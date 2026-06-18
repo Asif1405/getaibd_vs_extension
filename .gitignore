@@ -3,3 +3,11 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+
+# Rust engine
+engine/target
+bin/
+
+# Local agent memory / state
+*.mcp-memory.db
+.mcp-memory.db

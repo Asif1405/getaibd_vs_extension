@@ -1,0 +1,429 @@
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use crate::error::AppError;
+use crate::tools::Tool;
+
+fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let candidate = if Path::new(relative).is_absolute() {
+        PathBuf::from(relative)
+    } else {
+        root_canonical.join(relative)
+    };
+    if let Ok(p) = candidate.canonicalize() {
+        if !p.starts_with(&root_canonical) {
+            return Err(AppError::InvalidRequest(format!(
+                "Path escapes project root: {relative}"
+            )));
+        }
+        return Ok(candidate);
+    }
+    let mut p = root_canonical.clone();
+    for comp in Path::new(relative).components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(AppError::InvalidRequest(format!(
+                    "Path escapes project root: {relative}"
+                )));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !p.pop() {
+                    return Err(AppError::InvalidRequest(format!(
+                        "Path escapes project root: {relative}"
+                    )));
+                }
+            }
+            Component::Normal(c) => p.push(c),
+        }
+    }
+    if !p.starts_with(&root_canonical) {
+        return Err(AppError::InvalidRequest(format!(
+            "Path escapes project root: {relative}"
+        )));
+    }
+    Ok(candidate)
+}
+
+pub struct ReadFile {
+    root: Arc<PathBuf>,
+}
+
+impl ReadFile {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadFile {
+    fn name(&self) -> &'static str {
+        "read_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Read file contents. Optionally specify line_start and line_end for a range."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to project root" },
+                "line_start": { "type": "integer", "description": "Start line (1-indexed, inclusive)" },
+                "line_end": { "type": "integer", "description": "End line (1-indexed, inclusive)" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let rel = input["path"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
+        let path = resolve_path(&self.root, rel)?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| AppError::InvalidRequest(format!("Cannot read {rel}: {e}")))?;
+
+        let line_start = input["line_start"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok());
+        let line_end = input["line_end"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok());
+
+        let result = match (line_start, line_end) {
+            (Some(start), Some(end)) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let s = start.saturating_sub(1);
+                let e = end.min(lines.len());
+                lines[s..e]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{}|{l}", s + i + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            _ => content,
+        };
+
+        Ok(json!({ "content": result }))
+    }
+}
+
+pub struct WriteFile {
+    root: Arc<PathBuf>,
+}
+
+impl WriteFile {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for WriteFile {
+    fn name(&self) -> &'static str {
+        "write_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Write content to a file. Creates parent directories if create_dirs is true."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to project root" },
+                "content": { "type": "string", "description": "Content to write" },
+                "create_dirs": { "type": "boolean", "description": "Create parent directories if missing" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let rel = input["path"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
+        let content = input["content"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("content is required".into()))?;
+        let create_dirs = input["create_dirs"].as_bool().unwrap_or(false);
+
+        let path = resolve_path(&self.root, rel)?;
+
+        if create_dirs {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| AppError::InvalidRequest(format!("Cannot create dirs: {e}")))?;
+            }
+        }
+
+        let bytes = content.len();
+        tokio::fs::write(&path, content)
+            .await
+            .map_err(|e| AppError::InvalidRequest(format!("Cannot write {rel}: {e}")))?;
+
+        Ok(json!({ "written": rel, "bytes": bytes }))
+    }
+}
+
+pub struct PatchFile {
+    root: Arc<PathBuf>,
+}
+
+impl PatchFile {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for PatchFile {
+    fn name(&self) -> &'static str {
+        "patch_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Apply a search-and-replace edit to a file."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to project root" },
+                "old_text": { "type": "string", "description": "Text to find" },
+                "new_text": { "type": "string", "description": "Replacement text" }
+            },
+            "required": ["path", "old_text", "new_text"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let rel = input["path"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
+        let old_text = input["old_text"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("old_text is required".into()))?;
+        let new_text = input["new_text"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("new_text is required".into()))?;
+
+        let path = resolve_path(&self.root, rel)?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| AppError::InvalidRequest(format!("Cannot read {rel}: {e}")))?;
+
+        if !content.contains(old_text) {
+            return Err(AppError::InvalidRequest(format!(
+                "old_text not found in {rel}"
+            )));
+        }
+
+        let updated = content.replacen(old_text, new_text, 1);
+        tokio::fs::write(&path, &updated)
+            .await
+            .map_err(|e| AppError::InvalidRequest(format!("Cannot write {rel}: {e}")))?;
+
+        Ok(json!({ "patched": rel }))
+    }
+}
+
+pub struct ListDirectory {
+    root: Arc<PathBuf>,
+}
+
+impl ListDirectory {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for ListDirectory {
+    fn name(&self) -> &'static str {
+        "list_directory"
+    }
+
+    fn description(&self) -> &'static str {
+        "List files and directories at the given path."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory path relative to project root (default: '.')" },
+                "recursive": { "type": "boolean", "description": "List recursively" }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let rel = input["path"].as_str().unwrap_or(".");
+        let recursive = input["recursive"].as_bool().unwrap_or(false);
+        let path = resolve_path(&self.root, rel)?;
+
+        let mut entries = Vec::new();
+        collect_entries(&path, &path, recursive, &mut entries).await?;
+        Ok(json!({ "entries": entries }))
+    }
+}
+
+async fn collect_entries(
+    base: &Path,
+    dir: &Path,
+    recursive: bool,
+    out: &mut Vec<Value>,
+) -> Result<(), AppError> {
+    let mut rd = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| AppError::InvalidRequest(format!("Cannot read dir: {e}")))?;
+
+    while let Some(entry) = rd
+        .next_entry()
+        .await
+        .map_err(|e| AppError::InvalidRequest(format!("readdir: {e}")))?
+    {
+        let meta = entry.metadata().await.ok();
+        let name = entry
+            .path()
+            .strip_prefix(base)
+            .unwrap_or(&entry.path())
+            .to_string_lossy()
+            .to_string();
+        let is_dir = meta.as_ref().is_some_and(std::fs::Metadata::is_dir);
+        let size = meta.as_ref().map_or(0, std::fs::Metadata::len);
+
+        out.push(json!({
+            "name": name,
+            "type": if is_dir { "directory" } else { "file" },
+            "size": size,
+        }));
+
+        if recursive && is_dir {
+            Box::pin(collect_entries(base, &entry.path(), true, out)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub struct SearchFiles {
+    root: Arc<PathBuf>,
+}
+
+impl SearchFiles {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for SearchFiles {
+    fn name(&self) -> &'static str {
+        "search_files"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search file contents for a pattern (plain text or regex)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Search pattern (text or regex)" },
+                "path": { "type": "string", "description": "Directory to search (default: '.')" },
+                "glob": { "type": "string", "description": "File glob filter (e.g. '*.rs')" },
+                "max_results": { "type": "integer", "description": "Max matches to return (default: 50)" }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let pattern = input["pattern"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("pattern is required".into()))?;
+        let search_path = input["path"].as_str().unwrap_or(".");
+        let max = usize::try_from(input["max_results"].as_u64().unwrap_or(50)).unwrap_or(50);
+
+        let dir = resolve_path(&self.root, search_path)?;
+        let mut results = Vec::new();
+        search_recursive(&dir, &dir, pattern, max, &mut results).await?;
+
+        Ok(json!({ "matches": results, "count": results.len() }))
+    }
+}
+
+async fn search_recursive(
+    base: &Path,
+    dir: &Path,
+    pattern: &str,
+    max: usize,
+    out: &mut Vec<Value>,
+) -> Result<(), AppError> {
+    if out.len() >= max {
+        return Ok(());
+    }
+
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+        return Ok(());
+    };
+
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if out.len() >= max {
+            break;
+        }
+
+        let path = entry.path();
+        let meta = entry.metadata().await.ok();
+
+        if meta.as_ref().is_some_and(std::fs::Metadata::is_dir) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            Box::pin(search_recursive(base, &path, pattern, max, out)).await?;
+        } else if meta.as_ref().is_some_and(std::fs::Metadata::is_file) {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                for (i, line) in content.lines().enumerate() {
+                    if out.len() >= max {
+                        break;
+                    }
+                    if line.contains(pattern) {
+                        out.push(json!({
+                            "file": rel,
+                            "line": i + 1,
+                            "content": line.trim(),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
