@@ -1,5 +1,6 @@
 {
   "name": "getaibd",
+  "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "AI supported coding assistant powered by GetAIBD",
   "version": "0.0.1",
