@@ -10,8 +10,16 @@ import {
   type ChatMessage,
 } from "../client";
 import { scanText, formatWarning } from "../safetype/detector";
+import { ensureEngine } from "../engine/manager";
 import { PatchPreviewPanel } from "./patchPreview";
-import { getServerUrl, authHeaders } from "../util/config";
+import {
+  getServerUrl,
+  authHeaders,
+  getApiKey,
+  isFreeToken,
+  FREE_MODEL_ID,
+  FREE_MODEL_LABEL,
+} from "../util/config";
 import { ProviderStore, BUILTIN_PROVIDERS, CURATED_MODELS, PROVIDER_META } from "../settings/providerStore";
 
 interface WebviewMessage {
@@ -89,6 +97,17 @@ export class ChatPanel {
     this.panel.webview.postMessage({ type: "showSettings" });
   }
 
+  /** Re-reads the stored credential and tells the webview whether it is free-tier. */
+  async refreshAuthMode() {
+    const key = await getApiKey(this.context.secrets);
+    this.panel.webview.postMessage({
+      type: "authMode",
+      free: isFreeToken(key),
+      freeModelId: FREE_MODEL_ID,
+      freeModelLabel: FREE_MODEL_LABEL,
+    });
+  }
+
   enableAgentMode() {
     this.panel.webview.postMessage({ type: "setAgentMode" });
   }
@@ -158,6 +177,7 @@ export class ChatPanel {
         this.currentStreamContent = "";
         this.panel.webview.postMessage({ type: "streamError", error });
         this.abortController = undefined;
+        this.maybeHandlePaymentError(error);
       },
     }, apiKey);
   }
@@ -225,6 +245,12 @@ export class ChatPanel {
       case "previewPatch":
         if (msg.content) {await this.previewPatch(msg.content as string);}
         break;
+      case "needApiKey":
+        await this.promptUpgrade();
+        break;
+      case "refreshModels":
+        await this.refreshModels();
+        break;
       case "getSettings":
         await this.sendSettings();
         break;
@@ -255,9 +281,52 @@ export class ChatPanel {
   }
 
   private async onReady() {
+    try {
+      await ensureEngine(this.context);
+    } catch {
+      /* engine errors are surfaced when the user sends */
+    }
     await this.loadProviders();
     this.restoreHistory();
     this.restoreSelections();
+    await this.refreshAuthMode();
+  }
+
+  /** Ensures the engine is up, then reloads providers + models (dropdown self-heal). */
+  private async refreshModels() {
+    try {
+      await ensureEngine(this.context);
+    } catch {
+      /* no credential yet; nothing to load */
+    }
+    await this.loadProviders();
+    await this.loadModels("getaibd");
+  }
+
+  /** Detects free-limit / payment-required stream errors and prompts to add a key. */
+  private maybeHandlePaymentError(error: string): boolean {
+    if (!/\b402\b|Free limit|requires your own/i.test(error)) {
+      return false;
+    }
+    void this.promptUpgrade(error);
+    return true;
+  }
+
+  /** Free tier only includes the "Auto" model; nudge the user to add a key. */
+  private async promptUpgrade(detail?: string) {
+    const base = detail && /Free limit/i.test(detail)
+      ? "You've used all your free days this month."
+      : 'That model needs your own GetAIBD API key. The free tier only includes the "Auto" model.';
+    const choice = await vscode.window.showInformationMessage(
+      base,
+      "Set API Key",
+      "Get a Key",
+    );
+    if (choice === "Set API Key") {
+      await vscode.commands.executeCommand("getaibd.setApiKey");
+    } else if (choice === "Get a Key") {
+      await vscode.env.openExternal(vscode.Uri.parse("https://getaibd.com"));
+    }
   }
 
   private async loadProviders() {
@@ -496,6 +565,7 @@ export class ChatPanel {
       onError: (error) => {
         this.panel.webview.postMessage({ type: "agentError", error });
         this.abortController = undefined;
+        this.maybeHandlePaymentError(error);
       },
     }, { requireApproval: true, apiKey });
   }
@@ -553,6 +623,7 @@ export class ChatPanel {
       onError: (error) => {
         this.panel.webview.postMessage({ type: "agentError", error });
         this.abortController = undefined;
+        this.maybeHandlePaymentError(error);
       },
     }, { apiKey });
   }
@@ -958,11 +1029,113 @@ body {
 .send-btn:hover { background: var(--btn-hover); }
 .send-btn.stop { background: var(--error-fg); }
 
+/* ── Cursor-style composer ── */
+.brand { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.3px; }
+
+.composer {
+  margin: 8px 12px 12px;
+  border: 1px solid var(--input-border);
+  border-radius: 12px;
+  background: var(--input-bg);
+  padding: 8px 10px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.composer:focus-within { border-color: var(--focus); }
+.composer textarea {
+  width: 100%;
+  background: transparent;
+  color: var(--input-fg);
+  border: none;
+  outline: none;
+  resize: none;
+  font-family: inherit;
+  font-size: 13px;
+  min-height: 24px;
+  max-height: 180px;
+  line-height: 1.45;
+  padding: 2px 2px 0;
+  box-sizing: border-box;
+}
+.composer-row { display: flex; align-items: center; gap: 6px; }
+.composer-spacer { flex: 1; }
+
+.ctl-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.07));
+  border: none;
+  color: var(--fg);
+  border-radius: 14px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  max-width: 220px;
+  white-space: nowrap;
+}
+.ctl-pill:hover { background: var(--list-hover); }
+.ctl-pill .ctl-icon { font-size: 13px; flex-shrink: 0; }
+.ctl-pill .ctl-arrow { font-size: 9px; opacity: 0.55; flex-shrink: 0; }
+.ctl-pill .ctl-label, .ctl-pill .pill-label { overflow: hidden; text-overflow: ellipsis; }
+.ctl-pill .pill-icon { display: none; }
+
+.round-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: none;
+  background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.07));
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.round-btn:hover { background: var(--list-hover); color: var(--fg); }
+.round-btn.send-btn { background: var(--btn-bg); color: var(--btn-fg); }
+.round-btn.send-btn:hover { background: var(--btn-hover); }
+.round-btn.send-btn.stop { background: var(--error-fg); }
+
+.mode-menu {
+  display: none;
+  position: fixed;
+  bottom: 96px;
+  left: 14px;
+  min-width: 210px;
+  background: var(--vscode-dropdown-background, var(--input-bg));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  z-index: 200;
+  box-shadow: 0 -8px 32px rgba(0,0,0,0.45);
+}
+.mode-menu.open { display: block; }
+.mode-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.mode-item:hover { background: var(--list-hover); }
+.mode-item .mi-icon { width: 16px; text-align: center; flex-shrink: 0; }
+.mode-item .mi-label { flex: 1; }
+.mode-item .mi-check { color: var(--success); visibility: hidden; }
+.mode-item.active .mi-check { visibility: visible; }
+
 /* ── Model Dropdown ── */
 .model-dropdown {
   display: none;
   position: fixed;
-  bottom: 58px;
+  bottom: 96px;
   left: 8px;
   right: 8px;
   background: var(--vscode-dropdown-background, var(--input-bg));
@@ -1108,6 +1281,11 @@ body {
 .tag-badge.powerful  { background: rgba(251,191,36,0.15);  color: #fbbf24; }
 .tag-badge.code      { background: rgba(56,189,248,0.15);  color: #38bdf8; }
 .tag-badge.open      { background: rgba(148,163,184,0.1);  color: #94a3b8; }
+.tag-badge.free      { background: rgba(34,197,94,0.18);   color: #22c55e; }
+
+.model-item.locked { opacity: 0.5; }
+.model-item.locked:hover { background: var(--list-hover); }
+.model-item-lock { font-size: 10px; opacity: 0.8; }
 
 .model-divider { height: 1px; background: var(--border); margin: 4px 14px; opacity: 0.4; }
 .empty-models { padding: 24px 14px; text-align: center; color: var(--muted); font-size: 12px; }
@@ -1271,13 +1449,9 @@ body {
 <body>
 
 <div class="header">
-  <button class="tab active" data-mode="chat" onclick="switchMode('chat')">Chat</button>
-  <button class="tab" data-mode="plan" onclick="switchMode('plan')">Plan</button>
-  <button class="tab" data-mode="ask" onclick="switchMode('ask')">Ask</button>
-  <button class="tab" data-mode="agent" onclick="switchMode('agent')">Agent</button>
-  <button class="tab" data-mode="debug" onclick="switchMode('debug')">Debug</button>
+  <span class="brand">GetAIBD</span>
   <span class="header-spacer"></span>
-  <button class="icon-btn" id="clearBtn" title="Clear chat">&#x1F5D1;</button>
+  <button class="icon-btn" id="clearBtn" title="New chat">&#x1F5D1;</button>
   <button class="icon-btn" id="settingsBtn" title="Settings">&#x2699;</button>
 </div>
 
@@ -1301,15 +1475,31 @@ body {
   <div class="model-list" id="modelList"></div>
 </div>
 
-<div class="input-bar">
-  <button class="attach-btn" id="attachBtn" title="Attach file">+</button>
+<div class="mode-menu" id="modeMenu">
+  <div class="mode-item" data-mode="agent"><span class="mi-icon">&#8734;</span><span class="mi-label">Agent</span><span class="mi-check">&#10003;</span></div>
+  <div class="mode-item" data-mode="plan"><span class="mi-icon">&#9776;</span><span class="mi-label">Plan</span><span class="mi-check">&#10003;</span></div>
+  <div class="mode-item" data-mode="debug"><span class="mi-icon">&#128027;</span><span class="mi-label">Debug</span><span class="mi-check">&#10003;</span></div>
+  <div class="mode-item" data-mode="ask"><span class="mi-icon">&#128172;</span><span class="mi-label">Ask</span><span class="mi-check">&#10003;</span></div>
+  <div class="mode-item" data-mode="chat"><span class="mi-icon">&#9998;</span><span class="mi-label">Chat</span><span class="mi-check">&#10003;</span></div>
+</div>
+
+<div class="composer">
   <textarea id="input" rows="1" placeholder="Ask anything... (use @filename to reference files)"></textarea>
-  <button class="model-pill" id="modelPill">
-    <span class="pill-icon" id="modelPillIcon">🤖</span>
-    <span class="pill-label" id="modelPillLabel">Select model</span>
-    <span class="pill-arrow">&#9662;</span>
-  </button>
-  <button class="send-btn" id="sendBtn">&#9654;</button>
+  <div class="composer-row">
+    <button class="ctl-pill" id="modePill" title="Mode">
+      <span class="ctl-icon" id="modePillIcon">&#8734;</span>
+      <span class="ctl-label" id="modePillLabel">Agent</span>
+      <span class="ctl-arrow">&#9662;</span>
+    </button>
+    <button class="ctl-pill model" id="modelPill" title="Model">
+      <span class="pill-icon" id="modelPillIcon"></span>
+      <span class="pill-label" id="modelPillLabel">Select model</span>
+      <span class="ctl-arrow">&#9662;</span>
+    </button>
+    <span class="composer-spacer"></span>
+    <button class="round-btn" id="attachBtn" title="Attach file">&#x1F4CE;</button>
+    <button class="round-btn send-btn" id="sendBtn" title="Send">&#9654;</button>
+  </div>
 </div>
 
 <script>
@@ -1322,6 +1512,10 @@ const sendBtn = document.getElementById("sendBtn");
 const modelPill = document.getElementById("modelPill");
 const modelPillLabel = document.getElementById("modelPillLabel");
 const modelPillIcon = document.getElementById("modelPillIcon");
+const modePill = document.getElementById("modePill");
+const modePillLabel = document.getElementById("modePillLabel");
+const modePillIcon = document.getElementById("modePillIcon");
+const modeMenu = document.getElementById("modeMenu");
 const modelDropdown = document.getElementById("modelDropdown");
 const modelSearch = document.getElementById("modelSearch");
 const modelList = document.getElementById("modelList");
@@ -1347,6 +1541,14 @@ let providerMeta = {};   // { providerId: { icon, color } }
 let builtinProviders = []; // [{id, label}]
 let activeProviderTab = "all";  // "all" or a provider id
 
+let freeMode = false;
+let freeModelId = "qwen-flash";
+let freeModelLabel = "Auto";
+
+function modelDisplay(modelId, name) {
+  return modelId === freeModelId ? freeModelLabel : (name || modelId);
+}
+
 const MODE_PLACEHOLDERS = {
   chat: "Ask anything... (use @filename to reference files)",
   plan: "Describe what you want to plan...",
@@ -1355,15 +1557,59 @@ const MODE_PLACEHOLDERS = {
   debug: "Describe the error or bug to debug...",
 };
 
-/* ── Tabs ── */
+const MODE_META = {
+  agent: { icon: "\u221E", label: "Agent" },
+  plan:  { icon: "\u2630", label: "Plan" },
+  debug: { icon: "\uD83D\uDC1B", label: "Debug" },
+  ask:   { icon: "\uD83D\uDCAC", label: "Ask" },
+  chat:  { icon: "\u270E", label: "Chat" },
+};
+
+/* ── Mode switcher (Cursor-style) ── */
 function switchMode(mode) {
   currentMode = mode;
-  document.querySelectorAll(".tab[data-mode]").forEach(t => {
-    t.classList.toggle("active", t.getAttribute("data-mode") === mode);
+  const meta = MODE_META[mode] || MODE_META.chat;
+  if (modePillLabel) modePillLabel.textContent = meta.label;
+  if (modePillIcon) modePillIcon.textContent = meta.icon;
+  document.querySelectorAll(".mode-item").forEach(el => {
+    el.classList.toggle("active", el.getAttribute("data-mode") === mode);
   });
   inputEl.placeholder = MODE_PLACEHOLDERS[mode] || MODE_PLACEHOLDERS.chat;
+  closeModeMenu();
   vscode.postMessage({ type: "modeChanged", mode });
 }
+
+function openModeMenu() {
+  closeModeDropdownConflicts();
+  modeMenu.classList.add("open");
+}
+function closeModeMenu() {
+  if (modeMenu) modeMenu.classList.remove("open");
+}
+function closeModeDropdownConflicts() {
+  if (modelDropdown) modelDropdown.classList.remove("open");
+}
+
+if (modePill) {
+  modePill.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (modeMenu.classList.contains("open")) closeModeMenu();
+    else openModeMenu();
+  });
+}
+document.querySelectorAll(".mode-item").forEach(el => {
+  el.addEventListener("click", (e) => {
+    e.stopPropagation();
+    switchMode(el.getAttribute("data-mode"));
+  });
+});
+document.addEventListener("click", (e) => {
+  if (modeMenu && !modeMenu.contains(e.target) && e.target !== modePill && !modePill.contains(e.target)) {
+    closeModeMenu();
+  }
+});
+
+switchMode(currentMode);
 
 /* ── Settings ── */
 settingsBtn.addEventListener("click", () => {
@@ -1395,11 +1641,16 @@ attachBtn.addEventListener("click", () => vscode.postMessage({ type: "attachFile
 
 /* ── Model Pill / Dropdown ── */
 function openModelDropdown() {
+  closeModeMenu();
   modelDropdown.classList.add("open");
   modelSearch.value = "";
   activeProviderTab = "all";
   renderProviderTabs();
   renderModelList("");
+  const haveModels = Object.values(allModels).some(a => (a || []).length > 0);
+  if (!haveModels) {
+    vscode.postMessage({ type: "refreshModels" });
+  }
   setTimeout(() => modelSearch.focus(), 50);
 }
 
@@ -1522,15 +1773,17 @@ function renderModelList(filter) {
   if (total === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-models";
-    empty.textContent = filter ? "No models match \"" + filter + "\"" : "No models available. Enable a provider in Settings.";
+    empty.textContent = filter ? "No models match \"" + filter + "\"" : "Loading models… (starting engine — pick Set API Key or Use Free if prompted)";
     modelList.appendChild(empty);
   }
 }
 
 function makeModelItem(providerId, modelId, displayName, ctx, tags) {
+  const isFreeModel = modelId === freeModelId;
+  const locked = freeMode && !isFreeModel;
   const isSelected = modelId === currentModel && providerId === currentProvider;
   const item = document.createElement("div");
-  item.className = "model-item" + (isSelected ? " selected" : "");
+  item.className = "model-item" + (isSelected ? " selected" : "") + (locked ? " locked" : "");
 
   const check = document.createElement("span");
   check.className = "model-item-check";
@@ -1538,10 +1791,17 @@ function makeModelItem(providerId, modelId, displayName, ctx, tags) {
 
   const name = document.createElement("span");
   name.className = "model-item-name";
-  name.textContent = displayName;
+  name.textContent = modelDisplay(modelId, displayName);
 
   const badges = document.createElement("span");
   badges.className = "model-item-badges";
+
+  if (isFreeModel) {
+    const freeBadge = document.createElement("span");
+    freeBadge.className = "tag-badge free";
+    freeBadge.textContent = "free";
+    badges.appendChild(freeBadge);
+  }
 
   if (ctx) {
     const ctxBadge = document.createElement("span");
@@ -1557,11 +1817,23 @@ function makeModelItem(providerId, modelId, displayName, ctx, tags) {
     badges.appendChild(tagBadge);
   }
 
+  if (locked) {
+    const lock = document.createElement("span");
+    lock.className = "model-item-lock";
+    lock.textContent = "🔒";
+    badges.appendChild(lock);
+  }
+
   item.appendChild(check);
   item.appendChild(name);
   item.appendChild(badges);
 
   item.addEventListener("click", () => {
+    if (locked) {
+      vscode.postMessage({ type: "needApiKey" });
+      closeModelDropdown();
+      return;
+    }
     currentProvider = providerId;
     currentModel = modelId;
     updateModelPill();
@@ -1580,6 +1852,7 @@ function updateModelPill() {
       const apiM = (allModels[currentProvider] || []).find(m => m.id === currentModel);
       if (apiM && apiM.name) displayName = apiM.name;
     }
+    displayName = modelDisplay(currentModel, displayName);
     const shortName = displayName.length > 24 ? displayName.slice(0, 22) + "…" : displayName;
     modelPillLabel.textContent = shortName;
     modelPillIcon.textContent = getProviderIcon(currentProvider);
@@ -1917,8 +2190,23 @@ window.addEventListener("message", (event) => {
       if (msg.provider) currentProvider = msg.provider;
       if (msg.model) currentModel = msg.model;
       updateModelPill();
-      if (msg.mode === "agent") {
-        switchMode("agent");
+      if (msg.mode) {
+        switchMode(msg.mode);
+      }
+      break;
+
+    case "authMode":
+      freeMode = !!msg.free;
+      if (msg.freeModelId) freeModelId = msg.freeModelId;
+      if (msg.freeModelLabel) freeModelLabel = msg.freeModelLabel;
+      if (freeMode) {
+        currentProvider = "getaibd";
+        currentModel = freeModelId;
+      }
+      updateModelPill();
+      if (modelDropdown.classList.contains("open")) {
+        renderProviderTabs();
+        renderModelList(modelSearch ? modelSearch.value.toLowerCase() : "");
       }
       break;
 
