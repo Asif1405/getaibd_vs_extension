@@ -3,6 +3,14 @@
 out/**
 node_modules/**
 src/**
+engine/**
+scripts/**
+.github/**
+dist-vsix/**
+run.sh
+FEEDBACK.md
+PUBLISHING.md
+*.vsix
 .gitignore
 .yarnrc
 esbuild.js

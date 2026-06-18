@@ -11,3 +11,4 @@ bin/
 # Local agent memory / state
 *.mcp-memory.db
 .mcp-memory.db
+dist-vsix/
