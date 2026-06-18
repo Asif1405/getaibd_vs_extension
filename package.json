@@ -4,9 +4,13 @@
   "displayName": "GetAIBD",
   "description": "Cursor-style AI coding agent powered by GetAIBD",
   "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dmsbilas/getaibd_vs_extension.git"
+  },
   "icon": "media/logo.png",
   "engines": {
-    "vscode": "^1.125.0"
+    "vscode": "^1.96.0"
   },
   "categories": [
     "AI",
@@ -193,7 +197,7 @@
     "engine:build": "cargo build --release --manifest-path engine/Cargo.toml"
   },
   "devDependencies": {
-    "@types/vscode": "^1.125.0",
+    "@types/vscode": "^1.96.0",
     "@types/node": "22.x",
     "typescript-eslint": "^8.56.1",
     "eslint": "^9.39.3",

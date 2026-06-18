@@ -1,0 +1,115 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-arm64, triple: aarch64-apple-darwin,      os: macos-14 }
+          - { target: darwin-x64,   triple: x86_64-apple-darwin,        os: macos-13 }
+          - { target: win32-x64,    triple: x86_64-pc-windows-msvc,     os: windows-latest }
+          - { target: linux-x64,    triple: x86_64-unknown-linux-gnu,   os: ubuntu-latest }
+          - { target: linux-arm64,  triple: aarch64-unknown-linux-gnu,  os: ubuntu-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Linux arm64 cross linker
+        if: matrix.target == 'linux-arm64'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build engine
+        run: cargo build --release --manifest-path engine/Cargo.toml --target ${{ matrix.triple }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+
+      - name: Sign + notarize (macOS)
+        if: startsWith(matrix.target, 'darwin')
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -e
+          BIN="engine/target/${{ matrix.triple }}/release/getaibd-agent"
+          if [ -z "$APPLE_CERT_P12_BASE64" ]; then
+            echo "No Apple cert secret set — shipping unsigned (users may hit Gatekeeper)."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          security create-keychain -p actions "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          echo "$APPLE_CERT_P12_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions "$KEYCHAIN"
+          codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$BIN"
+          ditto -c -k "$BIN" "$RUNNER_TEMP/agent.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/agent.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p bin
+          if [ "${{ matrix.target }}" = "win32-x64" ]; then
+            cp "engine/target/${{ matrix.triple }}/release/getaibd-agent.exe" bin/
+          else
+            cp "engine/target/${{ matrix.triple }}/release/getaibd-agent" bin/
+          fi
+
+      - name: Package VSIX
+        run: npx @vscode/vsce package --target ${{ matrix.target }} -o "getaibd-${{ matrix.target }}.vsix"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ matrix.target }}
+          path: "*.vsix"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: vsix
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vsix/*.vsix
+
+      - name: Publish to VS Code Marketplace + Open VSX
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          for f in vsix/*.vsix; do
+            echo "publishing $f"
+            [ -n "$VSCE_PAT" ] && npx @vscode/vsce publish --packagePath "$f" --pat "$VSCE_PAT" || echo "vsce skipped/failed for $f"
+            [ -n "$OVSX_PAT" ] && npx ovsx publish "$f" -p "$OVSX_PAT" || echo "ovsx skipped/failed for $f"
+          done
