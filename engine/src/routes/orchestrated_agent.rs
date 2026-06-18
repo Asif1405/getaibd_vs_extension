@@ -1,0 +1,124 @@
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::Json;
+use futures::stream::Stream;
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::agent::modes::AgentMode;
+use crate::agent::orchestrator::Orchestrator;
+use crate::agent::runtime::AgentEventKind;
+use crate::agent::session::Session;
+use crate::error::AppError;
+use crate::state::AppState;
+use crate::tools::ToolRegistry;
+
+#[derive(Debug, Deserialize)]
+pub struct OrchestratedRequest {
+    pub provider: String,
+    pub model: String,
+    pub input: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub auto_mode: bool,
+    #[serde(default)]
+    pub use_memory: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrchestratedResponse {
+    pub mode: String,
+    pub result: String,
+    pub iterations: u32,
+}
+
+#[allow(clippy::unused_async)]
+pub async fn orchestrated_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OrchestratedRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let provider = state
+        .get_provider(&req.provider)
+        .ok_or_else(|| AppError::UnknownProvider(req.provider.clone()))?;
+
+    let registry = ToolRegistry::build_default(&state.project_root);
+
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
+
+    tokio::spawn(async move {
+        let result = run_orchestrated_task(&state, req, provider, registry, tx.clone()).await;
+
+        match result {
+            Ok(resp) => {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("complete")
+                        .data(serde_json::to_string(&resp).unwrap_or_default())))
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Ok(Event::default().event("error").data(e.to_string())))
+                    .await;
+            }
+        }
+    });
+
+    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+}
+
+async fn run_orchestrated_task(
+    state: &AppState,
+    req: OrchestratedRequest,
+    provider: Arc<dyn crate::providers::Provider>,
+    registry: ToolRegistry,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+) -> Result<OrchestratedResponse, AppError> {
+    let mut session = Session::new(&req.provider, &req.model, state.project_root.clone());
+
+    let mut orchestrator = Orchestrator::new(provider, registry).with_auto_mode(req.auto_mode);
+
+    if req.use_memory {
+        if let (Some(store), Some(embedder)) = (&state.memory_store, &state.embedder) {
+            orchestrator = orchestrator.with_memory(store.clone().into(), embedder.clone_box());
+        }
+    }
+
+    let mode = req.mode.as_deref().map(AgentMode::from_str);
+
+    let mut on_event = |event: crate::agent::runtime::AgentEvent| {
+        let event_name = match event.kind {
+            AgentEventKind::Start => "start",
+            AgentEventKind::Think => "think",
+            AgentEventKind::ToolCall => "tool_call",
+            AgentEventKind::ToolResult => "tool_result",
+            AgentEventKind::Response => "response",
+            AgentEventKind::Complete => "complete",
+            AgentEventKind::Error => "error",
+            AgentEventKind::ModeSelected => "mode_selected",
+            AgentEventKind::Planning => "planning",
+            AgentEventKind::Thinking => "thinking",
+            AgentEventKind::Reflecting => "reflecting",
+            AgentEventKind::Replanning => "replanning",
+            AgentEventKind::ContextCompressed => "context_compressed",
+        };
+
+        let data = event.content.unwrap_or_default();
+
+        let _ = tx.try_send(Ok(Event::default().event(event_name).data(data)));
+    };
+
+    let result = orchestrator
+        .execute(&mut session, &req.input, mode, &mut on_event)
+        .await?;
+
+    Ok(OrchestratedResponse {
+        mode: result.mode.unwrap_or_else(|| "ask".to_string()),
+        result: result.final_response,
+        iterations: result.iterations,
+    })
+}

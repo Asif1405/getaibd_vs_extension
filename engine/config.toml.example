@@ -1,0 +1,177 @@
+# MCP Universal — example configuration
+# Copy to config.toml and edit, or just use environment variables.
+# Every field is optional. Env vars always override file values.
+
+[server]
+host = "127.0.0.1"         # MCP_SERVER_HOST
+port = 3333                 # MCP_SERVER_PORT
+request_timeout_secs = 60   # MCP_SERVER_REQUEST_TIMEOUT_SECS
+# public_url = "https://your-tunnel.ngrok.io"  # MCP_PUBLIC_URL
+# auth_token = ""           # MCP_AUTH_TOKEN — when set, all endpoints (except /health) require Bearer token
+
+[agent]
+project_root = "."          # MCP_AGENT_PROJECT_ROOT
+max_iterations = 50         # MCP_AGENT_MAX_ITERATIONS
+
+# --- Providers ---
+
+# Ollama (local) — enabled by default if Ollama is running
+[providers.ollama]
+enabled = true
+base_url = "http://localhost:11434"   # OLLAMA_BASE_URL
+default_model = "llama3"
+request_timeout_secs = 120
+max_retries = 3
+
+# Ollama (remote) — set base_url to your remote Ollama instance
+# [providers.ollama_remote]
+# enabled = true
+# base_url = "http://192.168.1.50:11434"   # OLLAMA_REMOTE_BASE_URL
+# default_model = "llama3"
+# request_timeout_secs = 120
+# max_retries = 3
+
+# OpenAI — auto-enabled when OPENAI_API_KEY env var is set
+# [providers.openai]
+# api_key = ""              # OPENAI_API_KEY
+# default_model = "gpt-4o"
+# request_timeout_secs = 60
+# max_retries = 3
+
+# Google Gemini — auto-enabled when GEMINI_API_KEY env var is set
+# [providers.gemini]
+# api_key = ""              # GEMINI_API_KEY
+# default_model = "gemini-2.0-flash"
+# request_timeout_secs = 60
+# max_retries = 3
+
+# Anthropic Claude — auto-enabled when ANTHROPIC_API_KEY env var is set
+# [providers.claude]
+# api_key = ""              # ANTHROPIC_API_KEY
+# default_model = "claude-sonnet-4-20250514"
+# request_timeout_secs = 60
+# max_retries = 3
+
+# OpenRouter — auto-enabled when OPENROUTER_API_KEY env var is set
+# Access 200+ models with one API key: https://openrouter.ai
+# [providers.openrouter]
+# api_key = ""              # OPENROUTER_API_KEY
+# default_model = "openai/gpt-4o"
+# request_timeout_secs = 60
+# max_retries = 3
+
+# Grok (xAI) — auto-enabled when XAI_API_KEY env var is set
+# [providers.grok]
+# api_key = ""              # XAI_API_KEY
+# default_model = "grok-3-mini"
+# request_timeout_secs = 60
+# max_retries = 3
+
+# DeepSeek — auto-enabled when DEEPSEEK_API_KEY env var is set
+# [providers.deepseek]
+# api_key = ""              # DEEPSEEK_API_KEY
+# default_model = "deepseek-chat"
+# request_timeout_secs = 60
+# max_retries = 3
+
+# Generic OpenAI-compatible provider — works with LM Studio, vLLM, Together, Groq, etc.
+# You can add multiple instances by repeating [[providers.openai_compat]]
+# Auto-created with id "openai_compat" when OPENAI_COMPAT_BASE_URL is set
+#
+# [[providers.openai_compat]]
+# id = "lmstudio"
+# display_name = "LM Studio"
+# base_url = "http://localhost:1234/v1"        # OPENAI_COMPAT_BASE_URL (for env-var auto instance)
+# api_key = ""                                 # OPENAI_COMPAT_API_KEY (optional)
+# default_model = "local-model"                # OPENAI_COMPAT_DEFAULT_MODEL
+# request_timeout_secs = 120
+# max_retries = 3
+# supports_tool_calling = false
+#
+# [[providers.openai_compat]]
+# id = "together"
+# display_name = "Together AI"
+# base_url = "https://api.together.xyz/v1"
+# api_key = ""
+# default_model = "meta-llama/Llama-3.1-70B-Instruct-Turbo"
+# supports_tool_calling = true
+
+# --- Context Management ---
+# Automatically trims conversation history to fit model context windows
+
+[context]
+enabled = true                      # Set false to disable auto-trimming
+# max_tokens = 8192                 # Override auto-detected model limit
+strategy = "drop_oldest"            # "drop_oldest" or "summarize"
+reserve_for_completion = 0.25       # Reserve 25% of context for completion
+
+# --- Memory (RAG) ---
+
+[memory]
+enabled = true              # MCP_MEMORY_ENABLED
+db_path = ".mcp_memory.db"  # MCP_MEMORY_DB_PATH
+embedding_provider = "openai"  # MCP_MEMORY_EMBEDDING_PROVIDER (openai|gemini|ollama)
+# embedding_model = "text-embedding-3-small"  # MCP_MEMORY_EMBEDDING_MODEL
+top_k = 5                   # MCP_MEMORY_TOP_K
+max_entries = 10000          # MCP_MEMORY_MAX_ENTRIES
+chunk_size = 512             # MCP_MEMORY_CHUNK_SIZE
+chunk_overlap = 64
+
+# --- Accounts & Credits ---
+
+[accounts]
+enabled = false             # Set to true to enable multi-user accounts
+db_path = "accounts.db"
+jwt_secret = ""             # Required if enabled — used to sign JWTs
+jwt_expiry_hours = 72       # JWT token expiration time
+credit_markup = 1.5         # Markup multiplier for credit pricing (1.5 = 50% markup)
+
+# --- Platform Keys (for managed credit-based access) ---
+# These are YOUR API keys, NOT exposed to users.
+# Users pay you in credits, you use these keys to call providers.
+
+[platform_keys]
+# openai_api_key = ""       # Platform OpenAI key for credit-based requests
+# claude_api_key = ""       # Platform Claude key
+# gemini_api_key = ""       # Platform Gemini key
+# openrouter_api_key = ""   # Platform OpenRouter key
+# grok_api_key = ""         # Platform Grok key
+# deepseek_api_key = ""     # Platform DeepSeek key
+# huggingface_api_key = ""  # Platform HuggingFace key
+
+# --- Messaging Adapters ---
+
+# Telegram — auto-enabled when TELEGRAM_BOT_TOKEN env var is set
+# [messaging.telegram]
+# enabled = true
+# bot_token = ""            # TELEGRAM_BOT_TOKEN
+# provider = "ollama"       # Which LLM provider to use
+# allowed_user_ids = []     # Empty = allow all. E.g. ["123456789"]
+# rate_limit_per_min = 30
+
+# Discord — auto-enabled when DISCORD_BOT_TOKEN env var is set
+# [messaging.discord]
+# enabled = true
+# bot_token = ""            # DISCORD_BOT_TOKEN
+# provider = "ollama"
+# allowed_user_ids = []
+# rate_limit_per_min = 30
+
+# Slack — auto-enabled when SLACK_BOT_TOKEN env var is set
+# [messaging.slack]
+# enabled = true
+# bot_token = ""            # SLACK_BOT_TOKEN
+# signing_secret = ""       # SLACK_SIGNING_SECRET
+# provider = "ollama"
+# allowed_user_ids = []
+# rate_limit_per_min = 30
+
+# WhatsApp Business — auto-enabled when WHATSAPP_API_TOKEN env var is set
+# [messaging.whatsapp]
+# enabled = true
+# api_token = ""            # WHATSAPP_API_TOKEN
+# phone_number_id = ""      # WHATSAPP_PHONE_NUMBER_ID
+# verify_token = ""         # WHATSAPP_VERIFY_TOKEN
+# provider = "ollama"
+# allowed_user_ids = []
+# rate_limit_per_min = 30

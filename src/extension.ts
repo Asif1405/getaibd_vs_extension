@@ -1,57 +1,136 @@
-import * as vscode from 'vscode';
-import { AgentViewProvider } from './AgentViewProvider';
+import * as vscode from "vscode";
+import { ChatPanel } from "./chat/panel";
+import { completeSelection } from "./commands/complete";
+import { explainSelection } from "./commands/explain";
+import { generateTests } from "./commands/generateTests";
+import { InlineCompletionProvider } from "./commands/inline";
+import { activateDiagnostics } from "./safetype/diagnostics";
+import { ensureEngine, restartEngine, stopEngine } from "./engine/manager";
+import { getApiKey, setApiKey } from "./util/config";
+import { fetchPlatformBalance } from "./client";
 
-/**
- * Called when the extension is activated.
- * Activation is triggered when the webview view becomes visible.
- */
 export function activate(context: vscode.ExtensionContext) {
-  console.log('GetAIBD extension is now active.');
+  activateDiagnostics(context);
 
-  // 1. Register the Agent panel webview view provider
-  const agentProvider = new AgentViewProvider(context.extensionUri);
+  const balanceItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  balanceItem.command = "getaibd.refreshBalance";
+  balanceItem.tooltip = "GetAIBD credit balance (click to refresh)";
+  context.subscriptions.push(balanceItem);
 
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(
-      AgentViewProvider.viewType,
-      agentProvider,
-      { webviewOptions: { retainContextWhenHidden: true } }
-    )
-  );
+  const refreshBalance = async () => {
+    const key = await getApiKey(context.secrets);
+    if (!key) {
+      balanceItem.hide();
+      return;
+    }
+    const balance = await fetchPlatformBalance(key);
+    if (balance === null) {
+      balanceItem.hide();
+      return;
+    }
+    balanceItem.text = `$(database) ${balance.toLocaleString()} credits`;
+    balanceItem.show();
+  };
 
-  // 2. Watch for API key changes → auto-refresh models
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('getaibd.apiKey')) {
-        const apiKey = vscode.workspace
-          .getConfiguration('getaibd')
-          .get<string>('apiKey', '');
-        if (apiKey) {
-          agentProvider.refreshModels();
-        }
+  /** Starts the engine on demand, surfacing a friendly error if the key is missing. */
+  const withEngine = (fn: () => void | Promise<void>) => async () => {
+    try {
+      await ensureEngine(context);
+      await fn();
+      void refreshBalance();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to start GetAIBD engine.";
+      const choice = await vscode.window.showErrorMessage(message, "Set API Key");
+      if (choice === "Set API Key") {
+        await vscode.commands.executeCommand("getaibd.setApiKey");
       }
-    })
+    }
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("getaibd.openChat", withEngine(() => {
+      ChatPanel.open(context);
+    })),
+
+    vscode.commands.registerCommand("getaibd.openAgent", withEngine(() => {
+      const panel = ChatPanel.open(context);
+      panel.enableAgentMode();
+    })),
+
+    vscode.commands.registerCommand("getaibd.completeSelection", withEngine(() => {
+      completeSelection(context);
+    })),
+
+    vscode.commands.registerCommand("getaibd.explainSelection", withEngine(() => {
+      explainSelection(context);
+    })),
+
+    vscode.commands.registerCommand("getaibd.generateTests", withEngine(() => {
+      generateTests(context);
+    })),
+
+    vscode.commands.registerCommand("getaibd.openSettings", withEngine(() => {
+      const panel = ChatPanel.open(context);
+      panel.openSettings();
+    })),
+
+    vscode.commands.registerCommand("getaibd.setApiKey", async () => {
+      const value = await vscode.window.showInputBox({
+        title: "GetAIBD API Key",
+        prompt: "Paste your GetAIBD API key (from https://getaibd.com)",
+        password: true,
+        ignoreFocusOut: true,
+        value: await getApiKey(context.secrets),
+      });
+      if (value === undefined) {
+        return;
+      }
+      await setApiKey(context.secrets, value);
+      await restartEngine(context).catch((err) => {
+        vscode.window.showErrorMessage(
+          err instanceof Error ? err.message : "Failed to restart GetAIBD engine.",
+        );
+      });
+      void refreshBalance();
+    }),
+
+    vscode.commands.registerCommand("getaibd.refreshBalance", refreshBalance),
+
+    vscode.commands.registerCommand("getaibd.restartEngine", async () => {
+      try {
+        await restartEngine(context);
+        vscode.window.showInformationMessage("GetAIBD engine restarted.");
+      } catch (err: unknown) {
+        vscode.window.showErrorMessage(
+          err instanceof Error ? err.message : "Failed to restart GetAIBD engine.",
+        );
+      }
+    }),
+
+    vscode.languages.registerInlineCompletionItemProvider(
+      { pattern: "**" },
+      new InlineCompletionProvider(),
+    ),
+
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (
+        e.affectsConfiguration("getaibd.baseUrl") ||
+        e.affectsConfiguration("getaibd.serverUrl") ||
+        e.affectsConfiguration("getaibd.enginePath")
+      ) {
+        restartEngine(context).catch(() => undefined);
+      }
+    }),
   );
 
-  // 3. Register the "Refresh Models" command
-  context.subscriptions.push(
-    vscode.commands.registerCommand('getaibd.refreshModels', () => {
-      agentProvider.refreshModels();
-    })
-  );
-
-  // 4. Register the "Open Settings" command
-  context.subscriptions.push(
-    vscode.commands.registerCommand('getaibd.openSettings', () => {
-      vscode.commands.executeCommand(
-        'workbench.action.openSettings',
-        'getaibd'
-      );
-    })
-  );
+  void getApiKey(context.secrets).then((key) => {
+    if (key) {
+      ensureEngine(context).catch(() => undefined);
+      void refreshBalance();
+    }
+  });
 }
 
-/**
- * Called when the extension is deactivated.
- */
-export function deactivate() {}
+export function deactivate() {
+  stopEngine();
+}

@@ -1,0 +1,8 @@
+target/
+vscode-extension/node_modules/
+vscode-extension/dist/
+.git/
+.github/
+.mcp-memory.db
+*.md
+!README.md
