@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "Cursor-style AI coding agent powered by GetAIBD",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "repository": {
     "type": "git",
     "url": "https://github.com/dmsbilas/getaibd_vs_extension.git"
@@ -59,6 +59,10 @@
       {
         "command": "getaibd.refreshBalance",
         "title": "GetAIBD: Refresh Credit Balance"
+      },
+      {
+        "command": "getaibd.useFree",
+        "title": "GetAIBD: Use Free Tier"
       }
     ],
     "keybindings": [

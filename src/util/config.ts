@@ -3,6 +3,16 @@ import * as vscode from "vscode";
 const DEFAULT_SERVER_URL = "http://127.0.0.1:39377";
 const DEFAULT_BASE_URL = "https://getaibd.com/v1/api";
 
+/** The free anonymous device token prefix and the single free ("Auto") model. */
+export const FREE_TOKEN_PREFIX = "aiobf_";
+export const FREE_MODEL_ID = "qwen-flash";
+export const FREE_MODEL_LABEL = "Auto";
+
+/** Whether a stored credential is an anonymous free-tier device token. */
+export function isFreeToken(key: string | undefined | null): boolean {
+  return !!key && key.startsWith(FREE_TOKEN_PREFIX);
+}
+
 let activeEngineUrl: string | undefined;
 let authToken: string | undefined;
 

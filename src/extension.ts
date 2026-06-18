@@ -7,10 +7,20 @@ import { InlineCompletionProvider } from "./commands/inline";
 import { activateDiagnostics } from "./safetype/diagnostics";
 import { ensureEngine, restartEngine, stopEngine } from "./engine/manager";
 import { getApiKey, setApiKey } from "./util/config";
-import { fetchPlatformBalance } from "./client";
+import { fetchAccountStatus } from "./client";
+import { createFreeSession } from "./free";
+
+const SIGNUP_URL = "https://getaibd.com";
 
 export function activate(context: vscode.ExtensionContext) {
   activateDiagnostics(context);
+
+  const openItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  openItem.text = "$(sparkle) GetAIBD";
+  openItem.tooltip = "Open GetAIBD chat";
+  openItem.command = "getaibd.openChat";
+  openItem.show();
+  context.subscriptions.push(openItem);
 
   const balanceItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   balanceItem.command = "getaibd.refreshBalance";
@@ -23,26 +33,114 @@ export function activate(context: vscode.ExtensionContext) {
       balanceItem.hide();
       return;
     }
-    const balance = await fetchPlatformBalance(key);
-    if (balance === null) {
+    const status = await fetchAccountStatus(key);
+    if (!status) {
       balanceItem.hide();
       return;
     }
-    balanceItem.text = `$(database) ${balance.toLocaleString()} credits`;
+    if (status.free) {
+      balanceItem.text = `$(rocket) Free: ${status.daysLeft ?? "?"}/${status.daysLimit ?? 3} days`;
+      balanceItem.tooltip = "GetAIBD free tier — usage days left this month (click to refresh)";
+    } else {
+      balanceItem.text = `$(database) ${(status.creditsBalance ?? 0).toLocaleString()} credits`;
+      balanceItem.tooltip = "GetAIBD credit balance (click to refresh)";
+    }
     balanceItem.show();
   };
 
-  /** Starts the engine on demand, surfacing a friendly error if the key is missing. */
+  /** Prompts for an API key, returns true once one is stored. */
+  const promptApiKey = async (): Promise<boolean> => {
+    const value = await vscode.window.showInputBox({
+      title: "GetAIBD API Key",
+      prompt: "Paste your GetAIBD API key (from https://getaibd.com)",
+      placeHolder: "aiob_…",
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (!value || !value.trim()) {
+      return false;
+    }
+    await setApiKey(context.secrets, value.trim());
+    await restartEngine(context).catch(() => undefined);
+    void refreshBalance();
+    return true;
+  };
+
+  /** Starts an anonymous free-tier session, returns true on success. */
+  const startFree = async (): Promise<boolean> => {
+    try {
+      const status = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Starting GetAIBD free session…" },
+        () => createFreeSession(context),
+      );
+      await setApiKey(context.secrets, status.token);
+      await restartEngine(context).catch(() => undefined);
+      void refreshBalance();
+      vscode.window.showInformationMessage(
+        `GetAIBD free tier active — ${status.days_left}/${status.days_limit} usage days left this month. ` +
+          `Using the free "Auto" model; add an API key any time for full model access.`,
+      );
+      return true;
+    } catch (err: unknown) {
+      vscode.window.showErrorMessage(
+        err instanceof Error ? err.message : "Could not start the free session.",
+      );
+      return false;
+    }
+  };
+
+  /** First-run choice: bring your own key, or use the free tier. */
+  const chooseAccess = async (): Promise<boolean> => {
+    const pick = await vscode.window.showQuickPick(
+      [
+        {
+          label: "$(key) Set API Key",
+          detail: "Use your GetAIBD API key — full access to every model.",
+          id: "key",
+        },
+        {
+          label: "$(rocket) Use Free",
+          detail: 'Free "Auto" model, 3 usage days per month. No key required.',
+          id: "free",
+        },
+      ],
+      {
+        title: "GetAIBD — how would you like to start?",
+        placeHolder: "Set an API key, or try the free tier",
+        ignoreFocusOut: true,
+      },
+    );
+    if (!pick) {
+      return false;
+    }
+    return pick.id === "key" ? promptApiKey() : startFree();
+  };
+
+  /** Ensures the user has chosen a credential (key or free) before continuing. */
+  const ensureChosen = async (): Promise<boolean> => {
+    const key = await getApiKey(context.secrets);
+    if (key) {
+      return true;
+    }
+    return chooseAccess();
+  };
+
+  /** Onboards then starts the engine, surfacing a friendly error on failure. */
   const withEngine = (fn: () => void | Promise<void>) => async () => {
+    if (!(await ensureChosen())) {
+      return;
+    }
     try {
       await ensureEngine(context);
       await fn();
       void refreshBalance();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Failed to start GetAIBD engine.";
-      const choice = await vscode.window.showErrorMessage(message, "Set API Key");
+      const choice = await vscode.window.showErrorMessage(message, "Set API Key", "Use Free");
       if (choice === "Set API Key") {
-        await vscode.commands.executeCommand("getaibd.setApiKey");
+        await promptApiKey();
+      } else if (choice === "Use Free") {
+        await startFree();
       }
     }
   };
@@ -51,6 +149,17 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("getaibd.openChat", withEngine(() => {
       ChatPanel.open(context);
     })),
+
+    vscode.commands.registerCommand("getaibd.useFree", async () => {
+      if (await startFree()) {
+        await ensureEngine(context).catch(() => undefined);
+        ChatPanel.current()?.refreshAuthMode();
+      }
+    }),
+
+    vscode.commands.registerCommand("getaibd.getApiKeyInfo", async () => {
+      await vscode.env.openExternal(vscode.Uri.parse(SIGNUP_URL));
+    }),
 
     vscode.commands.registerCommand("getaibd.openAgent", withEngine(() => {
       const panel = ChatPanel.open(context);
@@ -92,6 +201,7 @@ export function activate(context: vscode.ExtensionContext) {
         );
       });
       void refreshBalance();
+      ChatPanel.current()?.refreshAuthMode();
     }),
 
     vscode.commands.registerCommand("getaibd.refreshBalance", refreshBalance),

@@ -1,7 +1,14 @@
 import { getServerUrl, getBaseUrl, authHeaders } from "./util/config";
 
-/** Fetches the GetAIBD credit balance straight from the platform. */
-export async function fetchPlatformBalance(apiKey: string): Promise<number | null> {
+export interface AccountStatus {
+  free: boolean;
+  creditsBalance: number | null;
+  daysLeft?: number;
+  daysLimit?: number;
+}
+
+/** Fetches the GetAIBD balance (or free-tier usage) straight from the platform. */
+export async function fetchAccountStatus(apiKey: string): Promise<AccountStatus | null> {
   try {
     const resp = await fetch(`${getBaseUrl()}/balance`, {
       headers: { Authorization: `Bearer ${apiKey}` },
@@ -9,8 +16,18 @@ export async function fetchPlatformBalance(apiKey: string): Promise<number | nul
     if (!resp.ok) {
       return null;
     }
-    const data = (await resp.json()) as { credits_balance?: number };
-    return typeof data.credits_balance === "number" ? data.credits_balance : null;
+    const data = (await resp.json()) as {
+      free?: boolean;
+      credits_balance?: number;
+      days_left?: number;
+      days_limit?: number;
+    };
+    return {
+      free: !!data.free,
+      creditsBalance: typeof data.credits_balance === "number" ? data.credits_balance : null,
+      daysLeft: data.days_left,
+      daysLimit: data.days_limit,
+    };
   } catch {
     return null;
   }
