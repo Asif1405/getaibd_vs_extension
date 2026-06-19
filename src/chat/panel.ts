@@ -64,8 +64,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private activeSessionId = "";
   private history: HistoryEntry[] = [];
   private currentStreamContent = "";
-  private fileEdits = new Map<string, { path: string; oldContent: string; newContent: string }>();
-  private fileEditSeq = 0;
+  private fileEdits = new Map<string, { path: string; originalOld: string; latestNew: string }>();
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -80,9 +79,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const provider = new ChatPanel(context);
     const diffProvider: vscode.TextDocumentContentProvider = {
       provideTextDocumentContent(uri) {
-        const edit = provider.fileEdits.get(uri.query);
+        const edit = provider.fileEdits.get(decodeURIComponent(uri.query));
         if (!edit) {return "";}
-        return uri.scheme === "getaibd-diff-new" ? edit.newContent : edit.oldContent;
+        return uri.scheme === "getaibd-diff-new" ? edit.latestNew : edit.originalOld;
       },
     };
     context.subscriptions.push(
@@ -273,7 +272,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         }
         break;
       case "openDiff":
-        if (msg.id) {await this.openDiff(msg.id as string);}
+        if (msg.path) {await this.openDiff(msg.path as string);}
+        break;
+      case "keepEdits":
+        this.keepEdits();
+        break;
+      case "undoEdits":
+        await this.undoEdits();
         break;
       case "clearHistory":
         this.history = [];
@@ -711,14 +716,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private handleFileEdit(edit: FileEdit) {
-    const id = `edit-${++this.fileEditSeq}-${Date.now()}`;
-    const oldContent = edit.old_content ?? "";
-    const newContent = edit.new_content ?? "";
-    this.fileEdits.set(id, { path: edit.path, oldContent, newContent });
-    const { additions, deletions } = diffStat(oldContent, newContent);
+    const existing = this.fileEdits.get(edit.path);
+    const originalOld = existing ? existing.originalOld : (edit.old_content ?? "");
+    const latestNew = edit.new_content ?? "";
+    this.fileEdits.set(edit.path, { path: edit.path, originalOld, latestNew });
+    const { additions, deletions } = diffStat(originalOld, latestNew);
     this.post({
       type: "fileEdit",
-      id,
       path: edit.path,
       additions,
       deletions,
@@ -726,14 +730,15 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     });
   }
 
-  /** Opens the agent's edit as a native VS Code diff (original vs current file). */
-  private async openDiff(id: string) {
-    const edit = this.fileEdits.get(id);
+  /** Opens an agent edit as a native VS Code diff (original vs current file). */
+  private async openDiff(filePath: string) {
+    const edit = this.fileEdits.get(filePath);
     if (!edit) {return;}
-    const leftUri = vscode.Uri.parse(`getaibd-diff:/${edit.path}?${id}`);
+    const q = encodeURIComponent(filePath);
+    const leftUri = vscode.Uri.parse(`getaibd-diff:/${filePath}?${q}`);
     const folder = vscode.workspace.workspaceFolders?.[0];
-    const fileUri = folder ? vscode.Uri.joinPath(folder.uri, edit.path) : undefined;
-    let rightUri = vscode.Uri.parse(`getaibd-diff-new:/${edit.path}?${id}`);
+    const fileUri = folder ? vscode.Uri.joinPath(folder.uri, filePath) : undefined;
+    let rightUri = vscode.Uri.parse(`getaibd-diff-new:/${filePath}?${q}`);
     if (fileUri) {
       try {
         await vscode.workspace.fs.stat(fileUri);
@@ -746,8 +751,28 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       "vscode.diff",
       leftUri,
       rightUri,
-      `${edit.path} (agent edit)`,
+      `${filePath} (agent edit)`,
     );
+  }
+
+  /** Keeps all pending agent edits (no-op on disk; just clears the review state). */
+  private keepEdits() {
+    this.fileEdits.clear();
+  }
+
+  /** Reverts every pending agent edit back to its original content. */
+  private async undoEdits() {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    for (const edit of this.fileEdits.values()) {
+      if (!folder) {continue;}
+      const uri = vscode.Uri.joinPath(folder.uri, edit.path);
+      try {
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(edit.originalOld, "utf8"));
+      } catch {
+        /* file may have been deleted/moved */
+      }
+    }
+    this.fileEdits.clear();
   }
 
   private async previewPatch(llmResponse: string): Promise<void> {
@@ -1296,6 +1321,22 @@ body {
 .file-edit .fe-stat { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
 .file-edit .fe-stat .add { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
 .file-edit .fe-stat .del { color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+
+.tool-row { display: flex; align-items: center; gap: 6px; padding: 2px 2px; font-size: 12px; color: var(--muted); margin: 1px 0; }
+.tool-row .tool-verb { color: var(--fg); opacity: 0.85; }
+.tool-row .tool-arg { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; color: var(--muted); background: var(--code-bg); border-radius: 4px; padding: 1px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.tool-error { border-left-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+
+.edit-summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 12px; margin: 6px 0; }
+.edit-summary .es-label { color: var(--fg); }
+.edit-summary .es-label.es-done { color: var(--muted); font-style: italic; }
+.edit-summary .add { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+.edit-summary .del { color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+.edit-summary .es-actions { display: flex; gap: 6px; }
+.edit-summary button { font-size: 11px; padding: 3px 12px; border-radius: 4px; border: 1px solid var(--border); cursor: pointer; background: transparent; color: var(--fg); }
+.edit-summary .es-keep { background: var(--btn-bg); color: var(--btn-fg); border-color: var(--btn-bg); }
+.edit-summary .es-keep:hover { opacity: 0.9; }
+.edit-summary .es-undo:hover { border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
 
 /* ── Thinking Blocks ── */
 .thinking-block {
@@ -1968,6 +2009,9 @@ let thoughtBodyEl = null;
 let thoughtStart = 0;
 let currentMode = "agent";
 let settingsOpen = false;
+let editStats = {};
+let editCardEls = {};
+let editSummaryEl = null;
 
 let currentProvider = "";
 let currentModel = "";
@@ -2360,6 +2404,11 @@ inputEl.addEventListener("input", () => {
   inputEl.style.height = Math.min(inputEl.scrollHeight, 150) + "px";
 });
 
+function detectPlanIntent(text) {
+  const t = text.toLowerCase();
+  return /\b(plan|how (should|do|would|can) (i|we|you)|what(?:'s| is) the best way|best way to|approach to|strategy (for|to)|architecture (of|for)|design (a|an|the|for)|outline|steps to|break (this |it )?down|should (i|we))\b/.test(t);
+}
+
 function send() {
   const text = inputEl.value.trim();
   if (!text) return;
@@ -2368,6 +2417,9 @@ function send() {
     modelSearch.value = "";
     renderModelList("");
     return;
+  }
+  if (currentMode === "agent" && detectPlanIntent(text)) {
+    switchMode("plan");
   }
   inputEl.value = "";
   inputEl.style.height = "auto";
@@ -2423,6 +2475,72 @@ function mdToHtml(text) {
 
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function formatToolRow(name, args) {
+  args = args || {};
+  const path = args.path || args.file || args.file_path || args.filename;
+  switch (name) {
+    case "write_file":
+    case "patch_file":
+    case "apply_patch":
+    case "edit_file":
+      return { hidden: true };
+    case "read_file":
+      return { verb: "Read", arg: path };
+    case "list_directory":
+    case "list_dir":
+      return { verb: "Listed", arg: path || args.dir || "." };
+    case "search_files":
+    case "grep":
+    case "search":
+      return { verb: "Searched", arg: args.query || args.pattern || path };
+    case "run_command":
+    case "run_terminal":
+    case "shell":
+      return { verb: "Ran", arg: args.command || args.cmd };
+    default:
+      if (name && name.indexOf("git") === 0) {
+        return { verb: name.replace(/_/g, " "), arg: args.args };
+      }
+      return { verb: (name || "tool").replace(/_/g, " "), arg: path };
+  }
+}
+
+function renderEditSummary() {
+  const paths = Object.keys(editStats);
+  if (paths.length === 0) return;
+  if (!editSummaryEl) {
+    editSummaryEl = document.createElement("div");
+    editSummaryEl.className = "edit-summary";
+    messagesEl.appendChild(editSummaryEl);
+  }
+  let a = 0, d = 0;
+  for (const p of paths) { a += editStats[p].a; d += editStats[p].d; }
+  const n = paths.length;
+  const label = '<span class="es-label">' + n + ' file' + (n === 1 ? '' : 's')
+    + ' changed <span class="add">+' + a + '</span> <span class="del">-' + d + '</span></span>';
+  const actions = '<span class="es-actions"><button class="es-keep">Keep</button>'
+    + '<button class="es-undo">Undo</button></span>';
+  editSummaryEl.innerHTML = label + actions;
+  editSummaryEl.querySelector(".es-keep").addEventListener("click", () => {
+    vscode.postMessage({ type: "keepEdits" });
+    finalizeEdits("Kept " + n + " file" + (n === 1 ? '' : 's'));
+  });
+  editSummaryEl.querySelector(".es-undo").addEventListener("click", () => {
+    vscode.postMessage({ type: "undoEdits" });
+    finalizeEdits("Reverted " + n + " file" + (n === 1 ? '' : 's'));
+  });
+  messagesEl.appendChild(editSummaryEl);
+}
+
+function finalizeEdits(text) {
+  if (editSummaryEl) {
+    editSummaryEl.innerHTML = '<span class="es-label es-done">' + escapeHtml(text) + '</span>';
+  }
+  editStats = {};
+  editCardEls = {};
+  editSummaryEl = null;
 }
 
 function appendThinkingBlock(cssClass, label, content) {
@@ -2748,6 +2866,7 @@ window.addEventListener("message", (event) => {
 
     case "modeDetected": {
       const detected = msg.mode || "ask";
+      if (MODE_META[detected]) switchMode(detected);
       const badge = document.createElement("div");
       badge.className = "context-compressed-msg";
       badge.textContent = "Mode: " + detected;
@@ -2858,6 +2977,9 @@ window.addEventListener("message", (event) => {
       thoughtEl = null;
       thoughtBodyEl = null;
       thoughtStart = 0;
+      editStats = {};
+      editCardEls = {};
+      editSummaryEl = null;
       sendBtn.innerHTML = "&#9632;";
       sendBtn.classList.add("stop");
       spinnerEl.textContent = "Agent working...";
@@ -2866,11 +2988,16 @@ window.addEventListener("message", (event) => {
 
     case "agentToolCall": {
       agentTextEl = null;
-      const tcDiv = document.createElement("div");
-      tcDiv.className = "tool-call";
-      tcDiv.innerHTML = '<span class="tool-name">' + escapeHtml(msg.name) + '</span>'
-        + '<div class="tool-args">' + escapeHtml(JSON.stringify(msg.arguments, null, 2)) + '</div>';
-      messagesEl.appendChild(tcDiv);
+      const info = formatToolRow(msg.name, msg.arguments);
+      if (info.hidden) break;
+      const row = document.createElement("div");
+      row.className = "tool-row";
+      let html = '<span class="tool-verb">' + escapeHtml(info.verb) + '</span>';
+      if (info.arg) {
+        html += ' <code class="tool-arg">' + escapeHtml(String(info.arg)) + '</code>';
+      }
+      row.innerHTML = html;
+      messagesEl.appendChild(row);
       scrollToBottom();
       break;
     }
@@ -2879,10 +3006,13 @@ window.addEventListener("message", (event) => {
       agentTextEl = null;
       let t = msg.result == null
         ? ""
-        : (typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result, null, 2));
+        : (typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result));
       if (!t || t === "undefined" || t === "null") break;
+      const lower = t.slice(0, 80).toLowerCase();
+      const isError = lower.startsWith("error") || lower.indexOf('"error"') !== -1;
+      if (!isError) break;
       const trDiv = document.createElement("div");
-      trDiv.className = "tool-result";
+      trDiv.className = "tool-result tool-error";
       trDiv.textContent = t.length > 500 ? t.slice(0, 500) + "..." : t;
       messagesEl.appendChild(trDiv);
       scrollToBottom();
@@ -2891,16 +3021,23 @@ window.addEventListener("message", (event) => {
 
     case "fileEdit": {
       agentTextEl = null;
-      const box = document.createElement("div");
-      box.className = "file-edit";
-      const stat = msg.tooLarge
+      const p = msg.path;
+      const statHtml = msg.tooLarge
         ? '<span class="fe-stat">large file</span>'
         : '<span class="fe-stat"><span class="add">+' + msg.additions + '</span> <span class="del">-' + msg.deletions + '</span></span>';
-      box.innerHTML = '<span class="fe-icon">\u270E</span><span class="fe-path">'
-        + escapeHtml(msg.path) + '</span>' + stat;
-      box.title = "Open diff in editor";
-      box.addEventListener("click", () => vscode.postMessage({ type: "openDiff", id: msg.id }));
-      messagesEl.appendChild(box);
+      let card = editCardEls[p];
+      if (!card) {
+        card = document.createElement("div");
+        card.className = "file-edit";
+        card.title = "Open diff in editor";
+        card.addEventListener("click", () => vscode.postMessage({ type: "openDiff", path: p }));
+        editCardEls[p] = card;
+        messagesEl.appendChild(card);
+      }
+      card.innerHTML = '<span class="fe-icon">\u270E</span><span class="fe-path">'
+        + escapeHtml(p) + '</span>' + statHtml;
+      editStats[p] = msg.tooLarge ? { a: 0, d: 0 } : { a: msg.additions, d: msg.deletions };
+      renderEditSummary();
       scrollToBottom();
       break;
     }
