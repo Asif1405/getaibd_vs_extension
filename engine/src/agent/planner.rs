@@ -111,6 +111,7 @@ Order steps by dependency. Keep steps atomic and verifiable."#;
             tools: vec![],
             temperature: Some(0.2),
             max_tokens: Some(2048),
+            reasoning_effort: None,
         };
 
         let response = self.provider.chat_with_tools(&request).await?;

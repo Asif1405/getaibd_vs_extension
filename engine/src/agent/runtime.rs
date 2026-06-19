@@ -247,6 +247,7 @@ async fn agent_loop(
                 tools: Vec::new(),
                 temperature: None,
                 max_tokens: None,
+                reasoning_effort: None,
             };
             let summary = match chat_with_tools_retry_cb(provider, &wrap, None).await {
                 Ok(r) => r.content.filter(|c| !c.trim().is_empty()),
@@ -297,6 +298,7 @@ async fn agent_loop(
             tools: tool_defs.clone(),
             temperature: None,
             max_tokens: None,
+            reasoning_effort: session.reasoning_effort.clone(),
         };
 
         let response = if use_streaming {
@@ -543,6 +545,7 @@ async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provid
         ],
         temperature: Some(0.2),
         max_tokens: Some(800),
+        reasoning_effort: None,
         api_key: None,
     };
 
@@ -729,6 +732,7 @@ async fn reflect(session: &Session, provider: &Arc<dyn Provider>) -> Reflection 
         ],
         temperature: Some(0.2),
         max_tokens: Some(800),
+        reasoning_effort: None,
         api_key: None,
     };
 

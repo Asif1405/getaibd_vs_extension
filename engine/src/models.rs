@@ -15,6 +15,9 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Reasoning effort hint (low/medium/high) for thinking-capable models.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Optional BYOK: user can pass their own API key per request.
     /// If omitted, platform key or account-stored key is used.
     #[serde(default)]
@@ -181,6 +184,8 @@ pub struct ToolChatRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

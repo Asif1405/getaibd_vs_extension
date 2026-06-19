@@ -74,6 +74,8 @@ struct CompatRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +87,8 @@ struct CompatToolRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -97,6 +101,8 @@ struct CompatToolStreamRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -122,6 +128,12 @@ struct CompatToolCallResponse {
 
 fn default_tool_type() -> String {
     "function".to_string()
+}
+
+/// Keep only the canonical reasoning-effort levels the platform understands.
+fn norm_effort(effort: &Option<String>) -> Option<String> {
+    let v = effort.as_deref()?.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "low" | "medium" | "high").then_some(v)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -310,6 +322,7 @@ impl Provider for OpenAiCompatProvider {
             stream: false,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            reasoning_effort: norm_effort(&request.reasoning_effort),
         };
 
         let req = self
@@ -367,6 +380,7 @@ impl Provider for OpenAiCompatProvider {
                 stream: true,
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
+                reasoning_effort: norm_effort(&request.reasoning_effort),
             };
 
             let mut req = client
@@ -463,6 +477,7 @@ impl Provider for OpenAiCompatProvider {
             tools,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            reasoning_effort: norm_effort(&request.reasoning_effort),
         };
 
         let req = self
@@ -554,6 +569,7 @@ impl Provider for OpenAiCompatProvider {
                 stream: true,
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
+                reasoning_effort: norm_effort(&request.reasoning_effort),
             };
 
             let mut req = client

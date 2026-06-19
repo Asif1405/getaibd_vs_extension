@@ -310,7 +310,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "orchestratedSend":
         if (msg.provider && msg.model && msg.text && msg.mode) {
           this.saveSelections(msg.provider as string, msg.model as string);
-          await this.sendOrchestrated(msg.provider as string, msg.model as string, msg.text as string, msg.mode as string);
+          await this.sendOrchestrated(
+            msg.provider as string,
+            msg.model as string,
+            msg.text as string,
+            msg.mode as string,
+            (msg.reasoningEffort as string | undefined) ?? undefined,
+          );
         }
         break;
       case "openDiff":
@@ -709,7 +715,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }, { requireApproval: true, apiKey });
   }
 
-  private async sendOrchestrated(provider: string, model: string, text: string, mode: string) {
+  private async sendOrchestrated(
+    provider: string,
+    model: string,
+    text: string,
+    mode: string,
+    reasoningEffort?: string,
+  ) {
     if (!(await this.checkSecrets(text))) {return;}
     const priorHistory = [...this.buildFileContext(), ...this.conversationMessages()];
     const turnId = newId();
@@ -775,7 +787,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported });
+    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort });
   }
 
   private handleFileEdit(edit: FileEdit) {
@@ -2173,6 +2185,13 @@ body {
   margin-bottom: 8px;
 }
 
+.setting-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 8px;
+  line-height: 1.4;
+}
+
 .setting-row label {
   font-size: 12px;
   min-width: 100px;
@@ -2351,6 +2370,10 @@ body {
       <span class="pill-label" id="modelPillLabel">Select model</span>
       <span class="ctl-arrow">&#9662;</span>
     </button>
+    <button class="ctl-pill" id="reasonPill" title="Reasoning effort" style="display:none;">
+      <span class="ctl-icon">&#129504;</span>
+      <span class="ctl-label" id="reasonPillLabel">Reasoning: Off</span>
+    </button>
     <span class="composer-spacer"></span>
     <button class="round-btn" id="attachBtn" title="Attach file">&#x1F4CE;</button>
     <button class="round-btn send-btn" id="sendBtn" title="Send">&#9654;</button>
@@ -2373,6 +2396,8 @@ const sendBtn = document.getElementById("sendBtn");
 const modelPill = document.getElementById("modelPill");
 const modelPillLabel = document.getElementById("modelPillLabel");
 const modelPillIcon = document.getElementById("modelPillIcon");
+const reasonPill = document.getElementById("reasonPill");
+const reasonPillLabel = document.getElementById("reasonPillLabel");
 const modePill = document.getElementById("modePill");
 const modePillLabel = document.getElementById("modePillLabel");
 const modePillIcon = document.getElementById("modePillIcon");
@@ -2404,6 +2429,7 @@ if (settingsPanel) {
     else if (act === "saveServerCfg") { saveServerCfg(arg); }
     else if (act === "toggleKeyVis") { toggleKeyVis(arg); }
     else if (act === "saveKey") { saveKey(arg); }
+    else if (act === "removeKey") { removeKey(arg); }
     else if (act === "testProvider") { testProvider(arg); }
   });
   settingsPanel.addEventListener("change", (e) => {
@@ -2812,6 +2838,43 @@ function updateModelPill() {
     modelPillLabel.textContent = "Select model";
     modelPillIcon.textContent = "🤖";
   }
+  updateReasonPill();
+}
+
+const REASON_LEVELS = ["off", "low", "medium", "high"];
+let currentReasoning = "off";
+
+function modelCaps(provider, modelId) {
+  const api = (allModels[provider] || []).find(m => m.id === modelId);
+  if (api && Array.isArray(api.capabilities)) return api.capabilities;
+  const cur = (curatedModels[provider] || []).find(m => m.id === modelId);
+  if (cur && Array.isArray(cur.capabilities)) return cur.capabilities;
+  return [];
+}
+
+function currentModelSupportsThinking() {
+  return modelCaps(currentProvider, currentModel).includes("thinking");
+}
+
+function updateReasonPill() {
+  if (!reasonPill) return;
+  const supported = currentModel && currentModelSupportsThinking();
+  reasonPill.style.display = supported ? "" : "none";
+  if (!supported) {currentReasoning = "off";}
+  const label = currentReasoning === "off"
+    ? "Reasoning: Off"
+    : "Reasoning: " + currentReasoning.charAt(0).toUpperCase() + currentReasoning.slice(1);
+  if (reasonPillLabel) reasonPillLabel.textContent = label;
+  reasonPill.classList.toggle("active", currentReasoning !== "off");
+}
+
+if (reasonPill) {
+  reasonPill.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const idx = REASON_LEVELS.indexOf(currentReasoning);
+    currentReasoning = REASON_LEVELS[(idx + 1) % REASON_LEVELS.length];
+    updateReasonPill();
+  });
 }
 
 /* ── Send ── */
@@ -2855,7 +2918,15 @@ function send() {
   }
   inputEl.value = "";
   inputEl.style.height = "auto";
-  vscode.postMessage({ type: "orchestratedSend", provider: currentProvider, model: currentModel, text, mode: currentMode });
+  const reasoning = currentModelSupportsThinking() ? currentReasoning : "off";
+  vscode.postMessage({
+    type: "orchestratedSend",
+    provider: currentProvider,
+    model: currentModel,
+    text,
+    mode: currentMode,
+    reasoningEffort: reasoning === "off" ? null : reasoning,
+  });
 }
 
 /* ── Messages ── */
@@ -3142,6 +3213,21 @@ function renderSettings(data) {
     + '<input type="checkbox" ' + (data.autoOpenEdits ? 'checked' : '') + ' data-act="savePref" data-arg="editReview.autoOpen" /></div>';
   html += '</div>';
 
+  for (const p of (data.providers || [])) {
+    const ph = p.hasKey ? '********' : '';
+    html += '<div class="settings-section"><h3>' + escapeHtml(p.label) + ' API Key</h3>';
+    html += '<p class="setting-hint">Add your own ' + escapeHtml(p.label)
+      + ' API key to use paid models, or remove it to fall back to the free tier.</p>';
+    html += '<div class="setting-row">'
+      + '<input type="password" id="key_' + escapeHtml(p.id) + '" value="' + ph + '" placeholder="Paste API key" autocomplete="off" />'
+      + '<button class="small-btn" data-act="toggleKeyVis" data-arg="' + escapeHtml(p.id) + '">Show</button>'
+      + '<button class="small-btn primary" data-act="saveKey" data-arg="' + escapeHtml(p.id) + '">Save</button>'
+      + (p.hasKey ? '<button class="small-btn danger" data-act="removeKey" data-arg="' + escapeHtml(p.id) + '">Remove</button>' : '')
+      + '</div>';
+    html += '<div class="pref-row"><label>Status</label><span>' + (p.hasKey ? 'Key configured' : 'No key (free tier)') + '</span></div>';
+    html += '</div>';
+  }
+
   if (data.serverConfig) {
     const sc = data.serverConfig;
     html += '<div class="settings-section"><h3>Agent</h3>';
@@ -3224,6 +3310,10 @@ function saveKey(id) {
   vscode.postMessage({ type: "saveApiKey", providerId: id, key: val });
   input.type = "password";
   input.value = "********";
+}
+
+function removeKey(id) {
+  vscode.postMessage({ type: "removeApiKey", providerId: id });
 }
 
 function toggleKeyVis(id) {
