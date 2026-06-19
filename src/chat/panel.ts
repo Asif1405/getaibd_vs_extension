@@ -30,10 +30,15 @@ interface WebviewMessage {
 }
 
 interface HistoryEntry {
-  kind: "message" | "context";
+  kind: "message" | "context" | "fileEdit";
   role?: string;
   content: string;
   label?: string;
+  path?: string;
+  editOld?: string;
+  editNew?: string;
+  tooLarge?: boolean;
+  editStatus?: "pending" | "accept" | "reject";
 }
 
 interface SessionMeta {
@@ -91,6 +96,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     provider.editReview.setOnResolved((relPath, action) => {
       provider.post({ type: "editResolved", path: relPath, action });
       provider.fileEdits.delete(relPath);
+      provider.markEditResolved(relPath, action);
     });
     context.subscriptions.push(
       vscode.workspace.registerTextDocumentContentProvider("getaibd-diff", diffProvider),
@@ -737,11 +743,11 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const existing = this.editContents.get(edit.path);
     const originalOld = existing ? existing.originalOld : (edit.old_content ?? "");
     const latestNew = edit.new_content ?? "";
+    const tooLarge = !!edit.too_large;
     this.fileEdits.set(edit.path, { path: edit.path, originalOld, latestNew });
     this.editContents.set(edit.path, { originalOld, latestNew });
     this.editReview.addEdit(edit.path, originalOld, latestNew);
     const { additions, deletions } = diffStat(originalOld, latestNew);
-    const tooLarge = !!edit.too_large;
     const diff = tooLarge ? { lines: [], truncated: true } : computeDiffHunks(originalOld, latestNew);
     this.post({
       type: "fileEdit",
@@ -752,6 +758,86 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       isNew: originalOld.length === 0 && latestNew.length > 0,
       diff,
     });
+    this.recordEditHistory(edit.path, originalOld, latestNew, tooLarge);
+    this.autoOpenEdit(edit.path);
+  }
+
+  /** Persists an agent edit in the session history so it survives reloads. */
+  private recordEditHistory(path: string, editOld: string, editNew: string, tooLarge: boolean) {
+    const existing = this.history.find((e) => e.kind === "fileEdit" && e.path === path);
+    if (existing) {
+      existing.editOld = editOld;
+      existing.editNew = editNew;
+      existing.tooLarge = tooLarge;
+      existing.editStatus = "pending";
+    } else {
+      this.history.push({
+        kind: "fileEdit",
+        content: path,
+        path,
+        editOld,
+        editNew,
+        tooLarge,
+        editStatus: "pending",
+      });
+    }
+    this.saveHistory();
+  }
+
+  /** Records the accept/reject outcome of an edit so its state persists across reloads. */
+  private markEditResolved(path: string, action: "accept" | "reject") {
+    const entry = this.history.find((e) => e.kind === "fileEdit" && e.path === path);
+    if (entry && entry.editStatus !== action) {
+      entry.editStatus = action;
+      this.saveHistory();
+    }
+  }
+
+  /** Opens the just-edited file (preview tab, focus stays in chat) when enabled. */
+  private autoOpenEdit(relPath: string) {
+    const config = vscode.workspace.getConfiguration("getaibd");
+    if (!config.get<boolean>("editReview.autoOpen", true)) {return;}
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {return;}
+    const uri = vscode.Uri.joinPath(folder.uri, relPath);
+    void vscode.workspace.openTextDocument(uri).then(
+      (doc) =>
+        vscode.window.showTextDocument(doc, {
+          preview: true,
+          preserveFocus: true,
+          viewColumn: vscode.ViewColumn.One,
+        }),
+      () => undefined,
+    );
+  }
+
+  /** Re-applies a persisted agent edit to the in-editor review UI and chat card. */
+  private restoreFileEdit(entry: HistoryEntry) {
+    const path = entry.path;
+    if (!path) {return;}
+    const originalOld = entry.editOld ?? "";
+    const latestNew = entry.editNew ?? "";
+    const tooLarge = !!entry.tooLarge;
+    const status = entry.editStatus ?? "pending";
+    this.editContents.set(path, { originalOld, latestNew });
+    if (status === "pending") {
+      this.fileEdits.set(path, { path, originalOld, latestNew });
+      this.editReview.addEdit(path, originalOld, latestNew);
+    }
+    const { additions, deletions } = diffStat(originalOld, latestNew);
+    const diff = tooLarge ? { lines: [], truncated: true } : computeDiffHunks(originalOld, latestNew);
+    this.post({
+      type: "fileEdit",
+      path,
+      additions,
+      deletions,
+      tooLarge,
+      isNew: originalOld.length === 0 && latestNew.length > 0,
+      diff,
+    });
+    if (status !== "pending") {
+      this.post({ type: "editResolved", path, action: status });
+    }
   }
 
   /** Opens an agent edit as a native VS Code diff (original vs current file). */
@@ -857,9 +943,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private restoreHistory() {
+    this.editContents.clear();
+    this.fileEdits.clear();
+    this.editReview.clearAll();
     for (const entry of this.history) {
       if (entry.kind === "context") {
         this.post({ type: "addContext", label: entry.label, code: entry.content });
+      } else if (entry.kind === "fileEdit") {
+        this.restoreFileEdit(entry);
       } else {
         this.post({ type: "addMessage", role: entry.role, content: entry.content });
       }
@@ -938,6 +1029,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.sessions.unshift(session);
     this.activeSessionId = session.id;
     this.history = [];
+    this.editContents.clear();
+    this.fileEdits.clear();
+    this.editReview.clearAll();
     this.globalState.update(SESSION_HISTORY_PREFIX + session.id, []);
     this.saveSessions();
     this.sendSessions();
@@ -2838,6 +2932,8 @@ function renderSettings(data) {
     + '<input type="checkbox" ' + (data.fileContextEnabled ? 'checked' : '') + ' data-act="savePref" data-arg="fileContext.enabled" /></div>';
   html += '<div class="pref-row"><label>Inline completions</label>'
     + '<input type="checkbox" ' + (data.inlineCompletionsEnabled ? 'checked' : '') + ' data-act="savePref" data-arg="inlineCompletions.enabled" /></div>';
+  html += '<div class="pref-row"><label>Auto-open edited files</label>'
+    + '<input type="checkbox" ' + (data.autoOpenEdits ? 'checked' : '') + ' data-act="savePref" data-arg="editReview.autoOpen" /></div>';
   html += '</div>';
 
   if (data.serverConfig) {
