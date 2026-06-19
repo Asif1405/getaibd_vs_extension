@@ -50,6 +50,8 @@ pub enum AgentEventKind {
     FileEdit,
     /// A tool needs the user to approve before it runs.
     ApprovalRequired,
+    /// A shell command should be executed by the client in a managed terminal.
+    TerminalExec,
 }
 
 pub struct AgentResult {
@@ -69,6 +71,7 @@ pub struct MemoryContext<'a> {
 
 pub struct AgentOptions {
     pub approval_gate: Option<ApprovalGate>,
+    pub terminal_gate: Option<crate::tools::terminal_gate::TerminalGate>,
     pub tool_timeout_secs: u64,
     pub circuit_breaker: Option<Arc<CircuitBreaker>>,
     pub context_config: Option<ContextConfig>,
@@ -79,6 +82,7 @@ impl Default for AgentOptions {
     fn default() -> Self {
         Self {
             approval_gate: None,
+            terminal_gate: None,
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: None,
@@ -782,17 +786,25 @@ async fn execute_tool_calls(
             Some(tool) => {
                 let approved = check_approval(tool.as_ref(), call, options, on_event).await;
                 if approved {
-                    let execution = tool.execute(call.arguments.clone());
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout_secs),
-                        execution,
-                    )
-                    .await
-                    {
-                        Ok(Ok(val)) => val,
-                        Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
-                        Err(_) => {
-                            serde_json::json!({ "error": format!("Tool execution timeout after {}s", timeout_secs) })
+                    let terminal_gate =
+                        options.and_then(|o| o.terminal_gate.as_ref()).filter(|_| {
+                            call.name == "run_command"
+                        });
+                    if let Some(gate) = terminal_gate {
+                        delegate_terminal(call, gate, on_event).await
+                    } else {
+                        let execution = tool.execute(call.arguments.clone());
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(timeout_secs),
+                            execution,
+                        )
+                        .await
+                        {
+                            Ok(Ok(val)) => val,
+                            Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+                            Err(_) => {
+                                serde_json::json!({ "error": format!("Tool execution timeout after {}s", timeout_secs) })
+                            }
                         }
                     }
                 } else {
@@ -819,6 +831,30 @@ async fn execute_tool_calls(
 
         let result_str = serde_json::to_string(&result).unwrap_or_default();
         session.push_message(ToolMessage::tool_result(&call.id, result_str));
+    }
+}
+
+/// Hands a shell command to the client to run in a managed terminal, returning its result.
+async fn delegate_terminal(
+    call: &ToolCall,
+    gate: &crate::tools::terminal_gate::TerminalGate,
+    on_event: &mut impl FnMut(AgentEvent),
+) -> serde_json::Value {
+    let req_id = format!("{}_term", call.id);
+    on_event(AgentEvent {
+        kind: AgentEventKind::TerminalExec,
+        content: Some(
+            serde_json::json!({
+                "request_id": req_id,
+                "arguments": call.arguments,
+            })
+            .to_string(),
+        ),
+    });
+    match gate.request(req_id).await {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "stdout": raw, "stderr": "", "exit_code": 0 })),
+        None => serde_json::json!({ "error": "Terminal execution timed out or was cancelled" }),
     }
 }
 

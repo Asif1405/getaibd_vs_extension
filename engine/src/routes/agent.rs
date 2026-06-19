@@ -128,6 +128,7 @@ async fn run_agent_task(
 
     let opts = AgentOptions {
         approval_gate: gate,
+        terminal_gate: None,
         tool_timeout_secs: 300,
         circuit_breaker: Some(state.circuit_breaker.clone()),
         context_config: Some(state.context_config.clone()),
@@ -198,6 +199,10 @@ fn agent_event_to_sse(
             let payload = inject_session_id(data, session_id);
             Some(Event::default().event("approval_required").data(payload))
         }
+        AgentEventKind::TerminalExec => {
+            let payload = inject_session_id(data, session_id);
+            Some(Event::default().event("terminal_exec").data(payload))
+        }
     }
 }
 
@@ -234,6 +239,36 @@ pub async fn approve_handler(
     } else {
         Err(AppError::InvalidRequest(
             "No active agent session with approval".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TerminalResultRequest {
+    pub request_id: String,
+    /// Session UUID returned in the terminal_exec SSE event.
+    pub session_id: Option<String>,
+    /// JSON-encoded result, e.g. {"stdout":..,"stderr":..,"exit_code":..}.
+    pub result: String,
+}
+
+#[allow(clippy::unused_async)]
+pub async fn terminal_result_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TerminalResultRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let gate = if let Some(sid) = &req.session_id {
+        state.get_terminal_gate(sid)
+    } else {
+        state.any_terminal_gate()
+    };
+
+    if let Some(gate) = gate {
+        let sent = gate.respond(&req.request_id, req.result).await;
+        Ok(Json(serde_json::json!({ "acknowledged": sent })))
+    } else {
+        Err(AppError::InvalidRequest(
+            "No active agent session awaiting terminal result".into(),
         ))
     }
 }

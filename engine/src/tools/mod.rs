@@ -2,6 +2,7 @@ pub mod approval;
 pub mod command;
 pub mod env_manager;
 pub mod git;
+pub mod terminal_gate;
 pub mod workspace;
 
 use async_trait::async_trait;

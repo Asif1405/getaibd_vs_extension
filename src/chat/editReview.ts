@@ -205,6 +205,14 @@ export class EditReviewManager implements vscode.CodeLensProvider {
     this.refresh();
   }
 
+  /** Drops review state for one file without touching disk (used after a checkpoint restore). */
+  dropEdit(relPath: string): void {
+    const abs = this.absFor(relPath);
+    if (abs) {this.edits.delete(abs);}
+    this.changed.fire();
+    this.refresh();
+  }
+
   clearAll(): void {
     this.edits.clear();
     this.changed.fire();
