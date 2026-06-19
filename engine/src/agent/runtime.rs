@@ -211,7 +211,7 @@ async fn agent_loop(
     let tool_defs = registry.definitions();
     let mut iterations = 0;
     let mut last_text = String::new();
-    let mut nudged = false;
+    let mut nudge_count = 0u32;
     let use_streaming = provider.supports_streaming_tools();
     let enable_thinking = options.is_none_or(|o| o.enable_thinking);
 
@@ -305,19 +305,25 @@ async fn agent_loop(
         }
 
         if response.tool_calls.is_empty() {
-            // In action modes the model sometimes only describes a plan instead of
-            // executing it. Nudge it once to actually use the tools before finishing.
-            let described_only = !nudged
+            // In action modes the model often narrates ("I'll write the file now") without
+            // emitting a tool call, so nothing actually happens. Nudge it to run the tools.
+            // Repeat a few times for weaker models, but never override a genuine question.
+            const MAX_NUDGES: u32 = 3;
+            let content_txt = response.content.as_deref().unwrap_or("");
+            let described_only = !looks_like_user_question(content_txt)
+                && nudge_count < MAX_NUDGES
                 && !tool_defs.is_empty()
                 && session.max_iterations > 1
                 && iterations < session.max_iterations;
             if described_only {
-                nudged = true;
+                nudge_count += 1;
                 session.push_message(ToolMessage::system(
-                    "Do not stop at describing a plan. If you have enough information, call the \
-                     tools now to actually perform the task end to end. Only ask the user a \
-                     question if you are genuinely blocked or the request is ambiguous or \
-                     destructive."
+                    "You replied without calling any tool, so the task has NOT been performed yet \
+                     and no files have changed. Call the appropriate tools NOW (write_file, \
+                     patch_file, move_file, delete_file, run_command, etc.) to do the work end to \
+                     end, then verify with git_diff. Do not describe what you will do — do it. Only \
+                     ask the user a question if you are genuinely blocked, or the action is \
+                     ambiguous or destructive."
                         .to_string(),
                 ));
                 continue;
@@ -346,6 +352,32 @@ async fn agent_loop(
             session.push_message(ToolMessage::system(thinking::REFLECTION_PROMPT.to_string()));
         }
     }
+}
+
+/// True when the model's text is a genuine question/confirmation for the user (so we
+/// should let it finish rather than nudging it to keep calling tools).
+fn looks_like_user_question(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.ends_with('?') {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    [
+        "would you like",
+        "do you want",
+        "should i ",
+        "shall i ",
+        "could you clarify",
+        "can you clarify",
+        "which option",
+        "let me know if",
+        "please confirm",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn emit_thinking_events(text: &str, on_event: &mut impl FnMut(AgentEvent)) {
