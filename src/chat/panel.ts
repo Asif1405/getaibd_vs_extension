@@ -13,6 +13,7 @@ import {
 import { scanText, formatWarning } from "../safetype/detector";
 import { ensureEngine } from "../engine/manager";
 import { PatchPreviewPanel } from "./patchPreview";
+import { EditReviewManager } from "./editReview";
 import {
   getServerUrl,
   authHeaders,
@@ -66,6 +67,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private currentStreamContent = "";
   private fileEdits = new Map<string, { path: string; originalOld: string; latestNew: string }>();
   private editContents = new Map<string, { originalOld: string; latestNew: string }>();
+  private editReview = new EditReviewManager(vscode.workspace.workspaceFolders?.[0]?.uri);
   private pendingApprovals = new Map<string, string | undefined>();
 
   constructor(context: vscode.ExtensionContext) {
@@ -86,9 +88,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         return uri.scheme === "getaibd-diff-new" ? edit.latestNew : edit.originalOld;
       },
     };
+    provider.editReview.setOnResolved((relPath, action) => {
+      provider.post({ type: "editResolved", path: relPath, action });
+      provider.fileEdits.delete(relPath);
+    });
     context.subscriptions.push(
       vscode.workspace.registerTextDocumentContentProvider("getaibd-diff", diffProvider),
       vscode.workspace.registerTextDocumentContentProvider("getaibd-diff-new", diffProvider),
+      ...provider.editReview.register(),
     );
     return vscode.window.registerWebviewViewProvider(ChatPanel.viewType, provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -732,6 +739,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const latestNew = edit.new_content ?? "";
     this.fileEdits.set(edit.path, { path: edit.path, originalOld, latestNew });
     this.editContents.set(edit.path, { originalOld, latestNew });
+    this.editReview.addEdit(edit.path, originalOld, latestNew);
     const { additions, deletions } = diffStat(originalOld, latestNew);
     const tooLarge = !!edit.too_large;
     const diff = tooLarge ? { lines: [], truncated: true } : computeDiffHunks(originalOld, latestNew);
@@ -773,44 +781,30 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   /** Accepts all pending agent edits (no-op on disk; just clears the review state). */
   private keepEdits() {
+    for (const path of [...this.fileEdits.keys()]) {
+      this.editReview.accept(path);
+    }
     this.fileEdits.clear();
   }
 
   /** Accepts a single pending edit, leaving the file as written. */
   private keepEdit(filePath: string) {
+    this.editReview.accept(filePath);
     this.fileEdits.delete(filePath);
   }
 
   /** Reverts every pending agent edit back to its original content. */
   private async undoEdits() {
     for (const edit of [...this.fileEdits.values()]) {
-      await this.revertEdit(edit.path, edit.originalOld);
+      await this.editReview.reject(edit.path);
     }
     this.fileEdits.clear();
   }
 
   /** Reverts a single pending edit back to its original content. */
   private async undoEdit(filePath: string) {
-    const edit = this.fileEdits.get(filePath);
-    if (!edit) {return;}
-    await this.revertEdit(filePath, edit.originalOld);
+    await this.editReview.reject(filePath);
     this.fileEdits.delete(filePath);
-  }
-
-  /** Writes original content back, or deletes the file if it was newly created. */
-  private async revertEdit(filePath: string, originalOld: string) {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) {return;}
-    const uri = vscode.Uri.joinPath(folder.uri, filePath);
-    try {
-      if (originalOld.length === 0) {
-        await vscode.workspace.fs.delete(uri, { useTrash: true });
-      } else {
-        await vscode.workspace.fs.writeFile(uri, Buffer.from(originalOld, "utf8"));
-      }
-    } catch {
-      /* file may have been deleted/moved */
-    }
   }
 
   private async previewPatch(llmResponse: string): Promise<void> {
@@ -2728,11 +2722,16 @@ function renderEditSummary() {
   let a = 0, d = 0;
   for (const p of paths) { a += editStats[p].a; d += editStats[p].d; }
   const n = paths.length;
-  const label = '<span class="es-label">' + n + ' file' + (n === 1 ? '' : 's')
+  const label = '<span class="es-label" title="Open diff">' + n + ' file' + (n === 1 ? '' : 's')
     + ' changed <span class="add">+' + a + '</span> <span class="del">-' + d + '</span></span>';
   const actions = '<span class="es-actions"><button class="es-keep">Accept all</button>'
     + '<button class="es-undo">Revert all</button></span>';
   editSummaryEl.innerHTML = label + actions;
+  const labelEl = editSummaryEl.querySelector(".es-label");
+  if (labelEl) {
+    labelEl.style.cursor = "pointer";
+    labelEl.addEventListener("click", () => vscode.postMessage({ type: "openDiff", path: paths[0] }));
+  }
   editSummaryEl.querySelector(".es-keep").addEventListener("click", () => {
     vscode.postMessage({ type: "keepEdits" });
     markAllCards("fe-accepted");
@@ -3312,6 +3311,17 @@ window.addEventListener("message", (event) => {
       editStats[p] = msg.tooLarge ? { a: 0, d: 0 } : { a: msg.additions, d: msg.deletions };
       renderEditSummary();
       scrollToBottom();
+      break;
+    }
+
+    case "editResolved": {
+      const rp = msg.path;
+      const rcard = editCardEls[rp];
+      if (rcard) {
+        rcard.classList.remove("fe-accepted", "fe-reverted");
+        rcard.classList.add(msg.action === "reject" ? "fe-reverted" : "fe-accepted");
+      }
+      if (editStats[rp]) { delete editStats[rp]; renderEditSummary(); }
       break;
     }
 
