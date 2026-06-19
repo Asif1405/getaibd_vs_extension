@@ -1402,7 +1402,7 @@ body {
 .file-edit.fe-reverted { opacity: 0.5; }
 .file-edit.fe-reverted .fe-path { text-decoration: line-through; }
 .file-edit.fe-accepted .fe-actions, .file-edit.fe-reverted .fe-actions { display: none; }
-.fe-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; }
+.fe-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; }
 .fe-head:hover { background: var(--vscode-list-hoverBackground, transparent); }
 .fe-icon { opacity: 0.8; }
 .fe-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vscode-editor-font-family, monospace); cursor: pointer; }
@@ -2544,7 +2544,7 @@ inputEl.addEventListener("input", () => {
 
 function detectPlanIntent(text) {
   const t = text.toLowerCase();
-  return /\b(plan|how (should|do|would|can) (i|we|you)|what(?:'s| is) the best way|best way to|approach to|strategy (for|to)|architecture (of|for)|design (a|an|the|for)|outline|steps to|break (this |it )?down|should (i|we))\b/.test(t);
+  return /\\b(plan|how (should|do|would|can) (i|we|you)|what(?:'s| is) the best way|best way to|approach to|strategy (for|to)|architecture (of|for)|design (a|an|the|for)|outline|steps to|break (this |it )?down|should (i|we))\\b/.test(t);
 }
 
 function send() {
@@ -2616,7 +2616,7 @@ function mdToHtml(text) {
 
 function enhanceTaskLists(html) {
   if (!html || html.indexOf("[") === -1) return html;
-  return html.replace(/<li[^>]*>(\s*<p>)?\s*\[([ xX])\]\s*/g, (m, p, c) => {
+  return html.replace(/<li[^>]*>(\\s*<p>)?\\s*\\[([ xX])\\]\\s*/g, (m, p, c) => {
     const checked = c.toLowerCase() === "x";
     const cls = checked ? "task-item checked" : "task-item";
     return '<li class="' + cls + '">' + (p || "")
@@ -2801,10 +2801,10 @@ function finalizeThought() {
 function stripThinkingTags(text) {
   if (!text) return "";
   let out = text
-    .replace(/<plan>[\s\S]*?<\/plan>/gi, "")
-    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
-    .replace(/<reflection>[\s\S]*?<\/reflection>/gi, "");
-  out = out.replace(/<\/?(plan|thinking|reflection)>/gi, "");
+    .replace(/<plan>[\\s\\S]*?<\\/plan>/gi, "")
+    .replace(/<thinking>[\\s\\S]*?<\\/thinking>/gi, "")
+    .replace(/<reflection>[\\s\\S]*?<\\/reflection>/gi, "");
+  out = out.replace(/<\\/?(plan|thinking|reflection)>/gi, "");
   const open = out.search(/<(plan|thinking|reflection)>[^]*$/i);
   if (open !== -1) out = out.slice(0, open);
   return out;
@@ -3281,8 +3281,11 @@ window.addEventListener("message", (event) => {
         ? '<div class="fe-diff" style="display:none">' + diffBodyHtml(msg.diff) + '</div>'
         : '';
       card.innerHTML = head + body;
-      const pathEl = card.querySelector(".fe-path");
-      if (pathEl) pathEl.addEventListener("click", () => vscode.postMessage({ type: "openDiff", path: p }));
+      const headEl = card.querySelector(".fe-head");
+      if (headEl) headEl.addEventListener("click", (e) => {
+        if (e.target && e.target.closest && e.target.closest("button")) return;
+        vscode.postMessage({ type: "openDiff", path: p });
+      });
       const toggleEl = card.querySelector(".fe-toggle");
       const diffEl = card.querySelector(".fe-diff");
       if (toggleEl && diffEl) toggleEl.addEventListener("click", () => {
