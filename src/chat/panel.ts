@@ -57,7 +57,6 @@ interface SessionMeta {
   createdAt: number;
 }
 
-const HISTORY_KEY = "getaibd.chatHistory";
 const SESSIONS_KEY = "getaibd.sessions";
 const ACTIVE_SESSION_KEY = "getaibd.activeSession";
 const SESSION_HISTORY_PREFIX = "getaibd.history.";
@@ -71,6 +70,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private static instance: ChatPanel | undefined;
   private view: vscode.WebviewView | undefined;
   private readonly globalState: vscode.Memento;
+  // Per-workspace store for chat sessions + history so each project/window keeps
+  // its own conversations (globalState is shared across every VS Code window).
+  private readonly sessionStore: vscode.Memento;
   private readonly context: vscode.ExtensionContext;
   private readonly store: ProviderStore;
   private abortController: AbortController | undefined;
@@ -91,6 +93,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
+    this.sessionStore = context.workspaceState;
     this.context = context;
     this.store = new ProviderStore(context.globalState, context.secrets);
     this.loadSessions();
@@ -1156,7 +1159,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private saveHistory() {
-    this.globalState.update(SESSION_HISTORY_PREFIX + this.activeSessionId, this.history);
+    this.sessionStore.update(SESSION_HISTORY_PREFIX + this.activeSessionId, this.history);
     this.maybeTitleFromHistory();
   }
 
@@ -1180,35 +1183,31 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     return out;
   }
 
-  /** Loads session metadata, migrating any legacy single-history into a first session. */
+  /** Loads this workspace's session metadata (each project keeps its own). */
   private loadSessions() {
-    this.sessions = this.globalState.get<SessionMeta[]>(SESSIONS_KEY, []);
+    this.sessions = this.sessionStore.get<SessionMeta[]>(SESSIONS_KEY, []);
     if (this.sessions.length === 0) {
-      const legacy = this.globalState.get<HistoryEntry[]>(HISTORY_KEY, []);
       const first: SessionMeta = { id: newId(), title: "New chat", createdAt: Date.now() };
       this.sessions = [first];
       this.activeSessionId = first.id;
-      this.globalState.update(SESSIONS_KEY, this.sessions);
-      this.globalState.update(ACTIVE_SESSION_KEY, first.id);
-      this.globalState.update(SESSION_HISTORY_PREFIX + first.id, legacy);
-      if (legacy.length) {
-        this.globalState.update(HISTORY_KEY, []);
-      }
+      this.sessionStore.update(SESSIONS_KEY, this.sessions);
+      this.sessionStore.update(ACTIVE_SESSION_KEY, first.id);
+      this.sessionStore.update(SESSION_HISTORY_PREFIX + first.id, []);
     } else {
-      this.activeSessionId = this.globalState.get<string>(ACTIVE_SESSION_KEY, this.sessions[0].id);
+      this.activeSessionId = this.sessionStore.get<string>(ACTIVE_SESSION_KEY, this.sessions[0].id);
       if (!this.sessions.some((s) => s.id === this.activeSessionId)) {
         this.activeSessionId = this.sessions[0].id;
       }
     }
-    this.history = this.globalState.get<HistoryEntry[]>(
+    this.history = this.sessionStore.get<HistoryEntry[]>(
       SESSION_HISTORY_PREFIX + this.activeSessionId,
       [],
     );
   }
 
   private saveSessions() {
-    this.globalState.update(SESSIONS_KEY, this.sessions);
-    this.globalState.update(ACTIVE_SESSION_KEY, this.activeSessionId);
+    this.sessionStore.update(SESSIONS_KEY, this.sessions);
+    this.sessionStore.update(ACTIVE_SESSION_KEY, this.activeSessionId);
   }
 
   private sendSessions() {
@@ -1240,7 +1239,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.editContents.clear();
     this.fileEdits.clear();
     this.editReview.clearAll();
-    this.globalState.update(SESSION_HISTORY_PREFIX + session.id, []);
+    this.sessionStore.update(SESSION_HISTORY_PREFIX + session.id, []);
     this.saveSessions();
     this.sendSessions();
     this.post({ type: "clearMessages" });
@@ -1254,7 +1253,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.abortController = undefined;
     this.currentTurnId = undefined;
     this.activeSessionId = id;
-    this.history = this.globalState.get<HistoryEntry[]>(SESSION_HISTORY_PREFIX + id, []);
+    this.history = this.sessionStore.get<HistoryEntry[]>(SESSION_HISTORY_PREFIX + id, []);
     this.saveSessions();
     this.sendSessions();
     this.post({ type: "clearMessages" });
@@ -1267,14 +1266,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       return;
     }
     this.sessions.splice(idx, 1);
-    this.globalState.update(SESSION_HISTORY_PREFIX + id, undefined);
+    this.sessionStore.update(SESSION_HISTORY_PREFIX + id, undefined);
     if (this.sessions.length === 0) {
       const session: SessionMeta = { id: newId(), title: "New chat", createdAt: Date.now() };
       this.sessions = [session];
     }
     if (id === this.activeSessionId) {
       this.activeSessionId = this.sessions[0].id;
-      this.history = this.globalState.get<HistoryEntry[]>(
+      this.history = this.sessionStore.get<HistoryEntry[]>(
         SESSION_HISTORY_PREFIX + this.activeSessionId,
         [],
       );
