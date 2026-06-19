@@ -75,9 +75,8 @@ async fn main() {
 
     let state = Arc::new(AppState::from_config(&app_config));
 
-    run_startup_indexing(&state).await;
-
     let _watcher = start_file_watcher(&state);
+    let index_state = state.clone();
 
     if let Some(ref url) = state.public_url {
         tracing::info!("Public URL set to {url} — SSE clients should connect here");
@@ -128,9 +127,13 @@ async fn main() {
         .parse()
         .expect("Invalid bind address");
 
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     tracing::info!("MCP Universal server listening on http://{addr}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tokio::spawn(async move {
+        run_startup_indexing(index_state.as_ref()).await;
+    });
+
     axum::serve(listener, app).await.unwrap();
 }
 

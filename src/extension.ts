@@ -6,7 +6,7 @@ import { generateTests } from "./commands/generateTests";
 import { InlineCompletionProvider } from "./commands/inline";
 import { activateDiagnostics } from "./safetype/diagnostics";
 import { ensureEngine, restartEngine, stopEngine } from "./engine/manager";
-import { getApiKey, setApiKey } from "./util/config";
+import { getApiKey, setApiKey, isFreeToken } from "./util/config";
 import { fetchAccountStatus } from "./client";
 import { createFreeSession } from "./free";
 
@@ -56,13 +56,18 @@ export function activate(context: vscode.ExtensionContext) {
       placeHolder: "aiob_…",
       password: true,
       ignoreFocusOut: true,
+      validateInput: (v) =>
+        isFreeToken(v.trim())
+          ? "That is an internal free-tier token. Paste your real GetAIBD API key."
+          : undefined,
     });
-    if (!value || !value.trim()) {
+    if (!value || !value.trim() || isFreeToken(value.trim())) {
       return false;
     }
     await setApiKey(context.secrets, value.trim());
     await restartEngine(context).catch(() => undefined);
     void refreshBalance();
+    ChatPanel.current()?.refreshAuthMode();
     return true;
   };
 
@@ -146,8 +151,15 @@ export function activate(context: vscode.ExtensionContext) {
   };
 
   context.subscriptions.push(
+    ChatPanel.register(context),
+
     vscode.commands.registerCommand("getaibd.openChat", withEngine(() => {
       ChatPanel.open(context);
+    })),
+
+    vscode.commands.registerCommand("getaibd.newChat", withEngine(() => {
+      ChatPanel.open(context);
+      ChatPanel.current()?.startNewSession();
     })),
 
     vscode.commands.registerCommand("getaibd.useFree", async () => {
@@ -184,17 +196,26 @@ export function activate(context: vscode.ExtensionContext) {
     })),
 
     vscode.commands.registerCommand("getaibd.setApiKey", async () => {
+      const existing = await getApiKey(context.secrets);
       const value = await vscode.window.showInputBox({
         title: "GetAIBD API Key",
         prompt: "Paste your GetAIBD API key (from https://getaibd.com)",
         password: true,
         ignoreFocusOut: true,
-        value: await getApiKey(context.secrets),
+        value: isFreeToken(existing) ? "" : existing,
+        validateInput: (v) =>
+          isFreeToken(v.trim())
+            ? "That is an internal free-tier token. Paste your real GetAIBD API key."
+            : undefined,
       });
       if (value === undefined) {
         return;
       }
-      await setApiKey(context.secrets, value);
+      const trimmed = value.trim();
+      if (isFreeToken(trimmed)) {
+        return;
+      }
+      await setApiKey(context.secrets, trimmed);
       await restartEngine(context).catch((err) => {
         vscode.window.showErrorMessage(
           err instanceof Error ? err.message : "Failed to restart GetAIBD engine.",

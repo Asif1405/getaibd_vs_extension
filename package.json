@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "Cursor-style AI coding agent powered by GetAIBD",
-  "version": "0.1.3",
+  "version": "0.2.5",
   "repository": {
     "type": "git",
     "url": "https://github.com/dmsbilas/getaibd_vs_extension.git"
@@ -23,10 +23,33 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "getaibd",
+          "title": "GetAIBD",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "getaibd": [
+        {
+          "id": "getaibd.chatView",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "getaibd.openChat",
         "title": "GetAIBD: Open Chat"
+      },
+      {
+        "command": "getaibd.newChat",
+        "title": "GetAIBD: New Chat",
+        "icon": "$(add)"
       },
       {
         "command": "getaibd.openAgent",
@@ -46,7 +69,8 @@
       },
       {
         "command": "getaibd.openSettings",
-        "title": "GetAIBD: Open Settings"
+        "title": "GetAIBD: Open Settings",
+        "icon": "$(gear)"
       },
       {
         "command": "getaibd.setApiKey",
@@ -83,6 +107,18 @@
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "getaibd.newChat",
+          "when": "view == getaibd.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "getaibd.openSettings",
+          "when": "view == getaibd.chatView",
+          "group": "navigation@2"
+        }
+      ],
       "editor/context": [
         {
           "command": "getaibd.explainSelection",
@@ -113,7 +149,13 @@
         "getaibd.model": {
           "type": "string",
           "default": "qwen-flash",
-          "description": "Default model id. 'qwen-flash' is free; other models require your own provider API key.",
+          "description": "Default model id. 'qwen-flash' is free; other models use your GetAIBD credit balance.",
+          "order": 2
+        },
+        "getaibd.memory": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the agent's project memory and codebase indexing. The memory database is stored in the extension's storage, not your project.",
           "order": 2
         },
         "getaibd.baseUrl": {
@@ -167,7 +209,12 @@
         "getaibd.chat.defaultMode": {
           "type": "string",
           "default": "agent",
-          "enum": ["chat", "agent"],
+          "enum": [
+            "agent",
+            "plan",
+            "ask",
+            "debug"
+          ],
           "description": "Default mode when opening the chat panel."
         },
         "getaibd.agent.maxIterations": {
@@ -183,7 +230,13 @@
         "getaibd.agent.autoMode": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "ask", "plan", "agent", "debug"],
+          "enum": [
+            "auto",
+            "ask",
+            "plan",
+            "agent",
+            "debug"
+          ],
           "description": "Agent mode selection (auto = detect from the prompt)."
         }
       }
@@ -201,12 +254,15 @@
     "engine:build": "cargo build --release --manifest-path engine/Cargo.toml"
   },
   "devDependencies": {
-    "@types/vscode": "^1.96.0",
     "@types/node": "22.x",
-    "typescript-eslint": "^8.56.1",
-    "eslint": "^9.39.3",
+    "@types/vscode": "^1.96.0",
     "esbuild": "^0.27.3",
+    "eslint": "^9.39.3",
     "npm-run-all": "^4.1.5",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1"
+  },
+  "dependencies": {
+    "marked": "^14.1.4"
   }
 }

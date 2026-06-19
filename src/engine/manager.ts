@@ -1,8 +1,11 @@
 import * as vscode from "vscode";
-import { spawn, ChildProcess } from "child_process";
-import { randomUUID } from "crypto";
+import { spawn, execFile, ChildProcess } from "child_process";
+import { randomUUID, createHash } from "crypto";
+import { promisify } from "util";
 import * as path from "path";
 import * as fs from "fs";
+
+const execFileAsync = promisify(execFile);
 import {
   getApiKey,
   getBaseUrl,
@@ -37,6 +40,47 @@ function resolveEnginePath(context: vscode.ExtensionContext): string | undefined
     path.join(context.extensionPath, "engine", "target", "debug", binaryName()),
   ];
   return candidates.find((p) => p && fs.existsSync(p));
+}
+
+/** Kills any stale process still bound to the engine port (e.g. an orphan from a
+ * previous session whose auth token we no longer know). Best-effort, cross-platform. */
+async function freePort(port: string): Promise<void> {
+  try {
+    if (process.platform === "win32") {
+      const { stdout } = await execFileAsync("netstat", ["-ano", "-p", "tcp"]);
+      const pids = new Set<string>();
+      for (const line of stdout.split(/\r?\n/)) {
+        if (line.includes(`:${port}`) && /LISTENING/i.test(line)) {
+          const pid = line.trim().split(/\s+/).pop();
+          if (pid && pid !== "0") {
+            pids.add(pid);
+          }
+        }
+      }
+      for (const pid of pids) {
+        await execFileAsync("taskkill", ["/F", "/PID", pid]).catch(() => undefined);
+      }
+    } else {
+      const { stdout } = await execFileAsync("lsof", [
+        "-nP",
+        `-iTCP:${port}`,
+        "-sTCP:LISTEN",
+        "-t",
+      ]).catch(() => ({ stdout: "" }));
+      for (const pid of stdout.split(/\s+/).filter(Boolean)) {
+        try {
+          process.kill(Number(pid));
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  } catch {
+    /* nothing listening, or tool unavailable */
+  }
+  if (await isHealthy(`http://127.0.0.1:${port}`, 1500)) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
 }
 
 async function isHealthy(url: string, timeoutMs: number): Promise<boolean> {
@@ -86,6 +130,11 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
   }
 
   const token = randomUUID();
+  const projectRoot =
+    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? context.extensionPath;
+  const memoryEnabled = vscode.workspace
+    .getConfiguration("getaibd")
+    .get<boolean>("memory", true);
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     GETAIBD_API_KEY: apiKey,
@@ -93,7 +142,15 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
     MCP_SERVER_HOST: "127.0.0.1",
     MCP_SERVER_PORT: port,
     MCP_AUTH_TOKEN: token,
+    MCP_AGENT_PROJECT_ROOT: projectRoot,
+    MCP_MEMORY_ENABLED: memoryEnabled ? "1" : "0",
   };
+  if (memoryEnabled) {
+    const memDir = path.join(context.globalStoragePath, "memory");
+    fs.mkdirSync(memDir, { recursive: true });
+    const key = Buffer.from(projectRoot).toString("hex").slice(0, 40);
+    env.MCP_MEMORY_DB_PATH = path.join(memDir, `${key}.db`);
+  }
   const model = vscode.workspace
     .getConfiguration("getaibd")
     .get<string>("model", "")
@@ -102,13 +159,19 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
     env.GETAIBD_DEFAULT_MODEL = model;
   }
 
-  log(`Starting engine: ${enginePath} (port ${port})`);
+  await freePort(port);
+
+  log(`Starting engine: ${enginePath} (port ${port}, root ${projectRoot})`);
   const child = spawn(enginePath, [], {
     env,
-    cwd: context.extensionPath,
+    cwd: projectRoot,
     stdio: ["ignore", "pipe", "pipe"],
   });
   engineProcess = child;
+  let exited = false;
+  child.once("exit", () => {
+    exited = true;
+  });
 
   child.stdout?.on("data", (d: Buffer) => log(d.toString().trimEnd()));
   child.stderr?.on("data", (d: Buffer) => log(d.toString().trimEnd()));
@@ -120,6 +183,10 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
   });
 
   const healthy = await isHealthy(serverUrl, 30000);
+  if (exited || child.exitCode !== null) {
+    engineProcess = undefined;
+    throw new Error("GetAIBD engine exited during startup (port may be in use). See the GetAIBD Engine output for details.");
+  }
   if (!healthy) {
     child.kill();
     engineProcess = undefined;

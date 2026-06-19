@@ -42,11 +42,28 @@ async function main() {
 			esbuildProblemMatcherPlugin,
 		],
 	});
+	const webCtx = await esbuild.context({
+		entryPoints: [
+			'src/webview/markdown.ts'
+		],
+		bundle: true,
+		format: 'iife',
+		minify: production,
+		sourcemap: !production,
+		sourcesContent: false,
+		platform: 'browser',
+		outfile: 'dist/markdown.js',
+		logLevel: 'silent',
+		plugins: [esbuildProblemMatcherPlugin],
+	});
 	if (watch) {
 		await ctx.watch();
+		await webCtx.watch();
 	} else {
 		await ctx.rebuild();
 		await ctx.dispose();
+		await webCtx.rebuild();
+		await webCtx.dispose();
 	}
 }
 

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AppError;
 
@@ -48,15 +48,16 @@ impl MemoryStore {
     }
 
     fn init_schema(&self) -> Result<(), AppError> {
-        self.lock()?
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS memories (
+        let conn = self.lock()?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memories (
                     id TEXT PRIMARY KEY,
                     content TEXT NOT NULL,
                     embedding BLOB NOT NULL,
                     source TEXT NOT NULL,
                     tier TEXT NOT NULL DEFAULT 'short',
-                    timestamp INTEGER NOT NULL
+                    timestamp INTEGER NOT NULL,
+                    hits INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
                 CREATE INDEX IF NOT EXISTS idx_memories_timestamp ON memories(timestamp);
@@ -64,12 +65,27 @@ impl MemoryStore {
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                     id UNINDEXED, content, tokenize='porter unicode61'
                 );",
-            )
-            .map_err(|e| AppError::ProviderError(format!("memory schema: {e}")))?;
+        )
+        .map_err(|e| AppError::ProviderError(format!("memory schema: {e}")))?;
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN hits INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .ok();
         Ok(())
     }
 
     pub fn insert(&self, entry: &MemoryEntry) -> Result<(), AppError> {
+        if let Some(dup_id) = self.find_content_duplicate(&entry.id, &entry.content)? {
+            let conn = self.lock()?;
+            conn.execute(
+                "UPDATE memories SET timestamp = ?1, hits = hits + 1 WHERE id = ?2",
+                params![entry.timestamp, dup_id],
+            )
+            .map_err(|e| AppError::ProviderError(format!("memory refresh: {e}")))?;
+            return Ok(());
+        }
+
         let emb_blob = embedding_to_blob(&entry.embedding);
         let conn = self.lock()?;
 
@@ -105,6 +121,26 @@ impl MemoryStore {
         top_k: usize,
     ) -> Result<Vec<RetrievedMemory>, AppError> {
         self.hybrid_search(query_embedding, "", top_k)
+    }
+
+    /// Returns the id of an existing memory with byte-identical content under a
+    /// different id, so re-inserts by id still update content while duplicates
+    /// from other sources are collapsed.
+    fn find_content_duplicate(
+        &self,
+        id: &str,
+        content: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.lock()?;
+        let existing = conn
+            .query_row(
+                "SELECT id FROM memories WHERE content = ?1 AND id != ?2 LIMIT 1",
+                params![content, id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| AppError::ProviderError(format!("dedup query: {e}")))?;
+        Ok(existing)
     }
 
     pub fn hybrid_search(
@@ -160,6 +196,7 @@ impl MemoryStore {
             let score = raw * decay * tier_boost;
 
             scored.push(RetrievedMemory {
+                id,
                 content,
                 score,
                 source: MemorySource::from_tag(&source_tag),
@@ -273,23 +310,69 @@ impl MemoryStore {
 
         let to_delete = total - keep;
 
+        let order = "ORDER BY CASE tier WHEN 'short' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END ASC, \
+                     hits ASC, timestamp ASC";
+
         conn.execute(
-            "DELETE FROM memories_fts WHERE id IN (
-                SELECT id FROM memories ORDER BY timestamp ASC LIMIT ?1
-            )",
+            &format!(
+                "DELETE FROM memories_fts WHERE id IN (
+                    SELECT id FROM memories {order} LIMIT ?1
+                )"
+            ),
             params![to_delete],
         )
         .ok();
 
         let count = conn
             .execute(
-                "DELETE FROM memories WHERE id IN (
-                    SELECT id FROM memories ORDER BY timestamp ASC LIMIT ?1
-                )",
+                &format!(
+                    "DELETE FROM memories WHERE id IN (
+                        SELECT id FROM memories {order} LIMIT ?1
+                    )"
+                ),
                 params![to_delete],
             )
             .map_err(|e| AppError::ProviderError(format!("memory prune: {e}")))?;
         Ok(count)
+    }
+
+    /// Reinforces retrieved memories: refreshes recency, counts a hit, and
+    /// promotes the tier once a memory has proven repeatedly useful.
+    pub fn touch_many(&self, ids: &[String]) -> Result<(), AppError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        const PROMOTE_MEDIUM: i64 = 3;
+        const PROMOTE_LONG: i64 = 8;
+        let now = current_timestamp();
+        let conn = self.lock()?;
+        for id in ids {
+            conn.execute(
+                "UPDATE memories SET timestamp = ?1, hits = hits + 1 WHERE id = ?2",
+                params![now, id],
+            )
+            .ok();
+            let hits: i64 = conn
+                .query_row("SELECT hits FROM memories WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            let new_tier = if hits >= PROMOTE_LONG {
+                Some(MemoryTier::Long)
+            } else if hits >= PROMOTE_MEDIUM {
+                Some(MemoryTier::Medium)
+            } else {
+                None
+            };
+            if let Some(tier) = new_tier {
+                conn.execute(
+                    "UPDATE memories SET tier = ?1 WHERE id = ?2 AND tier != ?1",
+                    params![tier.as_str(), id],
+                )
+                .ok();
+            }
+        }
+        Ok(())
     }
 
     pub fn promote_tier(&self, id: &str, new_tier: MemoryTier) -> Result<(), AppError> {

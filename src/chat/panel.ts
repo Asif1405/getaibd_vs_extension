@@ -34,58 +34,82 @@ interface HistoryEntry {
   label?: string;
 }
 
+interface SessionMeta {
+  id: string;
+  title: string;
+  createdAt: number;
+}
+
 const HISTORY_KEY = "getaibd.chatHistory";
+const SESSIONS_KEY = "getaibd.sessions";
+const ACTIVE_SESSION_KEY = "getaibd.activeSession";
+const SESSION_HISTORY_PREFIX = "getaibd.history.";
 const PROVIDER_KEY = "getaibd.lastProvider";
 const MODEL_KEY = "getaibd.lastModel";
 const MODE_KEY = "getaibd.lastMode";
 const MAX_RECONNECT = 3;
 
-export class ChatPanel {
+export class ChatPanel implements vscode.WebviewViewProvider {
+  static readonly viewType = "getaibd.chatView";
   private static instance: ChatPanel | undefined;
-  private readonly panel: vscode.WebviewPanel;
+  private view: vscode.WebviewView | undefined;
   private readonly globalState: vscode.Memento;
   private readonly context: vscode.ExtensionContext;
   private readonly store: ProviderStore;
   private abortController: AbortController | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private disposables: vscode.Disposable[] = [];
+  private sessions: SessionMeta[] = [];
+  private activeSessionId = "";
   private history: HistoryEntry[] = [];
   private currentStreamContent = "";
 
-  private constructor(context: vscode.ExtensionContext) {
+  constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
     this.context = context;
     this.store = new ProviderStore(context.globalState, context.secrets);
-    this.history = this.globalState.get<HistoryEntry[]>(HISTORY_KEY, []);
+    this.loadSessions();
+    ChatPanel.instance = this;
+  }
 
-    this.panel = vscode.window.createWebviewPanel(
-      "getaibdChat",
-      "GetAIBD",
-      vscode.ViewColumn.Beside,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, "media")],
-      },
-    );
+  /** Registers the chat as a full-height sidebar webview view. */
+  static register(context: vscode.ExtensionContext): vscode.Disposable {
+    const provider = new ChatPanel(context);
+    return vscode.window.registerWebviewViewProvider(ChatPanel.viewType, provider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    });
+  }
 
-    this.panel.webview.html = getWebviewContent();
-
-    this.panel.webview.onDidReceiveMessage(
+  resolveWebviewView(view: vscode.WebviewView) {
+    this.view = view;
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [
+        vscode.Uri.joinPath(this.context.extensionUri, "media"),
+        vscode.Uri.joinPath(this.context.extensionUri, "dist"),
+      ],
+    };
+    view.webview.html = getWebviewContent(view.webview, this.context.extensionUri);
+    view.webview.onDidReceiveMessage(
       (msg: WebviewMessage) => this.handleMessage(msg),
       undefined,
       this.disposables,
     );
-
-    this.panel.onDidDispose(() => this.dispose(), undefined, this.disposables);
+    view.onDidDispose(() => {
+      this.view = undefined;
+      this.ready = false;
+    }, undefined, this.disposables);
   }
 
-  static open(context: vscode.ExtensionContext) {
-    if (ChatPanel.instance) {
-      ChatPanel.instance.panel.reveal();
-      return ChatPanel.instance;
+  private post(msg: unknown) {
+    this.view?.webview.postMessage(msg);
+  }
+
+  static open(context: vscode.ExtensionContext): ChatPanel {
+    if (!ChatPanel.instance) {
+      ChatPanel.instance = new ChatPanel(context);
     }
-    ChatPanel.instance = new ChatPanel(context);
+    void vscode.commands.executeCommand(`${ChatPanel.viewType}.focus`);
     return ChatPanel.instance;
   }
 
@@ -93,14 +117,30 @@ export class ChatPanel {
     return ChatPanel.instance;
   }
 
+  private ready = false;
+  private pending: Array<() => void> = [];
+
+  /** Runs an action now if the webview is ready, else queues it until it is. */
+  private whenReady(fn: () => void) {
+    if (this.ready && this.view) {
+      fn();
+    } else {
+      this.pending.push(fn);
+    }
+  }
+
   openSettings() {
-    this.panel.webview.postMessage({ type: "showSettings" });
+    this.whenReady(() => this.post({ type: "showSettings" }));
+  }
+
+  startNewSession() {
+    this.whenReady(() => this.newSession());
   }
 
   /** Re-reads the stored credential and tells the webview whether it is free-tier. */
   async refreshAuthMode() {
     const key = await getApiKey(this.context.secrets);
-    this.panel.webview.postMessage({
+    this.post({
       type: "authMode",
       free: isFreeToken(key),
       freeModelId: FREE_MODEL_ID,
@@ -109,17 +149,17 @@ export class ChatPanel {
   }
 
   enableAgentMode() {
-    this.panel.webview.postMessage({ type: "setAgentMode" });
+    this.whenReady(() => this.post({ type: "setAgentMode" }));
   }
 
   setMode(mode: string) {
-    this.panel.webview.postMessage({ type: "setAgentMode", mode });
+    this.whenReady(() => this.post({ type: "setAgentMode", mode }));
   }
 
   addContext(label: string, code: string) {
     this.history.push({ kind: "context", content: code, label });
     this.saveHistory();
-    this.panel.webview.postMessage({ type: "addContext", label, code });
+    this.post({ type: "addContext", label, code });
   }
 
   streamToPanel(provider: string, model: string, messages: ChatMessage[], apiKey?: string) {
@@ -135,16 +175,16 @@ export class ChatPanel {
   ) {
     if (attempt === 0) {
       this.currentStreamContent = "";
-      this.panel.webview.postMessage({ type: "streamStart" });
+      this.post({ type: "streamStart" });
     } else {
       this.currentStreamContent = "";
-      this.panel.webview.postMessage({ type: "streamRetry" });
+      this.post({ type: "streamRetry" });
     }
 
     this.abortController = streamChat(provider, model, messages, {
       onToken: (token) => {
         this.currentStreamContent += token;
-        this.panel.webview.postMessage({ type: "streamToken", content: token });
+        this.post({ type: "streamToken", content: token });
       },
       onDone: () => {
         if (this.currentStreamContent) {
@@ -156,13 +196,13 @@ export class ChatPanel {
           this.saveHistory();
         }
         this.currentStreamContent = "";
-        this.panel.webview.postMessage({ type: "streamEnd" });
+        this.post({ type: "streamEnd" });
         this.abortController = undefined;
       },
       onError: (error) => {
         const isNetworkError = !error.startsWith("HTTP ");
         if (isNetworkError && attempt < MAX_RECONNECT) {
-          this.panel.webview.postMessage({
+          this.post({
             type: "reconnecting",
             attempt: attempt + 1,
             max: MAX_RECONNECT,
@@ -175,7 +215,7 @@ export class ChatPanel {
           return;
         }
         this.currentStreamContent = "";
-        this.panel.webview.postMessage({ type: "streamError", error });
+        this.post({ type: "streamError", error });
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
@@ -204,7 +244,7 @@ export class ChatPanel {
         this.abortController?.abort();
         this.abortController = undefined;
         this.currentStreamContent = "";
-        this.panel.webview.postMessage({ type: "streamEnd" });
+        this.post({ type: "streamEnd" });
         break;
       case "agentSend":
         if (msg.provider && msg.model && msg.text) {
@@ -221,6 +261,15 @@ export class ChatPanel {
       case "clearHistory":
         this.history = [];
         this.saveHistory();
+        break;
+      case "newSession":
+        this.newSession();
+        break;
+      case "switchSession":
+        if (msg.id) {this.switchSession(msg.id as string);}
+        break;
+      case "deleteSession":
+        if (msg.id) {this.deleteSession(msg.id as string);}
         break;
       case "copy":
         if (msg.content) {await vscode.env.clipboard.writeText(msg.content as string);}
@@ -287,9 +336,15 @@ export class ChatPanel {
       /* engine errors are surfaced when the user sends */
     }
     await this.loadProviders();
+    this.sendSessions();
     this.restoreHistory();
     this.restoreSelections();
     await this.refreshAuthMode();
+    this.ready = true;
+    const queued = this.pending.splice(0);
+    for (const fn of queued) {
+      fn();
+    }
   }
 
   /** Ensures the engine is up, then reloads providers + models (dropdown self-heal). */
@@ -332,11 +387,11 @@ export class ChatPanel {
   private async loadProviders() {
     try {
       const providers = await fetchProviders();
-      this.panel.webview.postMessage({ type: "providers", providers });
+      this.post({ type: "providers", providers });
     } catch {
-      this.panel.webview.postMessage({ type: "providers", providers: [] });
+      this.post({ type: "providers", providers: [] });
     }
-    this.panel.webview.postMessage({
+    this.post({
       type: "curatedCatalog",
       curatedModels: CURATED_MODELS,
       providerMeta: PROVIDER_META,
@@ -347,9 +402,9 @@ export class ChatPanel {
   private async loadModels(providerId: string) {
     try {
       const models = await fetchModels(providerId);
-      this.panel.webview.postMessage({ type: "models", models, provider: providerId });
+      this.post({ type: "models", models, provider: providerId });
     } catch {
-      this.panel.webview.postMessage({ type: "models", models: [], provider: providerId });
+      this.post({ type: "models", models: [], provider: providerId });
     }
   }
 
@@ -362,10 +417,11 @@ export class ChatPanel {
     const config = vscode.workspace.getConfiguration("getaibd");
     const lastProvider = this.globalState.get<string>(PROVIDER_KEY) || config.get<string>("chat.defaultProvider", "getaibd");
     const lastModel = this.globalState.get<string>(MODEL_KEY) || config.get<string>("chat.defaultModel", "");
-    const defaultMode = config.get<string>("chat.defaultMode", "chat");
+    let defaultMode = config.get<string>("chat.defaultMode", "agent");
+    if (defaultMode === "chat") {defaultMode = "agent";}
     const lastMode = this.globalState.get<string>(MODE_KEY) || defaultMode;
 
-    this.panel.webview.postMessage({
+    this.post({
       type: "restoreSelections",
       provider: lastProvider,
       model: lastModel,
@@ -382,7 +438,7 @@ export class ChatPanel {
         serverConfig = await resp.json();
       }
     } catch { /* server not reachable */ }
-    this.panel.webview.postMessage({ type: "settings", ...snapshot, serverConfig });
+    this.post({ type: "settings", ...snapshot, serverConfig });
   }
 
   private async handleSaveProvider(msg: WebviewMessage) {
@@ -401,9 +457,9 @@ export class ChatPanel {
     const id = msg.providerId as string;
     const model = (msg.model as string) || "gpt-4o-mini";
     const key = await this.store.getApiKey(id);
-    this.panel.webview.postMessage({ type: "testResult", providerId: id, status: "testing" });
+    this.post({ type: "testResult", providerId: id, status: "testing" });
     const result = await testProviderConnection(id, model, key);
-    this.panel.webview.postMessage({
+    this.post({
       type: "testResult",
       providerId: id,
       status: result.ok ? "ok" : "error",
@@ -474,7 +530,7 @@ export class ChatPanel {
       if (files.length > 0) {
         const doc = await vscode.workspace.openTextDocument(files[0]);
         messages.push({ role: "user", content: `[File: ${ref}]\n\`\`\`\n${doc.getText()}\n\`\`\`` });
-        this.panel.webview.postMessage({
+        this.post({
           type: "addContext",
           label: `@${ref}`,
           code: doc.getText().slice(0, 500) + (doc.getText().length > 500 ? "\n..." : ""),
@@ -501,7 +557,7 @@ export class ChatPanel {
     if (!(await this.checkSecrets(text))) {return;}
     this.history.push({ kind: "message", role: "user", content: text });
     this.saveHistory();
-    this.panel.webview.postMessage({ type: "addMessage", role: "user", content: text });
+    this.post({ type: "addMessage", role: "user", content: text });
 
     const apiKey = await this.store.getApiKey(provider);
     const fileCtx = this.buildFileContext();
@@ -514,44 +570,44 @@ export class ChatPanel {
     if (!(await this.checkSecrets(task))) {return;}
     this.history.push({ kind: "message", role: "user", content: task });
     this.saveHistory();
-    this.panel.webview.postMessage({ type: "addMessage", role: "user", content: task });
-    this.panel.webview.postMessage({ type: "agentStart" });
+    this.post({ type: "addMessage", role: "user", content: task });
+    this.post({ type: "agentStart" });
 
     const apiKey = await this.store.getApiKey(provider);
     this.abortController = streamAgent(provider, model, task, {
       onToolCall: (name, args) => {
-        this.panel.webview.postMessage({ type: "agentToolCall", name, arguments: args });
+        this.post({ type: "agentToolCall", name, arguments: args });
       },
       onToolResult: (name, result) => {
-        this.panel.webview.postMessage({ type: "agentToolResult", name, result });
+        this.post({ type: "agentToolResult", name, result });
       },
       onApprovalRequired: (requestId, toolName, args) => {
         this.handleApprovalRequest(requestId, toolName, args);
       },
       onText: (text) => {
-        this.panel.webview.postMessage({ type: "agentText", content: text });
+        this.post({ type: "agentText", content: text });
       },
       onPlanning: (content) => {
-        this.panel.webview.postMessage({ type: "agentPlanning", content });
+        this.post({ type: "agentPlanning", content });
       },
       onThinking: (content) => {
-        this.panel.webview.postMessage({ type: "agentThinking", content });
+        this.post({ type: "agentThinking", content });
       },
       onReflecting: (content) => {
-        this.panel.webview.postMessage({ type: "agentReflecting", content });
+        this.post({ type: "agentReflecting", content });
       },
       onReplanning: (content) => {
-        this.panel.webview.postMessage({ type: "agentReplanning", content });
+        this.post({ type: "agentReplanning", content });
       },
       onContextCompressed: (content) => {
-        this.panel.webview.postMessage({ type: "agentContextCompressed", content });
+        this.post({ type: "agentContextCompressed", content });
       },
       onDone: (content) => {
         if (content) {
           this.history.push({ kind: "message", role: "assistant", content });
           this.saveHistory();
         }
-        this.panel.webview.postMessage({ type: "agentDone", content });
+        this.post({ type: "agentDone", content });
         if (content && looksLikePatch(content)) {
           this.previewPatch(content).catch(() => {});
         }
@@ -559,11 +615,11 @@ export class ChatPanel {
         if (taskId) {this.startTaskPolling(taskId);}
       },
       onComplete: (iterations) => {
-        this.panel.webview.postMessage({ type: "agentComplete", iterations });
+        this.post({ type: "agentComplete", iterations });
         this.abortController = undefined;
       },
       onError: (error) => {
-        this.panel.webview.postMessage({ type: "agentError", error });
+        this.post({ type: "agentError", error });
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
@@ -574,54 +630,54 @@ export class ChatPanel {
     if (!(await this.checkSecrets(text))) {return;}
     this.history.push({ kind: "message", role: "user", content: text });
     this.saveHistory();
-    this.panel.webview.postMessage({ type: "addMessage", role: "user", content: text });
-    this.panel.webview.postMessage({ type: "agentStart" });
+    this.post({ type: "addMessage", role: "user", content: text });
+    this.post({ type: "agentStart" });
 
     const apiKey = await this.store.getApiKey(provider);
     this.abortController = streamOrchestrated(provider, model, text, mode, {
       onModeSelected: (selectedMode) => {
-        this.panel.webview.postMessage({ type: "modeDetected", mode: selectedMode });
+        this.post({ type: "modeDetected", mode: selectedMode });
       },
       onToolCall: (name, args) => {
-        this.panel.webview.postMessage({ type: "agentToolCall", name, arguments: args });
+        this.post({ type: "agentToolCall", name, arguments: args });
       },
       onToolResult: (name, result) => {
-        this.panel.webview.postMessage({ type: "agentToolResult", name, result });
+        this.post({ type: "agentToolResult", name, result });
       },
       onApprovalRequired: (requestId, toolName, args) => {
         this.handleApprovalRequest(requestId, toolName, args);
       },
       onText: (text) => {
-        this.panel.webview.postMessage({ type: "agentText", content: text });
+        this.post({ type: "agentText", content: text });
       },
       onPlanning: (content) => {
-        this.panel.webview.postMessage({ type: "agentPlanning", content });
+        this.post({ type: "agentPlanning", content });
       },
       onThinking: (content) => {
-        this.panel.webview.postMessage({ type: "agentThinking", content });
+        this.post({ type: "agentThinking", content });
       },
       onReflecting: (content) => {
-        this.panel.webview.postMessage({ type: "agentReflecting", content });
+        this.post({ type: "agentReflecting", content });
       },
       onReplanning: (content) => {
-        this.panel.webview.postMessage({ type: "agentReplanning", content });
+        this.post({ type: "agentReplanning", content });
       },
       onContextCompressed: (content) => {
-        this.panel.webview.postMessage({ type: "agentContextCompressed", content });
+        this.post({ type: "agentContextCompressed", content });
       },
       onDone: (content) => {
         if (content) {
           this.history.push({ kind: "message", role: "assistant", content });
           this.saveHistory();
         }
-        this.panel.webview.postMessage({ type: "agentDone", content });
+        this.post({ type: "agentDone", content });
       },
       onComplete: (iterations) => {
-        this.panel.webview.postMessage({ type: "agentComplete", iterations });
+        this.post({ type: "agentComplete", iterations });
         this.abortController = undefined;
       },
       onError: (error) => {
-        this.panel.webview.postMessage({ type: "agentError", error });
+        this.post({ type: "agentError", error });
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
@@ -657,7 +713,7 @@ export class ChatPanel {
       "Deny",
     );
     const approved = choice === "Allow";
-    this.panel.webview.postMessage({ type: "approvalStatus", toolName, approved });
+    this.post({ type: "approvalStatus", toolName, approved });
     await sendApproval(requestId, approved);
   }
 
@@ -667,10 +723,10 @@ export class ChatPanel {
         const res = await fetch(`${getServerUrl()}/tasks/${taskId}`, { headers: authHeaders() });
         if (!res.ok) { clearInterval(pollInterval); return; }
         const task = (await res.json()) as { status: string; result?: unknown; error?: string };
-        this.panel.webview.postMessage({ type: "taskProgress", taskId, task });
+        this.post({ type: "taskProgress", taskId, task });
         if (task.status !== "running" && task.status !== "queued") {
           clearInterval(pollInterval);
-          this.panel.webview.postMessage({ type: "taskComplete", taskId, task });
+          this.post({ type: "taskComplete", taskId, task });
         }
       } catch {
         clearInterval(pollInterval);
@@ -681,23 +737,130 @@ export class ChatPanel {
   private restoreHistory() {
     for (const entry of this.history) {
       if (entry.kind === "context") {
-        this.panel.webview.postMessage({ type: "addContext", label: entry.label, code: entry.content });
+        this.post({ type: "addContext", label: entry.label, code: entry.content });
       } else {
-        this.panel.webview.postMessage({ type: "addMessage", role: entry.role, content: entry.content });
+        this.post({ type: "addMessage", role: entry.role, content: entry.content });
       }
     }
   }
 
   private saveHistory() {
-    this.globalState.update(HISTORY_KEY, this.history);
+    this.globalState.update(SESSION_HISTORY_PREFIX + this.activeSessionId, this.history);
+    this.maybeTitleFromHistory();
+  }
+
+  /** Loads session metadata, migrating any legacy single-history into a first session. */
+  private loadSessions() {
+    this.sessions = this.globalState.get<SessionMeta[]>(SESSIONS_KEY, []);
+    if (this.sessions.length === 0) {
+      const legacy = this.globalState.get<HistoryEntry[]>(HISTORY_KEY, []);
+      const first: SessionMeta = { id: newId(), title: "New chat", createdAt: Date.now() };
+      this.sessions = [first];
+      this.activeSessionId = first.id;
+      this.globalState.update(SESSIONS_KEY, this.sessions);
+      this.globalState.update(ACTIVE_SESSION_KEY, first.id);
+      this.globalState.update(SESSION_HISTORY_PREFIX + first.id, legacy);
+      if (legacy.length) {
+        this.globalState.update(HISTORY_KEY, []);
+      }
+    } else {
+      this.activeSessionId = this.globalState.get<string>(ACTIVE_SESSION_KEY, this.sessions[0].id);
+      if (!this.sessions.some((s) => s.id === this.activeSessionId)) {
+        this.activeSessionId = this.sessions[0].id;
+      }
+    }
+    this.history = this.globalState.get<HistoryEntry[]>(
+      SESSION_HISTORY_PREFIX + this.activeSessionId,
+      [],
+    );
+  }
+
+  private saveSessions() {
+    this.globalState.update(SESSIONS_KEY, this.sessions);
+    this.globalState.update(ACTIVE_SESSION_KEY, this.activeSessionId);
+  }
+
+  private sendSessions() {
+    this.post({ type: "sessions", sessions: this.sessions, activeId: this.activeSessionId });
+  }
+
+  /** Derives a short session title from the first user message. */
+  private maybeTitleFromHistory() {
+    const session = this.sessions.find((s) => s.id === this.activeSessionId);
+    if (!session || (session.title && session.title !== "New chat")) {
+      return;
+    }
+    const firstUser = this.history.find((e) => e.kind === "message" && e.role === "user");
+    if (firstUser) {
+      session.title = firstUser.content.replace(/\s+/g, " ").trim().slice(0, 40) || "New chat";
+      this.saveSessions();
+      this.sendSessions();
+    }
+  }
+
+  private newSession() {
+    this.abortController?.abort();
+    this.abortController = undefined;
+    const session: SessionMeta = { id: newId(), title: "New chat", createdAt: Date.now() };
+    this.sessions.unshift(session);
+    this.activeSessionId = session.id;
+    this.history = [];
+    this.globalState.update(SESSION_HISTORY_PREFIX + session.id, []);
+    this.saveSessions();
+    this.sendSessions();
+    this.post({ type: "clearMessages" });
+  }
+
+  private switchSession(id: string) {
+    if (id === this.activeSessionId || !this.sessions.some((s) => s.id === id)) {
+      return;
+    }
+    this.abortController?.abort();
+    this.abortController = undefined;
+    this.activeSessionId = id;
+    this.history = this.globalState.get<HistoryEntry[]>(SESSION_HISTORY_PREFIX + id, []);
+    this.saveSessions();
+    this.sendSessions();
+    this.post({ type: "clearMessages" });
+    this.restoreHistory();
+  }
+
+  private deleteSession(id: string) {
+    const idx = this.sessions.findIndex((s) => s.id === id);
+    if (idx < 0) {
+      return;
+    }
+    this.sessions.splice(idx, 1);
+    this.globalState.update(SESSION_HISTORY_PREFIX + id, undefined);
+    if (this.sessions.length === 0) {
+      const session: SessionMeta = { id: newId(), title: "New chat", createdAt: Date.now() };
+      this.sessions = [session];
+    }
+    if (id === this.activeSessionId) {
+      this.activeSessionId = this.sessions[0].id;
+      this.history = this.globalState.get<HistoryEntry[]>(
+        SESSION_HISTORY_PREFIX + this.activeSessionId,
+        [],
+      );
+      this.saveSessions();
+      this.sendSessions();
+      this.post({ type: "clearMessages" });
+      this.restoreHistory();
+    } else {
+      this.saveSessions();
+      this.sendSessions();
+    }
   }
 
   private dispose() {
     if (this.reconnectTimer) {clearTimeout(this.reconnectTimer);}
     this.abortController?.abort();
-    ChatPanel.instance = undefined;
     for (const d of this.disposables) {d.dispose();}
   }
+}
+
+function newId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
 function looksLikePatch(text: string): boolean {
@@ -712,12 +875,28 @@ function extractTaskId(text: string | undefined): string | null {
 
 /* ───────────────────────────── WEBVIEW HTML ───────────────────────────── */
 
-function getWebviewContent(): string {
+function getNonce(): string {
+  let text = "";
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  for (let i = 0; i < 32; i++) {
+    text += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return text;
+}
+
+function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+  const nonce = getNonce();
+  const cspSource = webview.cspSource;
+  const markdownUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, "dist", "markdown.js"),
+  );
   return /*html*/ `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} https: http: data: blob:; media-src ${cspSource} https: http: data: blob:; font-src ${cspSource} https: data:; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}';">
+<script nonce="${nonce}" src="${markdownUri}"></script>
 <title>GetAIBD</title>
 <style>
 :root {
@@ -782,6 +961,43 @@ body {
 
 .header-spacer { flex: 1; }
 
+.sessions-panel {
+  flex-shrink: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.session-item:hover { background: var(--list-hover); }
+.session-item.active { background: var(--list-hover); }
+.session-item .s-title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-item.active .s-title { font-weight: 600; }
+.session-item .s-del {
+  opacity: 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 4px;
+}
+.session-item:hover .s-del { opacity: 1; }
+.session-item .s-del:hover { color: var(--fg); }
+
 .icon-btn {
   background: none;
   border: none;
@@ -798,6 +1014,18 @@ body {
 }
 .icon-btn:hover { background: var(--list-hover); color: var(--fg); }
 .icon-btn.active { color: var(--btn-bg); }
+.upgrade-btn {
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  border: none;
+  border-radius: 12px;
+  padding: 3px 10px;
+  margin-right: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.upgrade-btn:hover { background: var(--btn-hover); }
 
 /* ── Messages ── */
 .messages {
@@ -842,6 +1070,60 @@ body {
   margin-bottom: 4px;
   display: block;
 }
+
+.md { white-space: normal; }
+.md > *:first-child { margin-top: 0; }
+.md > *:last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+  margin: 14px 0 6px;
+  line-height: 1.3;
+  font-weight: 600;
+}
+.md h1 { font-size: 1.4em; }
+.md h2 { font-size: 1.25em; }
+.md h3 { font-size: 1.1em; }
+.md h4, .md h5, .md h6 { font-size: 1em; }
+.md ul, .md ol { margin: 0 0 8px; padding-left: 22px; }
+.md li { margin: 2px 0; }
+.md li > p { margin: 0; }
+.md blockquote {
+  margin: 0 0 8px;
+  padding: 2px 10px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.md a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+.md a:hover { text-decoration: underline; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.md pre {
+  background: var(--code-bg);
+  padding: 10px 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0 0 8px;
+}
+.md pre code { background: none; padding: 0; font-size: 12px; }
+.md code {
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+}
+.md table {
+  border-collapse: collapse;
+  margin: 0 0 8px;
+  width: auto;
+  font-size: 12px;
+}
+.md th, .md td {
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  text-align: left;
+}
+.md th { background: var(--list-hover); font-weight: 600; }
+.md img { max-width: 100%; border-radius: 6px; }
 
 .message code {
   background: var(--code-bg);
@@ -1448,12 +1730,16 @@ body {
 </head>
 <body>
 
+<div id="diag" style="display:none;background:#5a1d1d;color:#fff;padding:6px 10px;font-size:11px;white-space:pre-wrap;line-height:1.4"></div>
 <div class="header">
-  <span class="brand">GetAIBD</span>
+  <button class="icon-btn" id="newChatBtn" title="New chat">&#x2795;</button>
+  <button class="icon-btn" id="sessionsBtn" title="Chat history">&#x1F551;</button>
+  <span class="brand" id="brand">GetAIBD</span>
   <span class="header-spacer"></span>
-  <button class="icon-btn" id="clearBtn" title="New chat">&#x1F5D1;</button>
+  <button class="upgrade-btn" id="upgradeBtn" title="Add your API key to unlock all models" style="display:none">&#x1F511; Add API Key</button>
   <button class="icon-btn" id="settingsBtn" title="Settings">&#x2699;</button>
 </div>
+<div id="sessionsPanel" class="sessions-panel" style="display:none"></div>
 
 <div class="messages" id="messages"></div>
 <div class="reconnect-banner" id="reconnectBanner"></div>
@@ -1480,7 +1766,6 @@ body {
   <div class="mode-item" data-mode="plan"><span class="mi-icon">&#9776;</span><span class="mi-label">Plan</span><span class="mi-check">&#10003;</span></div>
   <div class="mode-item" data-mode="debug"><span class="mi-icon">&#128027;</span><span class="mi-label">Debug</span><span class="mi-check">&#10003;</span></div>
   <div class="mode-item" data-mode="ask"><span class="mi-icon">&#128172;</span><span class="mi-label">Ask</span><span class="mi-check">&#10003;</span></div>
-  <div class="mode-item" data-mode="chat"><span class="mi-icon">&#9998;</span><span class="mi-label">Chat</span><span class="mi-check">&#10003;</span></div>
 </div>
 
 <div class="composer">
@@ -1502,7 +1787,13 @@ body {
   </div>
 </div>
 
-<script>
+<script nonce="${nonce}">
+window.addEventListener("error", function (ev) {
+  try {
+    var d = document.getElementById("diag");
+    if (d) { d.style.display = "block"; d.textContent = "Webview JS error: " + (ev.message || (ev.error && ev.error.message) || "unknown") + "  [" + (ev.filename || "") + ":" + (ev.lineno || "?") + "]"; }
+  } catch (_) {}
+});
 const vscode = acquireVsCodeApi();
 const messagesEl = document.getElementById("messages");
 const spinnerEl = document.getElementById("spinner");
@@ -1523,13 +1814,45 @@ const providerTabsEl = document.getElementById("providerTabs");
 const mdCloseBtn = document.getElementById("mdCloseBtn");
 const settingsBtn = document.getElementById("settingsBtn");
 const settingsPanel = document.getElementById("settingsPanel");
-const clearBtn = document.getElementById("clearBtn");
+const newChatBtn = document.getElementById("newChatBtn");
+const sessionsBtn = document.getElementById("sessionsBtn");
+const sessionsPanel = document.getElementById("sessionsPanel");
 const attachBtn = document.getElementById("attachBtn");
+const upgradeBtn = document.getElementById("upgradeBtn");
+if (upgradeBtn) {
+  upgradeBtn.addEventListener("click", () => vscode.postMessage({ type: "needApiKey" }));
+}
+
+if (settingsPanel) {
+  settingsPanel.addEventListener("click", (e) => {
+    const t = e.target.closest("[data-act]");
+    if (!t || t.tagName !== "BUTTON") { return; }
+    const act = t.getAttribute("data-act");
+    const arg = t.getAttribute("data-arg");
+    if (act === "closeSettings") { closeSettings(); }
+    else if (act === "saveServerUrl") { saveServerUrl(); }
+    else if (act === "saveServerCfg") { saveServerCfg(arg); }
+    else if (act === "toggleKeyVis") { toggleKeyVis(arg); }
+    else if (act === "saveKey") { saveKey(arg); }
+    else if (act === "testProvider") { testProvider(arg); }
+  });
+  settingsPanel.addEventListener("change", (e) => {
+    const t = e.target.closest("[data-act]");
+    if (!t) { return; }
+    const act = t.getAttribute("data-act");
+    const arg = t.getAttribute("data-arg");
+    if (act === "savePref") { savePref(arg, t.type === "checkbox" ? t.checked : t.value); }
+    else if (act === "saveProviderField") { saveProviderField(arg); }
+    else if (act === "toggleProvider") { toggleProvider(arg, t.checked); }
+  });
+}
 
 let streaming = false;
 let streamEl = null;
 let streamContent = "";
-let currentMode = "chat";
+let agentTextEl = null;
+let agentTextContent = "";
+let currentMode = "agent";
 let settingsOpen = false;
 
 let currentProvider = "";
@@ -1550,10 +1873,9 @@ function modelDisplay(modelId, name) {
 }
 
 const MODE_PLACEHOLDERS = {
-  chat: "Ask anything... (use @filename to reference files)",
   plan: "Describe what you want to plan...",
   ask: "Ask a question...",
-  agent: "Describe a task for the agent...",
+  agent: "Ask anything... (use @filename to reference files)",
   debug: "Describe the error or bug to debug...",
 };
 
@@ -1562,19 +1884,18 @@ const MODE_META = {
   plan:  { icon: "\u2630", label: "Plan" },
   debug: { icon: "\uD83D\uDC1B", label: "Debug" },
   ask:   { icon: "\uD83D\uDCAC", label: "Ask" },
-  chat:  { icon: "\u270E", label: "Chat" },
 };
 
 /* ── Mode switcher (Cursor-style) ── */
 function switchMode(mode) {
   currentMode = mode;
-  const meta = MODE_META[mode] || MODE_META.chat;
+  const meta = MODE_META[mode] || MODE_META.agent;
   if (modePillLabel) modePillLabel.textContent = meta.label;
   if (modePillIcon) modePillIcon.textContent = meta.icon;
   document.querySelectorAll(".mode-item").forEach(el => {
     el.classList.toggle("active", el.getAttribute("data-mode") === mode);
   });
-  inputEl.placeholder = MODE_PLACEHOLDERS[mode] || MODE_PLACEHOLDERS.chat;
+  inputEl.placeholder = MODE_PLACEHOLDERS[mode] || MODE_PLACEHOLDERS.agent;
   closeModeMenu();
   vscode.postMessage({ type: "modeChanged", mode });
 }
@@ -1632,10 +1953,51 @@ function closeSettings() {
   messagesEl.style.display = "";
 }
 
-clearBtn.addEventListener("click", () => {
-  messagesEl.innerHTML = "";
-  vscode.postMessage({ type: "clearHistory" });
-});
+if (newChatBtn) {
+  newChatBtn.addEventListener("click", () => {
+    sessionsPanel.style.display = "none";
+    vscode.postMessage({ type: "newSession" });
+  });
+}
+
+if (sessionsBtn) {
+  sessionsBtn.addEventListener("click", () => {
+    sessionsPanel.style.display = sessionsPanel.style.display === "none" ? "block" : "none";
+  });
+}
+
+let sessionList = [];
+let activeSessionId = "";
+
+function renderSessions() {
+  sessionsPanel.innerHTML = "";
+  if (!sessionList.length) {
+    sessionsPanel.style.display = "none";
+    return;
+  }
+  sessionList.forEach((s) => {
+    const item = document.createElement("div");
+    item.className = "session-item" + (s.id === activeSessionId ? " active" : "");
+    const title = document.createElement("span");
+    title.className = "s-title";
+    title.textContent = s.title || "New chat";
+    item.appendChild(title);
+    const del = document.createElement("button");
+    del.className = "s-del";
+    del.title = "Delete chat";
+    del.textContent = "\u2715";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: "deleteSession", id: s.id });
+    });
+    item.appendChild(del);
+    item.addEventListener("click", () => {
+      sessionsPanel.style.display = "none";
+      vscode.postMessage({ type: "switchSession", id: s.id });
+    });
+    sessionsPanel.appendChild(item);
+  });
+}
 
 attachBtn.addEventListener("click", () => vscode.postMessage({ type: "attachFile" }));
 
@@ -1773,7 +2135,7 @@ function renderModelList(filter) {
   if (total === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-models";
-    empty.textContent = filter ? "No models match \"" + filter + "\"" : "Loading models… (starting engine — pick Set API Key or Use Free if prompted)";
+    empty.textContent = filter ? ('No models match "' + filter + '"') : "Loading models… (starting engine — pick Set API Key or Use Free if prompted)";
     modelList.appendChild(empty);
   }
 }
@@ -1895,18 +2257,17 @@ function send() {
   }
   inputEl.value = "";
   inputEl.style.height = "auto";
-  if (currentMode === "chat") {
-    vscode.postMessage({ type: "send", provider: currentProvider, model: currentModel, text });
-  } else {
-    vscode.postMessage({ type: "orchestratedSend", provider: currentProvider, model: currentModel, text, mode: currentMode });
-  }
+  vscode.postMessage({ type: "orchestratedSend", provider: currentProvider, model: currentModel, text, mode: currentMode });
 }
 
 /* ── Messages ── */
 function addMessage(role, content) {
   const div = document.createElement("div");
   div.className = "message " + role;
-  div.innerHTML = '<span class="role-label">' + role + "</span>" + escapeHtml(content);
+  const body = role === "assistant"
+    ? '<div class="md">' + mdToHtml(content) + "</div>"
+    : escapeHtml(content);
+  div.innerHTML = '<span class="role-label">' + role + "</span>" + body;
   if (role === "assistant" && content) appendActionBtns(div, content);
   messagesEl.appendChild(div);
   scrollToBottom();
@@ -1939,6 +2300,13 @@ function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function mdToHtml(text) {
+  if (typeof window.renderMarkdown === "function") {
+    try { return window.renderMarkdown(text || ""); } catch (e) {}
+  }
+  return escapeHtml(text || "");
+}
+
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -1961,12 +2329,12 @@ function appendThinkingBlock(cssClass, label, content) {
 function renderSettings(data) {
   let html = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">'
     + '<span style="font-size:14px;font-weight:600;">Settings</span>'
-    + '<button class="small-btn" onclick="closeSettings()">Close</button></div>';
+    + '<button class="small-btn" data-act="closeSettings">Close</button></div>';
 
   html += '<div class="settings-section"><h3>Server</h3>';
   html += '<div class="setting-row"><label>Server URL</label>'
     + '<input type="url" value="' + escapeHtml(data.serverUrl) + '" id="settingServerUrl" />'
-    + '<button class="small-btn" onclick="saveServerUrl()">Save</button></div>';
+    + '<button class="small-btn" data-act="saveServerUrl">Save</button></div>';
   html += '</div>';
 
   html += '<div class="settings-section"><h3>Providers</h3>';
@@ -1977,13 +2345,13 @@ function renderSettings(data) {
 
   html += '<div class="settings-section"><h3>Preferences</h3>';
   html += '<div class="pref-row"><label>Auto-attach open file</label>'
-    + '<input type="checkbox" ' + (data.fileContextEnabled ? 'checked' : '') + ' onchange="savePref(\'fileContext.enabled\', this.checked)" /></div>';
+    + '<input type="checkbox" ' + (data.fileContextEnabled ? 'checked' : '') + ' data-act="savePref" data-arg="fileContext.enabled" /></div>';
   html += '<div class="pref-row"><label>Inline completions</label>'
-    + '<input type="checkbox" ' + (data.inlineCompletionsEnabled ? 'checked' : '') + ' onchange="savePref(\'inlineCompletions.enabled\', this.checked)" /></div>';
+    + '<input type="checkbox" ' + (data.inlineCompletionsEnabled ? 'checked' : '') + ' data-act="savePref" data-arg="inlineCompletions.enabled" /></div>';
   html += '<div class="pref-row"><label>Inline provider</label>'
-    + '<input type="text" value="' + escapeHtml(data.inlineProvider) + '" style="width:120px" onchange="savePref(\'inlineCompletions.provider\', this.value)" /></div>';
+    + '<input type="text" value="' + escapeHtml(data.inlineProvider) + '" style="width:120px" data-act="savePref" data-arg="inlineCompletions.provider" /></div>';
   html += '<div class="pref-row"><label>Inline model</label>'
-    + '<input type="text" value="' + escapeHtml(data.inlineModel) + '" style="width:120px" onchange="savePref(\'inlineCompletions.model\', this.value)" /></div>';
+    + '<input type="text" value="' + escapeHtml(data.inlineModel) + '" style="width:120px" data-act="savePref" data-arg="inlineCompletions.model" /></div>';
   html += '</div>';
 
   if (data.serverConfig) {
@@ -1993,7 +2361,7 @@ function renderSettings(data) {
       + '<input type="text" disabled value="' + escapeHtml(sc.agent.project_root) + '" style="opacity:0.6" /></div>';
     html += '<div class="setting-row"><label>Max iterations</label>'
       + '<input type="number" id="cfgMaxIter" value="' + sc.agent.max_iterations + '" style="width:80px" />'
-      + '<button class="small-btn primary" onclick="saveServerCfg(\'agent\')">Save</button></div>';
+      + '<button class="small-btn primary" data-act="saveServerCfg" data-arg="agent">Save</button></div>';
     html += '</div>';
 
     html += '<div class="settings-section"><h3>Memory</h3>';
@@ -2010,7 +2378,7 @@ function renderSettings(data) {
     html += '<div class="setting-row"><label>Reserve ratio</label>'
       + '<input type="number" id="cfgCtxReserve" value="' + sc.context.reserve_for_completion + '" step="0.05" min="0" max="1" style="width:80px" /></div>';
     html += '<div class="pref-row"><label>Strategy</label><span>' + escapeHtml(sc.context.strategy) + '</span></div>';
-    html += '<button class="small-btn primary" onclick="saveServerCfg(\'context\')" style="margin-top:4px">Save Context</button>';
+    html += '<button class="small-btn primary" data-act="saveServerCfg" data-arg="context" style="margin-top:4px">Save Context</button>';
     html += '</div>';
 
     if (sc.server) {
@@ -2033,9 +2401,9 @@ function renderProviderCard(p) {
     const keyDisplay = p.hasKey ? "********" : "";
     body += '<div class="key-row">'
       + '<input type="password" placeholder="API Key" value="' + keyDisplay + '" id="key_' + p.id + '" />'
-      + '<button class="small-btn" onclick="toggleKeyVis(\'' + p.id + '\')">Show</button>'
-      + '<button class="small-btn primary" onclick="saveKey(\'' + p.id + '\')">Save</button>'
-      + '<button class="small-btn" onclick="testProvider(\'' + p.id + '\')">Test</button>'
+      + '<button class="small-btn" data-act="toggleKeyVis" data-arg="' + p.id + '">Show</button>'
+      + '<button class="small-btn primary" data-act="saveKey" data-arg="' + p.id + '">Save</button>'
+      + '<button class="small-btn" data-act="testProvider" data-arg="' + p.id + '">Test</button>'
       + '<span class="test-status" id="test_' + p.id + '"></span>'
       + '</div>';
     if (p.keyEnvHint) {
@@ -2046,22 +2414,22 @@ function renderProviderCard(p) {
   if (p.needsUrl) {
     body += '<div class="setting-row" style="margin-top:4px;margin-bottom:0"><label style="min-width:60px">URL</label>'
       + '<input type="url" value="' + escapeHtml(p.url || '') + '" id="url_' + p.id + '" '
-      + 'onchange="saveProviderField(\'' + p.id + '\')" /></div>';
+      + 'data-act="saveProviderField" data-arg="' + p.id + '" /></div>';
   }
 
   if (p.needsEndpointId) {
     body += '<div class="setting-row" style="margin-bottom:0"><label style="min-width:60px">Endpoint</label>'
       + '<input type="text" value="' + escapeHtml(p.endpointId || '') + '" id="eid_' + p.id + '" '
-      + 'onchange="saveProviderField(\'' + p.id + '\')" /></div>';
+      + 'data-act="saveProviderField" data-arg="' + p.id + '" /></div>';
   }
 
   body += '<div class="setting-row" style="margin-top:4px;margin-bottom:0"><label style="min-width:60px">Model</label>'
     + '<input type="text" value="' + escapeHtml(p.defaultModel) + '" id="model_' + p.id + '" '
-    + 'onchange="saveProviderField(\'' + p.id + '\')" /></div>';
+    + 'data-act="saveProviderField" data-arg="' + p.id + '" /></div>';
 
   return '<div class="provider-card' + enabledClass + '" id="card_' + p.id + '">'
     + '<div class="provider-card-header">'
-    + '<input type="checkbox" ' + checkedAttr + ' onchange="toggleProvider(\'' + p.id + '\', this.checked)" />'
+    + '<input type="checkbox" ' + checkedAttr + ' data-act="toggleProvider" data-arg="' + p.id + '" />'
     + '<span class="provider-name">' + escapeHtml(p.label) + '</span>'
     + (p.hasKey ? '<span style="color:var(--success);font-size:11px;">Key saved</span>' : '')
     + '</div>'
@@ -2203,11 +2571,26 @@ window.addEventListener("message", (event) => {
         currentProvider = "getaibd";
         currentModel = freeModelId;
       }
+      if (upgradeBtn) upgradeBtn.style.display = freeMode ? "inline-block" : "none";
       updateModelPill();
       if (modelDropdown.classList.contains("open")) {
         renderProviderTabs();
         renderModelList(modelSearch ? modelSearch.value.toLowerCase() : "");
       }
+      break;
+
+    case "sessions":
+      sessionList = msg.sessions || [];
+      activeSessionId = msg.activeId || "";
+      renderSessions();
+      break;
+
+    case "clearMessages":
+      messagesEl.innerHTML = "";
+      streamEl = null;
+      streamContent = "";
+      agentTextEl = null;
+      agentTextContent = "";
       break;
 
     case "setAgentMode":
@@ -2274,7 +2657,7 @@ window.addEventListener("message", (event) => {
     case "streamToken":
       if (streamEl) {
         streamContent += msg.content;
-        streamEl.innerHTML = '<span class="role-label">assistant</span>' + escapeHtml(streamContent);
+        streamEl.innerHTML = '<span class="role-label">assistant</span><div class="md">' + mdToHtml(streamContent) + "</div>";
         scrollToBottom();
       }
       break;
@@ -2321,6 +2704,8 @@ window.addEventListener("message", (event) => {
 
     case "agentStart":
       streaming = true;
+      agentTextEl = null;
+      agentTextContent = "";
       sendBtn.innerHTML = "&#9632;";
       sendBtn.classList.add("stop");
       spinnerEl.textContent = "Agent working...";
@@ -2328,6 +2713,7 @@ window.addEventListener("message", (event) => {
       break;
 
     case "agentToolCall": {
+      agentTextEl = null;
       const tcDiv = document.createElement("div");
       tcDiv.className = "tool-call";
       tcDiv.innerHTML = '<span class="tool-name">' + escapeHtml(msg.name) + '</span>'
@@ -2338,9 +2724,11 @@ window.addEventListener("message", (event) => {
     }
 
     case "agentToolResult": {
+      agentTextEl = null;
       const trDiv = document.createElement("div");
       trDiv.className = "tool-result";
-      const t = typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result, null, 2);
+      let t = typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result, null, 2);
+      if (t == null) t = String(msg.result);
       trDiv.textContent = t.length > 500 ? t.slice(0, 500) + "..." : t;
       messagesEl.appendChild(trDiv);
       scrollToBottom();
@@ -2348,31 +2736,38 @@ window.addEventListener("message", (event) => {
     }
 
     case "agentText": {
-      const atDiv = document.createElement("div");
-      atDiv.className = "agent-status";
-      atDiv.textContent = msg.content;
-      messagesEl.appendChild(atDiv);
+      if (!agentTextEl) {
+        agentTextContent = "";
+        agentTextEl = addMessage("assistant", "");
+      }
+      agentTextContent += msg.content || "";
+      agentTextEl.innerHTML = '<span class="role-label">assistant</span><div class="md">' + mdToHtml(agentTextContent) + "</div>";
       scrollToBottom();
       break;
     }
 
     case "agentPlanning":
+      agentTextEl = null;
       appendThinkingBlock("plan", "Plan", msg.content);
       break;
 
     case "agentThinking":
+      agentTextEl = null;
       appendThinkingBlock("thinking", "Thinking", msg.content);
       break;
 
     case "agentReflecting":
+      agentTextEl = null;
       appendThinkingBlock("reflection", "Reflection", msg.content);
       break;
 
     case "agentReplanning":
+      agentTextEl = null;
       appendThinkingBlock("replan", "Re-planning", msg.content);
       break;
 
     case "agentContextCompressed": {
+      agentTextEl = null;
       const ccDiv = document.createElement("div");
       ccDiv.className = "context-compressed-msg";
       ccDiv.textContent = msg.content || "Context compressed";
@@ -2382,11 +2777,21 @@ window.addEventListener("message", (event) => {
     }
 
     case "agentDone":
-      if (msg.content) addMessage("assistant", msg.content);
+      if (agentTextEl) {
+        if (agentTextContent) appendActionBtns(agentTextEl, agentTextContent);
+      } else if (msg.content) {
+        const el = addMessage("assistant", msg.content);
+        appendActionBtns(el, msg.content);
+      }
+      agentTextEl = null;
+      agentTextContent = "";
       break;
 
     case "agentComplete":
       streaming = false;
+      if (agentTextEl && agentTextContent) appendActionBtns(agentTextEl, agentTextContent);
+      agentTextEl = null;
+      agentTextContent = "";
       sendBtn.innerHTML = "&#9654;";
       sendBtn.classList.remove("stop");
       spinnerEl.classList.remove("visible");
@@ -2401,6 +2806,8 @@ window.addEventListener("message", (event) => {
 
     case "agentError":
       streaming = false;
+      agentTextEl = null;
+      agentTextContent = "";
       sendBtn.innerHTML = "&#9654;";
       sendBtn.classList.remove("stop");
       spinnerEl.classList.remove("visible");
@@ -2428,6 +2835,7 @@ window.addEventListener("message", (event) => {
 });
 
 vscode.postMessage({ type: "ready" });
+try { var __b = document.getElementById("brand"); if (__b) { __b.textContent = "GetAIBD"; } } catch (_) {}
 </script>
 </body>
 </html>`;

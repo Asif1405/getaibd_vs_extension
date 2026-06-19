@@ -153,6 +153,34 @@ impl<'a> MemoryIndexer<'a> {
         Ok(chunks.len())
     }
 
+    /// Stores one distilled episodic memory for a completed task, replacing any
+    /// prior record for the same session.
+    pub async fn index_episode(
+        &self,
+        session_id: &str,
+        episode: &str,
+    ) -> Result<(), AppError> {
+        let source = MemorySource::Session {
+            session_id: session_id.to_string(),
+        };
+        self.store.delete_by_source(&source.to_tag())?;
+
+        if episode.trim().is_empty() {
+            return Ok(());
+        }
+
+        let emb = self.embedder.embed(episode).await?;
+        let entry = MemoryEntry {
+            id: format!("session:{session_id}:episode"),
+            content: episode.to_string(),
+            embedding: emb,
+            source,
+            tier: MemoryTier::Medium,
+            timestamp: unix_timestamp(),
+        };
+        self.store.insert(&entry)
+    }
+
     pub async fn index_persistent_fact(
         &self,
         fact_id: &str,

@@ -83,6 +83,8 @@ export class PatchPreviewPanel {
 
   private getHtml(): string {
     const { plan, previews, all_valid } = this.data;
+    const nonce = getNonce();
+    const cspSource = this.panel.webview.cspSource;
 
     const rows = previews.map((p) => {
       const icon = p.valid ? "✅" : "❌";
@@ -108,6 +110,7 @@ export class PatchPreviewPanel {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}';">
 <style>
   body { font-family: var(--vscode-font-family, sans-serif); font-size: 13px; padding: 16px; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); }
   h2 { margin-bottom: 4px; }
@@ -143,13 +146,15 @@ export class PatchPreviewPanel {
     <tbody>${rows}</tbody>
   </table>
   <div class="actions">
-    <button class="apply-btn" ${applyDisabled} onclick="apply()">Apply ${previews.length} Edit${previews.length !== 1 ? "s" : ""}</button>
-    <button class="cancel-btn" onclick="cancel()">Cancel</button>
+    <button class="apply-btn" id="applyBtn" ${applyDisabled}>Apply ${previews.length} Edit${previews.length !== 1 ? "s" : ""}</button>
+    <button class="cancel-btn" id="cancelBtn">Cancel</button>
   </div>
-<script>
+<script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
-  function apply() { vscode.postMessage({ type: "apply" }); }
-  function cancel() { vscode.postMessage({ type: "cancel" }); }
+  const applyBtn = document.getElementById("applyBtn");
+  const cancelBtn = document.getElementById("cancelBtn");
+  if (applyBtn) { applyBtn.addEventListener("click", () => vscode.postMessage({ type: "apply" })); }
+  if (cancelBtn) { cancelBtn.addEventListener("click", () => vscode.postMessage({ type: "cancel" })); }
 </script>
 </body>
 </html>`;
@@ -158,4 +163,13 @@ export class PatchPreviewPanel {
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function getNonce(): string {
+  let text = "";
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  for (let i = 0; i < 32; i++) {
+    text += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return text;
 }

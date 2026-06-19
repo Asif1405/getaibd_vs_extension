@@ -279,6 +279,7 @@ fn format_context_empty() {
 #[test]
 fn format_context_with_entries() {
     let memories = vec![RetrievedMemory {
+        id: "m1".to_string(),
         content: "some context".to_string(),
         score: 0.95,
         source: MemorySource::Manual,
