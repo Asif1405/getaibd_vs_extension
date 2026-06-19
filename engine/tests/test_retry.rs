@@ -77,6 +77,7 @@ fn test_request() -> ChatRequest {
         temperature: None,
         max_tokens: None,
         api_key: None,
+        reasoning_effort: None,
     }
 }
 

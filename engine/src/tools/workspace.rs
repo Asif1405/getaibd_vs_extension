@@ -130,11 +130,12 @@ impl Tool for ReadFile {
 
 pub struct WriteFile {
     root: Arc<PathBuf>,
+    edits: crate::tools::edits::EditTracker,
 }
 
 impl WriteFile {
-    pub fn new(root: Arc<PathBuf>) -> Self {
-        Self { root }
+    pub fn new(root: Arc<PathBuf>, edits: crate::tools::edits::EditTracker) -> Self {
+        Self { root, edits }
     }
 }
 
@@ -184,6 +185,7 @@ impl Tool for WriteFile {
         }
 
         let old_content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        self.edits.record_baseline(rel, &old_content);
 
         let bytes = content.len();
         tokio::fs::write(&path, content)
@@ -200,11 +202,12 @@ impl Tool for WriteFile {
 
 pub struct PatchFile {
     root: Arc<PathBuf>,
+    edits: crate::tools::edits::EditTracker,
 }
 
 impl PatchFile {
-    pub fn new(root: Arc<PathBuf>) -> Self {
-        Self { root }
+    pub fn new(root: Arc<PathBuf>, edits: crate::tools::edits::EditTracker) -> Self {
+        Self { root, edits }
     }
 }
 
@@ -256,6 +259,7 @@ impl Tool for PatchFile {
             )));
         }
 
+        self.edits.record_baseline(rel, &content);
         let updated = content.replacen(old_text, new_text, 1);
         tokio::fs::write(&path, &updated)
             .await

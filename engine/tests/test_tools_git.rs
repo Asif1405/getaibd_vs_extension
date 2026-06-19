@@ -1,4 +1,6 @@
+use mcp_universal::tools::edits::EditTracker;
 use mcp_universal::tools::git::{GitAdd, GitCommit, GitDiff, GitLog, GitStatus};
+use mcp_universal::tools::workspace::PatchFile;
 use mcp_universal::tools::Tool;
 use serde_json::json;
 use std::path::PathBuf;
@@ -68,7 +70,7 @@ async fn git_status_shows_modified() {
 async fn git_diff_shows_changes() {
     let (_dir, root) = setup_git_repo();
     std::fs::write(root.join("hello.txt"), "changed\n").unwrap();
-    let tool = GitDiff::new(root);
+    let tool = GitDiff::new(root, EditTracker::new());
     let result = tool.execute(json!({})).await.unwrap();
     let text = result["diff"].as_str().unwrap();
     assert!(text.contains("-hello world"));
@@ -85,7 +87,7 @@ async fn git_diff_staged() {
         .output()
         .unwrap();
 
-    let tool = GitDiff::new(root);
+    let tool = GitDiff::new(root, EditTracker::new());
     let result = tool.execute(json!({ "staged": true })).await.unwrap();
     let text = result["diff"].as_str().unwrap();
     assert!(text.contains("+staged"));
@@ -160,11 +162,31 @@ async fn git_commit_creates_commit() {
 }
 
 #[tokio::test]
+async fn git_diff_falls_back_to_tracked_edits_without_repo() {
+    let dir = TempDir::new().unwrap();
+    let root = Arc::new(dir.path().to_path_buf());
+    std::fs::write(root.join("note.txt"), "alpha\n").unwrap();
+
+    let edits = EditTracker::new();
+    let patch = PatchFile::new(root.clone(), edits.clone());
+    patch
+        .execute(json!({ "path": "note.txt", "old_text": "alpha", "new_text": "beta" }))
+        .await
+        .unwrap();
+
+    let diff = GitDiff::new(root, edits);
+    let result = diff.execute(json!({})).await.unwrap();
+    let text = result["diff"].as_str().unwrap();
+    assert!(text.contains("-alpha"), "diff was: {text}");
+    assert!(text.contains("+beta"), "diff was: {text}");
+}
+
+#[tokio::test]
 async fn git_tools_report_requires_approval() {
     let (_dir, root) = setup_git_repo();
 
     assert!(!GitStatus::new(root.clone()).requires_approval());
-    assert!(!GitDiff::new(root.clone()).requires_approval());
+    assert!(!GitDiff::new(root.clone(), EditTracker::new()).requires_approval());
     assert!(!GitLog::new(root.clone()).requires_approval());
     assert!(GitAdd::new(root.clone()).requires_approval());
     assert!(GitCommit::new(root).requires_approval());

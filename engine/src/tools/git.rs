@@ -23,6 +23,21 @@ async fn run_git(root: &PathBuf, args: &[&str]) -> Result<String, AppError> {
     }
 }
 
+/// True when `root` is inside a git work tree. Used so the git tools can degrade
+/// gracefully (instead of surfacing a raw "Not a git repository" error) when the
+/// workspace isn't version-controlled.
+async fn is_git_repo(root: &PathBuf) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+const NOT_A_REPO: &str = "This folder isn't a git repository. Run `git init` first to enable version control.";
+
 pub struct GitStatus {
     root: Arc<PathBuf>,
 }
@@ -48,6 +63,9 @@ impl Tool for GitStatus {
     }
 
     async fn execute(&self, _input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Ok(json!({ "status": "", "note": NOT_A_REPO }));
+        }
         let output = run_git(&self.root, &["status", "--porcelain"]).await?;
         Ok(json!({ "status": output.trim() }))
     }
@@ -55,12 +73,65 @@ impl Tool for GitStatus {
 
 pub struct GitDiff {
     root: Arc<PathBuf>,
+    edits: crate::tools::edits::EditTracker,
 }
 
 impl GitDiff {
-    pub fn new(root: Arc<PathBuf>) -> Self {
-        Self { root }
+    pub fn new(root: Arc<PathBuf>, edits: crate::tools::edits::EditTracker) -> Self {
+        Self { root, edits }
     }
+
+    /// Diff from the session's tracked edits, for workspaces without git.
+    async fn diff_from_tracked_edits(&self, filter: Option<&str>) -> Value {
+        let mut combined = String::new();
+        for (path, baseline) in self.edits.snapshot() {
+            if filter.is_some_and(|f| f != path) {
+                continue;
+            }
+            let current = tokio::fs::read_to_string(self.root.join(&path))
+                .await
+                .unwrap_or_default();
+            if current == baseline {
+                continue;
+            }
+            if let Some(d) = unified_diff(&path, &baseline, &current) {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&d);
+            }
+        }
+        if combined.is_empty() {
+            json!({
+                "diff": "",
+                "note": format!("{NOT_A_REPO} No edits have been made this session yet.")
+            })
+        } else {
+            json!({
+                "diff": combined.trim_end(),
+                "note": "Not a git repository — showing edits made this session."
+            })
+        }
+    }
+}
+
+/// Builds a unified diff between two buffers using libgit2 (no repo required).
+fn unified_diff(path: &str, old: &str, new: &str) -> Option<String> {
+    let as_path = std::path::Path::new(path);
+    let mut patch = git2::Patch::from_buffers(
+        old.as_bytes(),
+        Some(as_path),
+        new.as_bytes(),
+        Some(as_path),
+        None,
+    )
+    .ok()?;
+    let buf = patch.to_buf().ok()?;
+    let text = buf.as_str()?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(format!("diff --git a/{path} b/{path}\n{text}"))
 }
 
 #[async_trait]
@@ -84,6 +155,9 @@ impl Tool for GitDiff {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Ok(self.diff_from_tracked_edits(input["path"].as_str()).await);
+        }
         let staged = input["staged"].as_bool().unwrap_or(false);
         let mut args = vec!["diff"];
         if staged {
@@ -131,6 +205,9 @@ impl Tool for GitLog {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Ok(json!({ "log": "", "note": NOT_A_REPO }));
+        }
         let count = input["count"].as_u64().unwrap_or(10);
         let oneline = input["oneline"].as_bool().unwrap_or(true);
         let count_str = format!("-{count}");
@@ -182,6 +259,9 @@ impl Tool for GitAdd {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
         let paths = input["paths"]
             .as_array()
             .ok_or_else(|| AppError::InvalidRequest("paths array is required".into()))?;
@@ -232,6 +312,9 @@ impl Tool for GitCommit {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
         let message = input["message"]
             .as_str()
             .ok_or_else(|| AppError::InvalidRequest("message is required".into()))?;

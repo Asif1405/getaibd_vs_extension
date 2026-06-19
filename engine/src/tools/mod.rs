@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod command;
+pub mod edits;
 pub mod env_manager;
 pub mod git;
 pub mod terminal_gate;
@@ -60,16 +61,19 @@ impl ToolRegistry {
         let mut registry = Self::new();
         let root = Arc::new(project_root.to_path_buf());
         let env_mgr = env_manager::EnvManager::new(root.clone());
+        // Shared across the edit + diff tools so git_diff can fall back to the
+        // session's tracked edits when the workspace isn't a git repo.
+        let edits = edits::EditTracker::new();
 
         registry.register(Arc::new(workspace::ReadFile::new(root.clone())));
-        registry.register(Arc::new(workspace::WriteFile::new(root.clone())));
-        registry.register(Arc::new(workspace::PatchFile::new(root.clone())));
+        registry.register(Arc::new(workspace::WriteFile::new(root.clone(), edits.clone())));
+        registry.register(Arc::new(workspace::PatchFile::new(root.clone(), edits.clone())));
         registry.register(Arc::new(workspace::ListDirectory::new(root.clone())));
         registry.register(Arc::new(workspace::SearchFiles::new(root.clone())));
         registry.register(Arc::new(workspace::MoveFile::new(root.clone())));
         registry.register(Arc::new(workspace::DeleteFile::new(root.clone())));
         registry.register(Arc::new(git::GitStatus::new(root.clone())));
-        registry.register(Arc::new(git::GitDiff::new(root.clone())));
+        registry.register(Arc::new(git::GitDiff::new(root.clone(), edits.clone())));
         registry.register(Arc::new(git::GitLog::new(root.clone())));
         registry.register(Arc::new(git::GitAdd::new(root.clone())));
         registry.register(Arc::new(git::GitCommit::new(root.clone())));
