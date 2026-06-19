@@ -1010,15 +1010,24 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.maybeTitleFromHistory();
   }
 
-  /** Prior user/assistant turns for this session, capped to keep context affordable. */
+  /** Prior user/assistant turns, most-recent-first within a char budget. The engine
+   * further trims to the model's context window, so sizing is handled automatically. */
   private conversationMessages(): ChatMessage[] {
-    const msgs: ChatMessage[] = [];
+    const all: ChatMessage[] = [];
     for (const e of this.history) {
       if (e.kind !== "message" || !e.content) {continue;}
       if (e.role !== "user" && e.role !== "assistant") {continue;}
-      msgs.push({ role: e.role, content: e.content });
+      all.push({ role: e.role, content: e.content });
     }
-    return msgs.slice(-20);
+    const BUDGET = 60_000;
+    const out: ChatMessage[] = [];
+    let used = 0;
+    for (let i = all.length - 1; i >= 0; i--) {
+      used += all[i].content.length;
+      if (used > BUDGET && out.length >= 2) {break;}
+      out.unshift(all[i]);
+    }
+    return out;
   }
 
   /** Loads session metadata, migrating any legacy single-history into a first session. */

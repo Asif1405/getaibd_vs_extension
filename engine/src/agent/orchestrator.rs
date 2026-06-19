@@ -150,7 +150,7 @@ impl Orchestrator {
             approval_gate: self.approval_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
-            context_config: None,
+            context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: true,
         };
 
@@ -189,7 +189,7 @@ impl Orchestrator {
             approval_gate: self.approval_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
-            context_config: None,
+            context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: true,
         };
 
