@@ -280,6 +280,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "undoEdits":
         await this.undoEdits();
         break;
+      case "keepEdit":
+        if (msg.path) {this.keepEdit(msg.path as string);}
+        break;
+      case "undoEdit":
+        if (msg.path) {await this.undoEdit(msg.path as string);}
+        break;
       case "clearHistory":
         this.history = [];
         this.saveHistory();
@@ -721,12 +727,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const latestNew = edit.new_content ?? "";
     this.fileEdits.set(edit.path, { path: edit.path, originalOld, latestNew });
     const { additions, deletions } = diffStat(originalOld, latestNew);
+    const tooLarge = !!edit.too_large;
+    const diff = tooLarge ? { lines: [], truncated: true } : computeDiffHunks(originalOld, latestNew);
     this.post({
       type: "fileEdit",
       path: edit.path,
       additions,
       deletions,
-      tooLarge: !!edit.too_large,
+      tooLarge,
+      isNew: originalOld.length === 0 && latestNew.length > 0,
+      diff,
     });
   }
 
@@ -755,24 +765,46 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     );
   }
 
-  /** Keeps all pending agent edits (no-op on disk; just clears the review state). */
+  /** Accepts all pending agent edits (no-op on disk; just clears the review state). */
   private keepEdits() {
     this.fileEdits.clear();
   }
 
+  /** Accepts a single pending edit, leaving the file as written. */
+  private keepEdit(filePath: string) {
+    this.fileEdits.delete(filePath);
+  }
+
   /** Reverts every pending agent edit back to its original content. */
   private async undoEdits() {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    for (const edit of this.fileEdits.values()) {
-      if (!folder) {continue;}
-      const uri = vscode.Uri.joinPath(folder.uri, edit.path);
-      try {
-        await vscode.workspace.fs.writeFile(uri, Buffer.from(edit.originalOld, "utf8"));
-      } catch {
-        /* file may have been deleted/moved */
-      }
+    for (const edit of [...this.fileEdits.values()]) {
+      await this.revertEdit(edit.path, edit.originalOld);
     }
     this.fileEdits.clear();
+  }
+
+  /** Reverts a single pending edit back to its original content. */
+  private async undoEdit(filePath: string) {
+    const edit = this.fileEdits.get(filePath);
+    if (!edit) {return;}
+    await this.revertEdit(filePath, edit.originalOld);
+    this.fileEdits.delete(filePath);
+  }
+
+  /** Writes original content back, or deletes the file if it was newly created. */
+  private async revertEdit(filePath: string, originalOld: string) {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {return;}
+    const uri = vscode.Uri.joinPath(folder.uri, filePath);
+    try {
+      if (originalOld.length === 0) {
+        await vscode.workspace.fs.delete(uri, { useTrash: true });
+      } else {
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(originalOld, "utf8"));
+      }
+    } catch {
+      /* file may have been deleted/moved */
+    }
   }
 
   private async previewPatch(llmResponse: string): Promise<void> {
@@ -989,6 +1021,59 @@ function diffStat(oldText: string, newText: string): { additions: number; deleti
   for (const [line, c] of b) {additions += Math.max(0, c - (a.get(line) ?? 0));}
   for (const [line, c] of a) {deletions += Math.max(0, c - (b.get(line) ?? 0));}
   return { additions, deletions };
+}
+
+interface DiffLine { t: string; s: string }
+interface DiffHunks { lines: DiffLine[]; truncated: boolean }
+
+/** Line-level diff (LCS) condensed to a few context lines for an inline preview. */
+function computeDiffHunks(oldText: string, newText: string, maxLines = 240): DiffHunks {
+  const a = oldText.split("\n");
+  const b = newText.split("\n");
+  const n = a.length;
+  const m = b.length;
+  if (n * m > 4_000_000) {
+    return { lines: [], truncated: true };
+  }
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out: DiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { out.push({ t: " ", s: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ t: "-", s: a[i] }); i++; }
+    else { out.push({ t: "+", s: b[j] }); j++; }
+  }
+  while (i < n) { out.push({ t: "-", s: a[i] }); i++; }
+  while (j < m) { out.push({ t: "+", s: b[j] }); j++; }
+  const condensed = condenseContext(out, 3);
+  const truncated = condensed.length > maxLines;
+  return { lines: truncated ? condensed.slice(0, maxLines) : condensed, truncated };
+}
+
+/** Keeps `ctx` context lines around each change; collapses the rest into gap markers. */
+function condenseContext(lines: DiffLine[], ctx: number): DiffLine[] {
+  const keep = new Array(lines.length).fill(false);
+  for (let k = 0; k < lines.length; k++) {
+    if (lines[k].t !== " ") {
+      for (let d = -ctx; d <= ctx; d++) {
+        const idx = k + d;
+        if (idx >= 0 && idx < lines.length) {keep[idx] = true;}
+      }
+    }
+  }
+  const out: DiffLine[] = [];
+  let gap = false;
+  for (let k = 0; k < lines.length; k++) {
+    if (keep[k]) { out.push(lines[k]); gap = false; }
+    else if (!gap) { out.push({ t: "@", s: "" }); gap = true; }
+  }
+  return out;
 }
 
 /** Removes inline reasoning tags so saved/displayed answers stay clean. */
@@ -1314,13 +1399,33 @@ body {
 .tool-call .tool-args { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; color: var(--muted); white-space: pre-wrap; max-height: 120px; overflow-y: auto; margin-top: 4px; }
 .tool-result { background: var(--code-bg); border-left: 3px solid var(--btn-bg); border-radius: 0 6px 6px 0; padding: 6px 12px; font-size: 11px; font-family: var(--vscode-editor-font-family, monospace); white-space: pre-wrap; max-height: 200px; overflow-y: auto; color: var(--muted); margin: 2px 0; }
 .agent-status { padding: 4px 14px; font-size: 11px; color: var(--muted); font-style: italic; }
-.file-edit { display: flex; align-items: center; gap: 8px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 12px; margin: 4px 0; cursor: pointer; }
-.file-edit:hover { border-color: var(--btn-bg); background: var(--vscode-list-hoverBackground, var(--code-bg)); }
-.file-edit .fe-icon { opacity: 0.8; }
-.file-edit .fe-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vscode-editor-font-family, monospace); }
-.file-edit .fe-stat { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
-.file-edit .fe-stat .add { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
-.file-edit .fe-stat .del { color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+.file-edit { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; margin: 4px 0; font-size: 12px; overflow: hidden; }
+.file-edit.fe-accepted { border-color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); opacity: 0.75; }
+.file-edit.fe-reverted { opacity: 0.5; }
+.file-edit.fe-reverted .fe-path { text-decoration: line-through; }
+.file-edit.fe-accepted .fe-actions, .file-edit.fe-reverted .fe-actions { display: none; }
+.fe-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; }
+.fe-head:hover { background: var(--vscode-list-hoverBackground, transparent); }
+.fe-icon { opacity: 0.8; }
+.fe-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vscode-editor-font-family, monospace); cursor: pointer; }
+.fe-path:hover { text-decoration: underline; }
+.fe-badge { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 6px; border-radius: 4px; background: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); color: #fff; opacity: 0.85; }
+.fe-stat { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
+.fe-stat .add { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+.fe-stat .del { color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+.fe-toggle { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 12px; padding: 0 2px; }
+.fe-actions { display: flex; gap: 4px; }
+.fe-actions button { font-size: 11px; padding: 2px 10px; border-radius: 4px; border: 1px solid var(--border); cursor: pointer; background: transparent; color: var(--fg); }
+.fe-accept { background: var(--btn-bg) !important; color: var(--btn-fg) !important; border-color: var(--btn-bg) !important; }
+.fe-accept:hover { opacity: 0.9; }
+.fe-revert:hover { border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+.fe-diff { border-top: 1px solid var(--border); max-height: 320px; overflow: auto; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; line-height: 1.45; padding: 4px 0; }
+.fe-line { white-space: pre; padding: 0 8px; }
+.fe-line .fe-sign { display: inline-block; width: 1ch; margin-right: 6px; opacity: 0.7; }
+.fe-line.add { background: rgba(76,175,80,0.13); }
+.fe-line.del { background: rgba(244,67,54,0.13); }
+.fe-line.ctx { color: var(--muted); }
+.fe-line.gap { color: var(--muted); opacity: 0.6; text-align: center; }
 
 .tool-row { display: flex; align-items: center; gap: 6px; padding: 2px 2px; font-size: 12px; color: var(--muted); margin: 1px 0; }
 .tool-row .tool-verb { color: var(--fg); opacity: 0.85; }
@@ -2507,9 +2612,27 @@ function formatToolRow(name, args) {
   }
 }
 
+function diffBodyHtml(diff) {
+  let html = "";
+  for (const ln of diff.lines) {
+    if (ln.t === "@") { html += '<div class="fe-line gap">\u22EF</div>'; continue; }
+    const cls = ln.t === "+" ? "add" : (ln.t === "-" ? "del" : "ctx");
+    const sign = ln.t === " " ? "\u00A0" : ln.t;
+    html += '<div class="fe-line ' + cls + '"><span class="fe-sign">' + sign + '</span>'
+      + escapeHtml(ln.s || "") + '</div>';
+  }
+  if (diff.truncated) {
+    html += '<div class="fe-line gap">\u22EF diff truncated \u2014 open in editor</div>';
+  }
+  return html;
+}
+
 function renderEditSummary() {
   const paths = Object.keys(editStats);
-  if (paths.length === 0) return;
+  if (paths.length === 0) {
+    if (editSummaryEl) { editSummaryEl.style.display = "none"; editSummaryEl = null; }
+    return;
+  }
   if (!editSummaryEl) {
     editSummaryEl = document.createElement("div");
     editSummaryEl.className = "edit-summary";
@@ -2520,23 +2643,33 @@ function renderEditSummary() {
   const n = paths.length;
   const label = '<span class="es-label">' + n + ' file' + (n === 1 ? '' : 's')
     + ' changed <span class="add">+' + a + '</span> <span class="del">-' + d + '</span></span>';
-  const actions = '<span class="es-actions"><button class="es-keep">Keep</button>'
-    + '<button class="es-undo">Undo</button></span>';
+  const actions = '<span class="es-actions"><button class="es-keep">Accept all</button>'
+    + '<button class="es-undo">Revert all</button></span>';
   editSummaryEl.innerHTML = label + actions;
   editSummaryEl.querySelector(".es-keep").addEventListener("click", () => {
     vscode.postMessage({ type: "keepEdits" });
-    finalizeEdits("Kept " + n + " file" + (n === 1 ? '' : 's'));
+    markAllCards("fe-accepted");
+    finalizeEdits("Accepted " + n + " file" + (n === 1 ? '' : 's'));
   });
   editSummaryEl.querySelector(".es-undo").addEventListener("click", () => {
     vscode.postMessage({ type: "undoEdits" });
+    markAllCards("fe-reverted");
     finalizeEdits("Reverted " + n + " file" + (n === 1 ? '' : 's'));
   });
   messagesEl.appendChild(editSummaryEl);
 }
 
+function markAllCards(cls) {
+  for (const key of Object.keys(editCardEls)) {
+    const el = editCardEls[key];
+    if (el) { el.classList.remove("fe-accepted", "fe-reverted"); el.classList.add(cls); }
+  }
+}
+
 function finalizeEdits(text) {
   if (editSummaryEl) {
     editSummaryEl.innerHTML = '<span class="es-label es-done">' + escapeHtml(text) + '</span>';
+    editSummaryEl.style.display = "";
   }
   editStats = {};
   editCardEls = {};
@@ -3022,20 +3155,55 @@ window.addEventListener("message", (event) => {
     case "fileEdit": {
       agentTextEl = null;
       const p = msg.path;
-      const statHtml = msg.tooLarge
-        ? '<span class="fe-stat">large file</span>'
-        : '<span class="fe-stat"><span class="add">+' + msg.additions + '</span> <span class="del">-' + msg.deletions + '</span></span>';
       let card = editCardEls[p];
       if (!card) {
         card = document.createElement("div");
         card.className = "file-edit";
-        card.title = "Open diff in editor";
-        card.addEventListener("click", () => vscode.postMessage({ type: "openDiff", path: p }));
         editCardEls[p] = card;
         messagesEl.appendChild(card);
       }
-      card.innerHTML = '<span class="fe-icon">\u270E</span><span class="fe-path">'
-        + escapeHtml(p) + '</span>' + statHtml;
+      card.classList.remove("fe-accepted", "fe-reverted");
+      const statHtml = msg.tooLarge
+        ? '<span class="fe-stat">large file</span>'
+        : '<span class="fe-stat"><span class="add">+' + msg.additions + '</span> <span class="del">-' + msg.deletions + '</span></span>';
+      const badge = msg.isNew ? '<span class="fe-badge">new</span>' : '';
+      const hasDiff = msg.diff && msg.diff.lines && msg.diff.lines.length > 0;
+      const toggle = hasDiff ? '<button class="fe-toggle" title="Toggle diff">\u25BE</button>' : '';
+      const head = '<div class="fe-head">'
+        + '<span class="fe-icon">\u270E</span>'
+        + '<span class="fe-path" title="Open diff in editor">' + escapeHtml(p) + '</span>'
+        + badge + statHtml + toggle
+        + '<span class="fe-actions">'
+        + '<button class="fe-accept">Accept</button>'
+        + '<button class="fe-revert">Revert</button>'
+        + '</span></div>';
+      const body = hasDiff
+        ? '<div class="fe-diff" style="display:none">' + diffBodyHtml(msg.diff) + '</div>'
+        : '';
+      card.innerHTML = head + body;
+      const pathEl = card.querySelector(".fe-path");
+      if (pathEl) pathEl.addEventListener("click", () => vscode.postMessage({ type: "openDiff", path: p }));
+      const toggleEl = card.querySelector(".fe-toggle");
+      const diffEl = card.querySelector(".fe-diff");
+      if (toggleEl && diffEl) toggleEl.addEventListener("click", () => {
+        const shown = diffEl.style.display !== "none";
+        diffEl.style.display = shown ? "none" : "block";
+        toggleEl.textContent = shown ? "\u25BE" : "\u25B4";
+      });
+      const acceptEl = card.querySelector(".fe-accept");
+      if (acceptEl) acceptEl.addEventListener("click", () => {
+        vscode.postMessage({ type: "keepEdit", path: p });
+        card.classList.add("fe-accepted");
+        delete editStats[p];
+        renderEditSummary();
+      });
+      const revertEl = card.querySelector(".fe-revert");
+      if (revertEl) revertEl.addEventListener("click", () => {
+        vscode.postMessage({ type: "undoEdit", path: p });
+        card.classList.add("fe-reverted");
+        delete editStats[p];
+        renderEditSummary();
+      });
       editStats[p] = msg.tooLarge ? { a: 0, d: 0 } : { a: msg.additions, d: msg.deletions };
       renderEditSummary();
       scrollToBottom();
