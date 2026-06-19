@@ -48,6 +48,8 @@ pub enum AgentEventKind {
     /// Context was compressed/summarized to fit the window.
     ContextCompressed,
     FileEdit,
+    /// A tool needs the user to approve before it runs.
+    ApprovalRequired,
 }
 
 pub struct AgentResult {
@@ -793,8 +795,15 @@ async fn check_approval(
 
     let req_id = format!("{}_{}", call.id, call.name);
     on_event(AgentEvent {
-        kind: AgentEventKind::ToolCall,
-        content: Some(format!("Approval required: {} - {}", call.name, req_id)),
+        kind: AgentEventKind::ApprovalRequired,
+        content: Some(
+            serde_json::json!({
+                "request_id": req_id,
+                "tool_name": call.name,
+                "arguments": call.arguments,
+            })
+            .to_string(),
+        ),
     });
     gate.request(req_id).await
 }

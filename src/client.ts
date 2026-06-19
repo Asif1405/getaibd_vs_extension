@@ -229,7 +229,7 @@ function processSseEvent(event: string, data: string, callbacks: SseCallbacks) {
 export interface AgentCallbacks {
   onToolCall: (name: string, args: Record<string, unknown>) => void;
   onToolResult: (name: string, result: unknown) => void;
-  onApprovalRequired?: (requestId: string, toolName: string, args: Record<string, unknown>) => void;
+  onApprovalRequired?: (requestId: string, sessionId: string | undefined, toolName: string, args: Record<string, unknown>) => void;
   onText: (text: string) => void;
   onDone: (content: string) => void;
   onComplete: (iterations: number) => void;
@@ -249,11 +249,11 @@ export interface FileEdit {
   too_large?: boolean;
 }
 
-export async function sendApproval(requestId: string, approved: boolean): Promise<void> {
+export async function sendApproval(requestId: string, approved: boolean, sessionId?: string): Promise<void> {
   await fetch(`${getServerUrl()}/agent/approve`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify({ request_id: requestId, approved }),
+    body: JSON.stringify({ request_id: requestId, approved, session_id: sessionId }),
   });
 }
 
@@ -375,7 +375,7 @@ function processAgentEvent(
       }
       case "approval_required": {
         const parsed = JSON.parse(data);
-        callbacks.onApprovalRequired?.(parsed.request_id, parsed.tool_name, parsed.arguments ?? {});
+        callbacks.onApprovalRequired?.(parsed.request_id, parsed.session_id, parsed.tool_name, parsed.arguments ?? {});
         break;
       }
       case "text":
@@ -427,7 +427,7 @@ export function streamOrchestrated(
   input: string,
   mode: string,
   callbacks: OrchestratedCallbacks,
-  options?: { apiKey?: string; history?: ChatMessage[] },
+  options?: { apiKey?: string; history?: ChatMessage[]; requireApproval?: boolean },
 ): AbortController {
   const controller = new AbortController();
 
@@ -441,6 +441,7 @@ export function streamOrchestrated(
         auto_mode: mode === "auto",
         use_memory: true,
         history: options?.history ?? [],
+        require_approval: options?.requireApproval ?? false,
       };
       if (options?.apiKey) {body.api_key = options.apiKey;}
 
