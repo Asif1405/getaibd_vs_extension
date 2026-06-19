@@ -65,6 +65,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private history: HistoryEntry[] = [];
   private currentStreamContent = "";
   private fileEdits = new Map<string, { path: string; originalOld: string; latestNew: string }>();
+  private editContents = new Map<string, { originalOld: string; latestNew: string }>();
   private pendingApprovals = new Map<string, string | undefined>();
 
   constructor(context: vscode.ExtensionContext) {
@@ -80,7 +81,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const provider = new ChatPanel(context);
     const diffProvider: vscode.TextDocumentContentProvider = {
       provideTextDocumentContent(uri) {
-        const edit = provider.fileEdits.get(decodeURIComponent(uri.query));
+        const edit = provider.editContents.get(decodeURIComponent(uri.query));
         if (!edit) {return "";}
         return uri.scheme === "getaibd-diff-new" ? edit.latestNew : edit.originalOld;
       },
@@ -726,10 +727,11 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private handleFileEdit(edit: FileEdit) {
-    const existing = this.fileEdits.get(edit.path);
+    const existing = this.editContents.get(edit.path);
     const originalOld = existing ? existing.originalOld : (edit.old_content ?? "");
     const latestNew = edit.new_content ?? "";
     this.fileEdits.set(edit.path, { path: edit.path, originalOld, latestNew });
+    this.editContents.set(edit.path, { originalOld, latestNew });
     const { additions, deletions } = diffStat(originalOld, latestNew);
     const tooLarge = !!edit.too_large;
     const diff = tooLarge ? { lines: [], truncated: true } : computeDiffHunks(originalOld, latestNew);
@@ -746,7 +748,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   /** Opens an agent edit as a native VS Code diff (original vs current file). */
   private async openDiff(filePath: string) {
-    const edit = this.fileEdits.get(filePath);
+    const edit = this.editContents.get(filePath);
     if (!edit) {return;}
     const q = encodeURIComponent(filePath);
     const leftUri = vscode.Uri.parse(`getaibd-diff:/${filePath}?${q}`);
