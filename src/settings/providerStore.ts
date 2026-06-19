@@ -130,6 +130,7 @@ export class ProviderStore {
     serverUrl: string;
     fileContextEnabled: boolean;
     inlineCompletionsEnabled: boolean;
+    autoOpenEdits: boolean;
     inlineProvider: string;
     inlineModel: string;
     curatedModels: Record<string, CuratedModel[]>;
@@ -173,6 +174,7 @@ export class ProviderStore {
       serverUrl: config.get<string>("serverUrl", "http://127.0.0.1:39377"),
       fileContextEnabled: config.get<boolean>("fileContext.enabled", true),
       inlineCompletionsEnabled: config.get<boolean>("inlineCompletions.enabled", false),
+      autoOpenEdits: config.get<boolean>("editReview.autoOpen", true),
       inlineProvider: config.get<string>("inlineCompletions.provider", "getaibd"),
       inlineModel: config.get<string>("inlineCompletions.model", ""),
       curatedModels: CURATED_MODELS,

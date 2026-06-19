@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "Cursor-style AI coding agent powered by GetAIBD",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "repository": {
     "type": "git",
     "url": "https://github.com/dmsbilas/getaibd_vs_extension.git"
@@ -183,6 +183,11 @@
           "type": "string",
           "default": "",
           "description": "Model for inline completions (leave empty to use the default model)."
+        },
+        "getaibd.editReview.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open each file in the editor as the agent edits it, with inline Accept/Reject."
         },
         "getaibd.chat.defaultProvider": {
           "type": "string",
