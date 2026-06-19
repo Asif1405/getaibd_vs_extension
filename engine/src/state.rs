@@ -34,6 +34,8 @@ pub struct AppState {
     pub analysis_cache: Arc<ProjectAnalysisCache>,
     /// Session-scoped approval gates keyed by session UUID
     approval_gates: Mutex<HashMap<String, ApprovalGate>>,
+    /// Session-scoped terminal gates keyed by session UUID
+    terminal_gates: Mutex<HashMap<String, crate::tools::terminal_gate::TerminalGate>>,
     /// Snapshots for patch rollback, keyed by patch ID (UUID)
     pub patch_snapshots: Mutex<HashMap<String, Snapshot>>,
     pub context_config: crate::context::ContextConfig,
@@ -118,6 +120,7 @@ impl AppState {
             task_queue,
             analysis_cache,
             approval_gates: Mutex::new(HashMap::new()),
+            terminal_gates: Mutex::new(HashMap::new()),
             patch_snapshots: Mutex::new(HashMap::new()),
             context_config: config.context.clone(),
         }
@@ -143,6 +146,35 @@ impl AppState {
     /// Find any active gate — used as fallback when session_id is unknown.
     pub fn any_approval_gate(&self) -> Option<ApprovalGate> {
         self.approval_gates.lock().expect("state mutex poisoned").values().next().cloned()
+    }
+
+    /// Register a terminal gate for a specific agent session.
+    pub fn set_terminal_gate(
+        &self,
+        session_id: &str,
+        gate: crate::tools::terminal_gate::TerminalGate,
+    ) {
+        self.terminal_gates
+            .lock().expect("state mutex poisoned")
+            .insert(session_id.to_string(), gate);
+    }
+
+    /// Retrieve the terminal gate for a session.
+    pub fn get_terminal_gate(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::tools::terminal_gate::TerminalGate> {
+        self.terminal_gates.lock().expect("state mutex poisoned").get(session_id).cloned()
+    }
+
+    /// Remove the terminal gate after a session finishes.
+    pub fn clear_terminal_gate(&self, session_id: &str) {
+        self.terminal_gates.lock().expect("state mutex poisoned").remove(session_id);
+    }
+
+    /// Find any active terminal gate — fallback when session_id is unknown.
+    pub fn any_terminal_gate(&self) -> Option<crate::tools::terminal_gate::TerminalGate> {
+        self.terminal_gates.lock().expect("state mutex poisoned").values().next().cloned()
     }
 
     /// Store a patch snapshot for later rollback.

@@ -6,6 +6,7 @@ import {
   streamAgent,
   streamOrchestrated,
   sendApproval,
+  sendTerminalResult,
   testProviderConnection,
   type ChatMessage,
   type FileEdit,
@@ -14,6 +15,7 @@ import { scanText, formatWarning } from "../safetype/detector";
 import { ensureEngine } from "../engine/manager";
 import { PatchPreviewPanel } from "./patchPreview";
 import { EditReviewManager } from "./editReview";
+import { AgentTerminal } from "./terminal";
 import {
   getServerUrl,
   authHeaders,
@@ -29,8 +31,14 @@ interface WebviewMessage {
   [key: string]: unknown;
 }
 
+interface CheckpointBaseline {
+  path: string;
+  before: string;
+  existed: boolean;
+}
+
 interface HistoryEntry {
-  kind: "message" | "context" | "fileEdit";
+  kind: "message" | "context" | "fileEdit" | "checkpoint";
   role?: string;
   content: string;
   label?: string;
@@ -39,6 +47,8 @@ interface HistoryEntry {
   editNew?: string;
   tooLarge?: boolean;
   editStatus?: "pending" | "accept" | "reject";
+  turnId?: string;
+  baselines?: CheckpointBaseline[];
 }
 
 interface SessionMeta {
@@ -75,6 +85,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private editReview = new EditReviewManager(vscode.workspace.workspaceFolders?.[0]?.uri);
   private pendingApprovals = new Map<string, string | undefined>();
   private lastDiffPath: string | undefined;
+  private currentTurnId: string | undefined;
+  private agentTerminal = new AgentTerminal(vscode.workspace.workspaceFolders?.[0]?.uri);
+  private activeTerminalReq: { requestId: string; sessionId: string | undefined } | undefined;
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -282,6 +295,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           clearTimeout(this.reconnectTimer);
           this.reconnectTimer = undefined;
         }
+        this.cancelActiveTerminal();
         this.abortController?.abort();
         this.abortController = undefined;
         this.currentStreamContent = "";
@@ -301,6 +315,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         break;
       case "openDiff":
         if (msg.path) {await this.openDiff(msg.path as string);}
+        break;
+      case "restoreCheckpoint":
+        if (msg.turnId) {await this.restoreCheckpoint(msg.turnId as string);}
         break;
       case "keepEdits":
         this.keepEdits();
@@ -643,6 +660,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onApprovalRequired: (requestId, sessionId, toolName, args) => {
         this.handleApprovalRequest(requestId, sessionId, toolName, args);
       },
+      onTerminalExec: (requestId, sessionId, args) => {
+        void this.handleTerminalExec(requestId, sessionId, args);
+      },
       onText: (text) => {
         this.post({ type: "agentText", content: text });
       },
@@ -692,9 +712,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private async sendOrchestrated(provider: string, model: string, text: string, mode: string) {
     if (!(await this.checkSecrets(text))) {return;}
     const priorHistory = [...this.buildFileContext(), ...this.conversationMessages()];
-    this.history.push({ kind: "message", role: "user", content: text });
+    const turnId = newId();
+    this.currentTurnId = turnId;
+    this.history.push({ kind: "checkpoint", content: text, turnId, baselines: [] });
+    this.history.push({ kind: "message", role: "user", content: text, turnId });
     this.saveHistory();
-    this.post({ type: "addMessage", role: "user", content: text });
+    this.post({ type: "addMessage", role: "user", content: text, turnId, canRestore: true });
     this.post({ type: "agentStart" });
 
     const apiKey = await this.store.getApiKey(provider);
@@ -710,6 +733,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       },
       onApprovalRequired: (requestId, sessionId, toolName, args) => {
         this.handleApprovalRequest(requestId, sessionId, toolName, args);
+      },
+      onTerminalExec: (requestId, sessionId, args) => {
+        void this.handleTerminalExec(requestId, sessionId, args);
       },
       onText: (text) => {
         this.post({ type: "agentText", content: text });
@@ -749,10 +775,11 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey, history: priorHistory, requireApproval: true });
+    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported });
   }
 
   private handleFileEdit(edit: FileEdit) {
+    this.recordTurnBaseline(edit);
     const existing = this.editContents.get(edit.path);
     const originalOld = existing ? existing.originalOld : (edit.old_content ?? "");
     const latestNew = edit.new_content ?? "";
@@ -795,6 +822,69 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       });
     }
     this.saveHistory();
+  }
+
+  /** Captures the pre-edit content of a file the first time it changes in the current turn. */
+  private recordTurnBaseline(edit: FileEdit) {
+    const turnId = this.currentTurnId;
+    if (!turnId) {return;}
+    const cp = [...this.history].reverse().find((e) => e.kind === "checkpoint" && e.turnId === turnId);
+    if (!cp) {return;}
+    cp.baselines = cp.baselines ?? [];
+    if (cp.baselines.some((b) => b.path === edit.path)) {return;}
+    const before = edit.old_content ?? "";
+    const existed = before.length > 0 || this.editContents.has(edit.path);
+    cp.baselines.push({ path: edit.path, before, existed });
+    this.saveHistory();
+  }
+
+  /** Reverts every file change from this checkpoint onward and rolls the chat back to it. */
+  private async restoreCheckpoint(turnId: string) {
+    const idx = this.history.findIndex((e) => e.kind === "checkpoint" && e.turnId === turnId);
+    if (idx < 0) {return;}
+    const confirm = await vscode.window.showWarningMessage(
+      "Restore to this checkpoint? This reverts file changes made from this point onward and removes later messages.",
+      { modal: true },
+      "Restore",
+    );
+    if (confirm !== "Restore") {return;}
+    this.abortController?.abort();
+    this.abortController = undefined;
+
+    const restore = new Map<string, CheckpointBaseline>();
+    for (let i = idx; i < this.history.length; i++) {
+      const e = this.history[i];
+      if (e.kind === "checkpoint" && e.baselines) {
+        for (const b of e.baselines) {
+          if (!restore.has(b.path)) {restore.set(b.path, b);}
+        }
+      }
+    }
+
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    for (const [path, b] of restore) {
+      if (folder) {
+        const uri = vscode.Uri.joinPath(folder.uri, path);
+        try {
+          if (b.existed) {
+            await vscode.workspace.fs.writeFile(uri, Buffer.from(b.before, "utf8"));
+          } else {
+            await vscode.workspace.fs.delete(uri, { useTrash: true });
+          }
+        } catch {
+          /* file may have been moved or already removed */
+        }
+      }
+      this.editContents.delete(path);
+      this.fileEdits.delete(path);
+      this.editReview.dropEdit(path);
+    }
+
+    this.history = this.history.slice(0, idx);
+    this.currentTurnId = undefined;
+    this.saveHistory();
+    this.post({ type: "clearMessages" });
+    this.restoreHistory();
   }
 
   /** Syncs chat card, maps, and persistence after a per-block accept/reject in the editor. */
@@ -973,6 +1063,41 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     await sendApproval(requestId, approved, sessionId);
   }
 
+  /** Runs an agent shell command in the managed terminal and returns the result to the engine. */
+  private async handleTerminalExec(
+    requestId: string,
+    sessionId: string | undefined,
+    args: Record<string, unknown>,
+  ) {
+    const command = typeof args.command === "string" ? args.command : "";
+    const cmdArgs = Array.isArray(args.args)
+      ? args.args.filter((a): a is string => typeof a === "string")
+      : [];
+    const cwd = typeof args.cwd === "string" ? args.cwd : undefined;
+    this.activeTerminalReq = { requestId, sessionId };
+    let result = { stdout: "", stderr: "", exit_code: 0 };
+    try {
+      result = await this.agentTerminal.run(command, cmdArgs, cwd, () => undefined);
+    } catch (err) {
+      result = { stdout: "", stderr: err instanceof Error ? err.message : String(err), exit_code: 1 };
+    }
+    this.activeTerminalReq = undefined;
+    await sendTerminalResult(requestId, result, sessionId);
+  }
+
+  /** Cancels any in-flight terminal command and unblocks the engine. */
+  private cancelActiveTerminal() {
+    const req = this.activeTerminalReq;
+    if (!req) {return;}
+    this.activeTerminalReq = undefined;
+    this.agentTerminal.cancel();
+    void sendTerminalResult(
+      req.requestId,
+      { stdout: "", stderr: "Cancelled by user", exit_code: 130 },
+      req.sessionId,
+    );
+  }
+
   private startTaskPolling(taskId: string) {
     const pollInterval = setInterval(async () => {
       try {
@@ -999,8 +1124,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.post({ type: "addContext", label: entry.label, code: entry.content });
       } else if (entry.kind === "fileEdit") {
         this.restoreFileEdit(entry);
+      } else if (entry.kind === "checkpoint") {
+        /* metadata only; the user message carries the restore control */
       } else {
-        this.post({ type: "addMessage", role: entry.role, content: entry.content });
+        this.post({
+          type: "addMessage",
+          role: entry.role,
+          content: entry.content,
+          turnId: entry.turnId,
+          canRestore: !!entry.turnId && entry.role === "user",
+        });
       }
     }
   }
@@ -1086,6 +1219,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.sessions.unshift(session);
     this.activeSessionId = session.id;
     this.history = [];
+    this.currentTurnId = undefined;
     this.editContents.clear();
     this.fileEdits.clear();
     this.editReview.clearAll();
@@ -1101,6 +1235,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }
     this.abortController?.abort();
     this.abortController = undefined;
+    this.currentTurnId = undefined;
     this.activeSessionId = id;
     this.history = this.globalState.get<HistoryEntry[]>(SESSION_HISTORY_PREFIX + id, []);
     this.saveSessions();
@@ -1139,6 +1274,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private dispose() {
     if (this.reconnectTimer) {clearTimeout(this.reconnectTimer);}
     this.abortController?.abort();
+    this.agentTerminal.dispose();
     for (const d of this.disposables) {d.dispose();}
   }
 }
@@ -1518,6 +1654,7 @@ body {
 .msg-action-btn:hover { color: var(--fg); border-color: var(--fg); }
 .btn-copy { right: 6px; }
 .btn-insert { right: 48px; }
+.btn-restore { right: 6px; }
 
 .context-block {
   background: var(--code-bg);
@@ -2722,7 +2859,7 @@ function send() {
 }
 
 /* ── Messages ── */
-function addMessage(role, content) {
+function addMessage(role, content, opts) {
   const div = document.createElement("div");
   div.className = "message " + role;
   const body = role === "assistant"
@@ -2730,9 +2867,21 @@ function addMessage(role, content) {
     : escapeHtml(content);
   div.innerHTML = '<span class="role-label">' + role + "</span>" + body;
   if (role === "assistant" && content) appendActionBtns(div, content);
+  if (opts && opts.canRestore && opts.turnId) appendRestoreBtn(div, opts.turnId);
   messagesEl.appendChild(div);
   scrollToBottom();
   return div;
+}
+
+function appendRestoreBtn(container, turnId) {
+  const btn = document.createElement("button");
+  btn.className = "msg-action-btn btn-restore";
+  btn.title = "Revert file changes from this point and roll the chat back here";
+  btn.textContent = "\u21ba Restore checkpoint";
+  btn.addEventListener("click", () => {
+    vscode.postMessage({ type: "restoreCheckpoint", turnId: turnId });
+  });
+  container.appendChild(btn);
 }
 
 function appendActionBtns(container, rawContent) {
@@ -3227,7 +3376,7 @@ window.addEventListener("message", (event) => {
     }
 
     case "addMessage":
-      addMessage(msg.role, msg.content);
+      addMessage(msg.role, msg.content, { turnId: msg.turnId, canRestore: msg.canRestore });
       break;
 
     case "addContext": {

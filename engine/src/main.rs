@@ -96,6 +96,10 @@ async fn main() {
         .route("/agent/run", post(routes::agent::agent_handler))
         .route("/agent/approve", post(routes::agent::approve_handler))
         .route(
+            "/agent/terminal_result",
+            post(routes::agent::terminal_result_handler),
+        )
+        .route(
             "/agent/orchestrated",
             post(routes::orchestrated_agent::orchestrated_agent_handler),
         )

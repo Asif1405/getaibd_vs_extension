@@ -230,6 +230,7 @@ export interface AgentCallbacks {
   onToolCall: (name: string, args: Record<string, unknown>) => void;
   onToolResult: (name: string, result: unknown) => void;
   onApprovalRequired?: (requestId: string, sessionId: string | undefined, toolName: string, args: Record<string, unknown>) => void;
+  onTerminalExec?: (requestId: string, sessionId: string | undefined, args: Record<string, unknown>) => void;
   onText: (text: string) => void;
   onDone: (content: string) => void;
   onComplete: (iterations: number) => void;
@@ -254,6 +255,19 @@ export async function sendApproval(requestId: string, approved: boolean, session
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ request_id: requestId, approved, session_id: sessionId }),
+  });
+}
+
+/** Posts a delegated terminal command's captured result back to the engine. */
+export async function sendTerminalResult(
+  requestId: string,
+  result: { stdout: string; stderr: string; exit_code: number },
+  sessionId?: string,
+): Promise<void> {
+  await fetch(`${getServerUrl()}/agent/terminal_result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ request_id: requestId, session_id: sessionId, result: JSON.stringify(result) }),
   });
 }
 
@@ -378,6 +392,11 @@ function processAgentEvent(
         callbacks.onApprovalRequired?.(parsed.request_id, parsed.session_id, parsed.tool_name, parsed.arguments ?? {});
         break;
       }
+      case "terminal_exec": {
+        const parsed = JSON.parse(data);
+        callbacks.onTerminalExec?.(parsed.request_id, parsed.session_id, parsed.arguments ?? {});
+        break;
+      }
       case "text":
         callbacks.onText(data);
         break;
@@ -427,7 +446,7 @@ export function streamOrchestrated(
   input: string,
   mode: string,
   callbacks: OrchestratedCallbacks,
-  options?: { apiKey?: string; history?: ChatMessage[]; requireApproval?: boolean },
+  options?: { apiKey?: string; history?: ChatMessage[]; requireApproval?: boolean; clientTerminal?: boolean },
 ): AbortController {
   const controller = new AbortController();
 
@@ -442,6 +461,7 @@ export function streamOrchestrated(
         use_memory: true,
         history: options?.history ?? [],
         require_approval: options?.requireApproval ?? false,
+        client_terminal: options?.clientTerminal ?? false,
       };
       if (options?.apiKey) {body.api_key = options.apiKey;}
 

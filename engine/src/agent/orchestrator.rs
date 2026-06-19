@@ -17,6 +17,7 @@ pub struct Orchestrator {
     embedder: Option<Box<dyn EmbeddingProvider>>,
     auto_mode: bool,
     approval_gate: Option<crate::tools::approval::ApprovalGate>,
+    terminal_gate: Option<crate::tools::terminal_gate::TerminalGate>,
 }
 
 impl Orchestrator {
@@ -28,11 +29,17 @@ impl Orchestrator {
             embedder: None,
             auto_mode: true,
             approval_gate: None,
+            terminal_gate: None,
         }
     }
 
     pub fn with_approval_gate(mut self, gate: crate::tools::approval::ApprovalGate) -> Self {
         self.approval_gate = Some(gate);
+        self
+    }
+
+    pub fn with_terminal_gate(mut self, gate: crate::tools::terminal_gate::TerminalGate) -> Self {
+        self.terminal_gate = Some(gate);
         self
     }
 
@@ -148,6 +155,7 @@ impl Orchestrator {
         let memory_ctx = self.memory_context();
         let options = AgentOptions {
             approval_gate: self.approval_gate.clone(),
+            terminal_gate: self.terminal_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
@@ -187,6 +195,7 @@ impl Orchestrator {
         let memory_ctx = self.memory_context();
         let options = AgentOptions {
             approval_gate: self.approval_gate.clone(),
+            terminal_gate: self.terminal_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),

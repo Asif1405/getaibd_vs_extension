@@ -37,6 +37,9 @@ pub struct OrchestratedRequest {
     pub history: Vec<HistoryMessage>,
     #[serde(default)]
     pub require_approval: bool,
+    /// When true, run_command is delegated to the client's managed terminal.
+    #[serde(default)]
+    pub client_terminal: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,13 +70,29 @@ pub async fn orchestrated_agent_handler(
     } else {
         None
     };
+    let term_gate = if req.client_terminal {
+        let g = crate::tools::terminal_gate::TerminalGate::new();
+        state.set_terminal_gate(&session_id, g.clone());
+        Some(g)
+    } else {
+        None
+    };
     let sid = session_id.clone();
 
     tokio::spawn(async move {
-        let result =
-            run_orchestrated_task(&state, req, provider, registry, gate, sid.clone(), tx.clone())
-                .await;
+        let result = run_orchestrated_task(
+            &state,
+            req,
+            provider,
+            registry,
+            gate,
+            term_gate,
+            sid.clone(),
+            tx.clone(),
+        )
+        .await;
         state.clear_approval_gate(&sid);
+        state.clear_terminal_gate(&sid);
 
         match result {
             Ok(resp) => {
@@ -101,6 +120,7 @@ async fn run_orchestrated_task(
     provider: Arc<dyn crate::providers::Provider>,
     registry: ToolRegistry,
     gate: Option<crate::tools::approval::ApprovalGate>,
+    term_gate: Option<crate::tools::terminal_gate::TerminalGate>,
     session_id: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) -> Result<OrchestratedResponse, AppError> {
@@ -119,6 +139,10 @@ async fn run_orchestrated_task(
 
     if let Some(g) = gate {
         orchestrator = orchestrator.with_approval_gate(g);
+    }
+
+    if let Some(g) = term_gate {
+        orchestrator = orchestrator.with_terminal_gate(g);
     }
 
     if req.use_memory {
@@ -146,10 +170,13 @@ async fn run_orchestrated_task(
             AgentEventKind::ContextCompressed => "context_compressed",
             AgentEventKind::FileEdit => "file_edit",
             AgentEventKind::ApprovalRequired => "approval_required",
+            AgentEventKind::TerminalExec => "terminal_exec",
         };
 
         let data = match event.kind {
-            AgentEventKind::ApprovalRequired => inject_session_id(&event.content, &session_id),
+            AgentEventKind::ApprovalRequired | AgentEventKind::TerminalExec => {
+                inject_session_id(&event.content, &session_id)
+            }
             _ => event.content.unwrap_or_default(),
         };
 
