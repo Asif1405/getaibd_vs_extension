@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "Cursor-style AI coding agent powered by GetAIBD",
-  "version": "0.3.14",
+  "version": "0.3.16",
   "repository": {
     "type": "git",
     "url": "https://github.com/dmsbilas/getaibd_vs_extension.git"
@@ -87,6 +87,16 @@
       {
         "command": "getaibd.useFree",
         "title": "GetAIBD: Use Free Tier"
+      },
+      {
+        "command": "getaibd.acceptActiveDiff",
+        "title": "GetAIBD: Accept Agent Edit",
+        "icon": "$(check)"
+      },
+      {
+        "command": "getaibd.rejectActiveDiff",
+        "title": "GetAIBD: Reject Agent Edit",
+        "icon": "$(discard)"
       }
     ],
     "keybindings": [
@@ -107,6 +117,18 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "getaibd.acceptActiveDiff",
+          "when": "getaibd.diffOpen",
+          "group": "navigation@1"
+        },
+        {
+          "command": "getaibd.rejectActiveDiff",
+          "when": "getaibd.diffOpen",
+          "group": "navigation@2"
+        }
+      ],
       "editor/context": [
         {
           "command": "getaibd.explainSelection",

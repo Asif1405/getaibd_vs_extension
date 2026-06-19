@@ -74,6 +74,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private editContents = new Map<string, { originalOld: string; latestNew: string }>();
   private editReview = new EditReviewManager(vscode.workspace.workspaceFolders?.[0]?.uri);
   private pendingApprovals = new Map<string, string | undefined>();
+  private lastDiffPath: string | undefined;
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -98,10 +99,22 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       provider.fileEdits.delete(relPath);
       provider.markEditResolved(relPath, action);
     });
+    provider.editReview.setOnEditChanged((relPath, originalOld, latestNew) => {
+      provider.syncEditAfterBlockOp(relPath, originalOld, latestNew);
+    });
     context.subscriptions.push(
       vscode.workspace.registerTextDocumentContentProvider("getaibd-diff", diffProvider),
       vscode.workspace.registerTextDocumentContentProvider("getaibd-diff-new", diffProvider),
       ...provider.editReview.register(),
+      vscode.commands.registerCommand("getaibd.acceptActiveDiff", () => {
+        if (provider.lastDiffPath) {provider.keepEdit(provider.lastDiffPath);}
+        void vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+      }),
+      vscode.commands.registerCommand("getaibd.rejectActiveDiff", () => {
+        if (provider.lastDiffPath) {void provider.undoEdit(provider.lastDiffPath);}
+        void vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+      }),
+      vscode.window.tabGroups.onDidChangeTabs(() => provider.updateDiffContext()),
     );
     return vscode.window.registerWebviewViewProvider(ChatPanel.viewType, provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -678,7 +691,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendOrchestrated(provider: string, model: string, text: string, mode: string) {
     if (!(await this.checkSecrets(text))) {return;}
-    const priorHistory = [...this.conversationMessages(), ...this.buildFileContext()];
+    const priorHistory = [...this.buildFileContext(), ...this.conversationMessages()];
     this.history.push({ kind: "message", role: "user", content: text });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: text });
@@ -784,6 +797,30 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.saveHistory();
   }
 
+  /** Syncs chat card, maps, and persistence after a per-block accept/reject in the editor. */
+  private syncEditAfterBlockOp(path: string, originalOld: string, latestNew: string) {
+    this.editContents.set(path, { originalOld, latestNew });
+    if (this.fileEdits.has(path)) {
+      this.fileEdits.set(path, { path, originalOld, latestNew });
+    }
+    const entry = this.history.find((e) => e.kind === "fileEdit" && e.path === path);
+    if (entry) {
+      entry.editOld = originalOld;
+      entry.editNew = latestNew;
+      this.saveHistory();
+    }
+    const { additions, deletions } = diffStat(originalOld, latestNew);
+    this.post({
+      type: "fileEdit",
+      path,
+      additions,
+      deletions,
+      tooLarge: false,
+      isNew: originalOld.length === 0 && latestNew.length > 0,
+      diff: computeDiffHunks(originalOld, latestNew),
+    });
+  }
+
   /** Records the accept/reject outcome of an edit so its state persists across reloads. */
   private markEditResolved(path: string, action: "accept" | "reject") {
     const entry = this.history.find((e) => e.kind === "fileEdit" && e.path === path);
@@ -844,6 +881,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private async openDiff(filePath: string) {
     const edit = this.editContents.get(filePath);
     if (!edit) {return;}
+    this.lastDiffPath = filePath;
     const q = encodeURIComponent(filePath);
     const leftUri = vscode.Uri.parse(`getaibd-diff:/${filePath}?${q}`);
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -863,6 +901,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       rightUri,
       `${filePath} (agent edit)`,
     );
+    this.updateDiffContext();
+  }
+
+  /** Toggles the getaibd.diffOpen context key based on whether the active tab is our diff. */
+  updateDiffContext() {
+    const tab = vscode.window.tabGroups.activeTabGroup?.activeTab;
+    const input = tab?.input;
+    const isDiff =
+      input instanceof vscode.TabInputTextDiff && input.original?.scheme === "getaibd-diff";
+    void vscode.commands.executeCommand("setContext", "getaibd.diffOpen", isDiff);
   }
 
   /** Accepts all pending agent edits (no-op on disk; just clears the review state). */
