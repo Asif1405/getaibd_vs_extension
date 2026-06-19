@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.3]
+
+- Chat sessions and history are now stored per workspace, so each project/window keeps its own conversations instead of sharing one global history.
+
 ## [0.4.2]
 
 - `git_diff` now shows a real diff of the agent's edits even in folders that aren't git repositories; `git_status`/`git_log` degrade gracefully and `git_add`/`git_commit` give a clear "not a git repo" message.
