@@ -161,7 +161,7 @@ impl Tool for WriteFile {
     }
 
     fn requires_approval(&self) -> bool {
-        true
+        false
     }
 
     async fn execute(&self, input: Value) -> Result<Value, AppError> {
@@ -231,7 +231,7 @@ impl Tool for PatchFile {
     }
 
     fn requires_approval(&self) -> bool {
-        true
+        false
     }
 
     async fn execute(&self, input: Value) -> Result<Value, AppError> {

@@ -16,6 +16,7 @@ pub struct Orchestrator {
     memory_store: Option<Arc<MemoryStore>>,
     embedder: Option<Box<dyn EmbeddingProvider>>,
     auto_mode: bool,
+    approval_gate: Option<crate::tools::approval::ApprovalGate>,
 }
 
 impl Orchestrator {
@@ -26,7 +27,13 @@ impl Orchestrator {
             memory_store: None,
             embedder: None,
             auto_mode: true,
+            approval_gate: None,
         }
+    }
+
+    pub fn with_approval_gate(mut self, gate: crate::tools::approval::ApprovalGate) -> Self {
+        self.approval_gate = Some(gate);
+        self
     }
 
     pub fn with_memory(
@@ -140,7 +147,7 @@ impl Orchestrator {
 
         let memory_ctx = self.memory_context();
         let options = AgentOptions {
-            approval_gate: None,
+            approval_gate: self.approval_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: None,
@@ -179,7 +186,7 @@ impl Orchestrator {
 
         let memory_ctx = self.memory_context();
         let options = AgentOptions {
-            approval_gate: None,
+            approval_gate: self.approval_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: None,

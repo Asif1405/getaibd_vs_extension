@@ -65,6 +65,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private history: HistoryEntry[] = [];
   private currentStreamContent = "";
   private fileEdits = new Map<string, { path: string; originalOld: string; latestNew: string }>();
+  private pendingApprovals = new Map<string, string | undefined>();
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -285,6 +286,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         break;
       case "undoEdit":
         if (msg.path) {await this.undoEdit(msg.path as string);}
+        break;
+      case "approvalResponse":
+        if (msg.requestId) {await this.resolveApproval(msg.requestId as string, !!msg.approved);}
         break;
       case "clearHistory":
         this.history = [];
@@ -609,8 +613,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onToolResult: (name, result) => {
         this.post({ type: "agentToolResult", name, result });
       },
-      onApprovalRequired: (requestId, toolName, args) => {
-        this.handleApprovalRequest(requestId, toolName, args);
+      onApprovalRequired: (requestId, sessionId, toolName, args) => {
+        this.handleApprovalRequest(requestId, sessionId, toolName, args);
       },
       onText: (text) => {
         this.post({ type: "agentText", content: text });
@@ -677,8 +681,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onToolResult: (name, result) => {
         this.post({ type: "agentToolResult", name, result });
       },
-      onApprovalRequired: (requestId, toolName, args) => {
-        this.handleApprovalRequest(requestId, toolName, args);
+      onApprovalRequired: (requestId, sessionId, toolName, args) => {
+        this.handleApprovalRequest(requestId, sessionId, toolName, args);
       },
       onText: (text) => {
         this.post({ type: "agentText", content: text });
@@ -718,7 +722,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey, history: priorHistory });
+    }, { apiKey, history: priorHistory, requireApproval: true });
   }
 
   private handleFileEdit(edit: FileEdit) {
@@ -827,17 +831,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handleApprovalRequest(requestId: string, toolName: string, args: Record<string, unknown>) {
-    const argsPreview = JSON.stringify(args, null, 2).slice(0, 300);
-    const choice = await vscode.window.showWarningMessage(
-      `Agent wants to execute: ${toolName}\n\n${argsPreview}`,
-      { modal: true },
-      "Allow",
-      "Deny",
-    );
-    const approved = choice === "Allow";
-    this.post({ type: "approvalStatus", toolName, approved });
-    await sendApproval(requestId, approved);
+  private handleApprovalRequest(requestId: string, sessionId: string | undefined, toolName: string, args: Record<string, unknown>) {
+    this.pendingApprovals.set(requestId, sessionId);
+    this.post({ type: "approvalRequest", requestId, toolName, args });
+  }
+
+  /** Resolves an inline approval card click by notifying the engine gate. */
+  private async resolveApproval(requestId: string, approved: boolean) {
+    const sessionId = this.pendingApprovals.get(requestId);
+    this.pendingApprovals.delete(requestId);
+    await sendApproval(requestId, approved, sessionId);
   }
 
   private startTaskPolling(taskId: string) {
@@ -1427,10 +1430,41 @@ body {
 .fe-line.ctx { color: var(--muted); }
 .fe-line.gap { color: var(--muted); opacity: 0.6; text-align: center; }
 
+.tool-group { margin: 4px 0; }
+.tool-group > .tg-summary { cursor: pointer; list-style: none; font-size: 12px; color: var(--muted); padding: 3px 2px; user-select: none; }
+.tool-group > .tg-summary::-webkit-details-marker { display: none; }
+.tool-group > .tg-summary::before { content: "\\25B8"; display: inline-block; margin-right: 6px; transition: transform 0.15s; opacity: 0.7; }
+.tool-group[open] > .tg-summary::before { transform: rotate(90deg); }
+.tool-group > .tg-summary:hover { color: var(--fg); }
+.tg-body { padding: 2px 0 2px 14px; border-left: 1px solid var(--border); margin-left: 4px; }
 .tool-row { display: flex; align-items: center; gap: 6px; padding: 2px 2px; font-size: 12px; color: var(--muted); margin: 1px 0; }
 .tool-row .tool-verb { color: var(--fg); opacity: 0.85; }
 .tool-row .tool-arg { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; color: var(--muted); background: var(--code-bg); border-radius: 4px; padding: 1px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.tool-row .tool-state { display: inline-block; width: 12px; height: 12px; flex: 0 0 12px; position: relative; }
+.tool-row.pending .tool-state { border: 1.5px solid var(--border); border-top-color: var(--btn-bg); border-radius: 50%; animation: tg-spin 0.7s linear infinite; }
+.tool-row.done .tool-state::before { content: "\\2713"; color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); font-size: 11px; position: absolute; top: -2px; left: 0; }
+.tool-row.failed .tool-state::before { content: "\\2715"; color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); font-size: 11px; position: absolute; top: -2px; left: 0; }
+@keyframes tg-spin { to { transform: rotate(360deg); } }
 .tool-error { border-left-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+
+.approval-card { background: var(--code-bg); border: 1px solid var(--vscode-editorWarning-foreground, #cca700); border-radius: 6px; padding: 8px 10px; margin: 6px 0; font-size: 12px; }
+.approval-card .ap-head { display: flex; align-items: center; gap: 6px; }
+.approval-card .ap-icon { color: var(--vscode-editorWarning-foreground, #cca700); }
+.approval-card .ap-detail { margin: 6px 0; }
+.approval-card .ap-arg { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; background: var(--vscode-editor-background, var(--code-bg)); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; display: block; white-space: pre-wrap; word-break: break-all; }
+.approval-card .ap-actions { display: flex; gap: 6px; margin-top: 8px; }
+.approval-card button { font-size: 11px; padding: 3px 14px; border-radius: 4px; border: 1px solid var(--border); cursor: pointer; background: transparent; color: var(--fg); }
+.approval-card .ap-allow { background: var(--btn-bg); color: var(--btn-fg); border-color: var(--btn-bg); }
+.approval-card .ap-allow:hover { opacity: 0.9; }
+.approval-card .ap-deny:hover { border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+.approval-card .ap-result { color: var(--muted); font-style: italic; }
+.approval-card.ap-allowed { border-color: var(--border); opacity: 0.8; }
+.approval-card.ap-denied { border-color: var(--border); opacity: 0.6; }
+
+.md ul li.task-item { list-style: none; margin-left: -18px; display: flex; align-items: flex-start; gap: 6px; }
+.md li.task-item .task-box { flex: 0 0 14px; width: 14px; height: 14px; border: 1px solid var(--border); border-radius: 3px; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; line-height: 1; margin-top: 2px; color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+.md li.task-item.checked .task-box { background: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); color: #fff; border-color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+.md li.task-item.checked { opacity: 0.75; }
 
 .edit-summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 12px; margin: 6px 0; }
 .edit-summary .es-label { color: var(--fg); }
@@ -2117,6 +2151,10 @@ let settingsOpen = false;
 let editStats = {};
 let editCardEls = {};
 let editSummaryEl = null;
+let toolGroupEl = null;
+let toolGroupBodyEl = null;
+let toolGroupCount = 0;
+let pendingToolRows = [];
 
 let currentProvider = "";
 let currentModel = "";
@@ -2572,10 +2610,23 @@ function escapeHtml(text) {
 }
 
 function mdToHtml(text) {
+  let html;
   if (typeof window.renderMarkdown === "function") {
-    try { return window.renderMarkdown(text || ""); } catch (e) {}
+    try { html = window.renderMarkdown(text || ""); } catch (e) { html = escapeHtml(text || ""); }
+  } else {
+    html = escapeHtml(text || "");
   }
-  return escapeHtml(text || "");
+  return enhanceTaskLists(html);
+}
+
+function enhanceTaskLists(html) {
+  if (!html || html.indexOf("[") === -1) return html;
+  return html.replace(/<li[^>]*>(\s*<p>)?\s*\[([ xX])\]\s*/g, (m, p, c) => {
+    const checked = c.toLowerCase() === "x";
+    const cls = checked ? "task-item checked" : "task-item";
+    return '<li class="' + cls + '">' + (p || "")
+      + '<span class="task-box">' + (checked ? "\u2713" : "") + '</span>';
+  });
 }
 
 function scrollToBottom() {
@@ -2610,6 +2661,45 @@ function formatToolRow(name, args) {
       }
       return { verb: (name || "tool").replace(/_/g, " "), arg: path };
   }
+}
+
+function ensureToolGroup() {
+  if (!toolGroupEl) {
+    toolGroupEl = document.createElement("details");
+    toolGroupEl.className = "tool-group";
+    toolGroupEl.open = true;
+    const summary = document.createElement("summary");
+    summary.className = "tg-summary";
+    summary.textContent = "Working\u2026";
+    toolGroupBodyEl = document.createElement("div");
+    toolGroupBodyEl.className = "tg-body";
+    toolGroupEl.appendChild(summary);
+    toolGroupEl.appendChild(toolGroupBodyEl);
+    messagesEl.appendChild(toolGroupEl);
+    toolGroupCount = 0;
+  }
+  return toolGroupBodyEl;
+}
+
+function updateToolGroupSummary() {
+  if (!toolGroupEl) return;
+  const s = toolGroupEl.querySelector(".tg-summary");
+  if (s) s.textContent = "Worked on " + toolGroupCount + " step" + (toolGroupCount === 1 ? "" : "s");
+}
+
+function closeToolGroup() {
+  for (const row of pendingToolRows) {
+    row.classList.remove("pending");
+    row.classList.add("done");
+  }
+  pendingToolRows = [];
+  if (toolGroupEl) {
+    updateToolGroupSummary();
+    toolGroupEl.open = false;
+  }
+  toolGroupEl = null;
+  toolGroupBodyEl = null;
+  toolGroupCount = 0;
 }
 
 function diffBodyHtml(diff) {
@@ -3113,6 +3203,10 @@ window.addEventListener("message", (event) => {
       editStats = {};
       editCardEls = {};
       editSummaryEl = null;
+      toolGroupEl = null;
+      toolGroupBodyEl = null;
+      toolGroupCount = 0;
+      pendingToolRows = [];
       sendBtn.innerHTML = "&#9632;";
       sendBtn.classList.add("stop");
       spinnerEl.textContent = "Agent working...";
@@ -3123,37 +3217,48 @@ window.addEventListener("message", (event) => {
       agentTextEl = null;
       const info = formatToolRow(msg.name, msg.arguments);
       if (info.hidden) break;
+      const body = ensureToolGroup();
       const row = document.createElement("div");
-      row.className = "tool-row";
-      let html = '<span class="tool-verb">' + escapeHtml(info.verb) + '</span>';
+      row.className = "tool-row pending";
+      let html = '<span class="tool-state"></span>';
+      html += '<span class="tool-verb">' + escapeHtml(info.verb) + '</span>';
       if (info.arg) {
         html += ' <code class="tool-arg">' + escapeHtml(String(info.arg)) + '</code>';
       }
       row.innerHTML = html;
-      messagesEl.appendChild(row);
+      body.appendChild(row);
+      pendingToolRows.push(row);
+      toolGroupCount++;
+      updateToolGroupSummary();
       scrollToBottom();
       break;
     }
 
     case "agentToolResult": {
-      agentTextEl = null;
       let t = msg.result == null
         ? ""
         : (typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result));
-      if (!t || t === "undefined" || t === "null") break;
       const lower = t.slice(0, 80).toLowerCase();
-      const isError = lower.startsWith("error") || lower.indexOf('"error"') !== -1;
-      if (!isError) break;
-      const trDiv = document.createElement("div");
-      trDiv.className = "tool-result tool-error";
-      trDiv.textContent = t.length > 500 ? t.slice(0, 500) + "..." : t;
-      messagesEl.appendChild(trDiv);
+      const isError = !!t && (lower.startsWith("error") || lower.indexOf('"error"') !== -1);
+      const row = pendingToolRows.shift();
+      if (row) {
+        row.classList.remove("pending");
+        row.classList.add(isError ? "failed" : "done");
+      }
+      if (isError && t) {
+        const body = ensureToolGroup();
+        const trDiv = document.createElement("div");
+        trDiv.className = "tool-result tool-error";
+        trDiv.textContent = t.length > 500 ? t.slice(0, 500) + "..." : t;
+        body.appendChild(trDiv);
+      }
       scrollToBottom();
       break;
     }
 
     case "fileEdit": {
       agentTextEl = null;
+      closeToolGroup();
       const p = msg.path;
       let card = editCardEls[p];
       if (!card) {
@@ -3213,6 +3318,7 @@ window.addEventListener("message", (event) => {
     case "agentText": {
       if (!agentTextEl) {
         agentTextContent = "";
+        closeToolGroup();
       }
       agentTextContent += msg.content || "";
       const clean = stripThinkingTags(agentTextContent);
@@ -3257,6 +3363,7 @@ window.addEventListener("message", (event) => {
 
     case "agentDone":
       finalizeThought();
+      closeToolGroup();
       if (agentTextEl) {
         const clean = stripThinkingTags(agentTextContent);
         if (clean.trim()) appendActionBtns(agentTextEl, clean);
@@ -3274,6 +3381,7 @@ window.addEventListener("message", (event) => {
     case "agentComplete":
       streaming = false;
       finalizeThought();
+      closeToolGroup();
       if (agentTextEl) {
         const clean = stripThinkingTags(agentTextContent);
         if (clean.trim()) appendActionBtns(agentTextEl, clean);
@@ -3309,11 +3417,25 @@ window.addEventListener("message", (event) => {
       }
       break;
 
-    case "approvalStatus": {
-      const apDiv = document.createElement("div");
-      apDiv.className = "agent-status";
-      apDiv.textContent = msg.approved ? "Approved: " + msg.toolName : "Denied: " + msg.toolName;
-      messagesEl.appendChild(apDiv);
+    case "approvalRequest": {
+      agentTextEl = null;
+      const info = formatToolRow(msg.toolName, msg.args);
+      const detail = info.arg ? '<code class="ap-arg">' + escapeHtml(String(info.arg)) + '</code>' : '';
+      const card = document.createElement("div");
+      card.className = "approval-card";
+      card.innerHTML = '<div class="ap-head"><span class="ap-icon">\u26A0</span>'
+        + '<span class="ap-title">Allow <b>' + escapeHtml(info.verb || msg.toolName) + '</b>?</span></div>'
+        + (detail ? '<div class="ap-detail">' + detail + '</div>' : '')
+        + '<div class="ap-actions"><button class="ap-allow">Allow</button>'
+        + '<button class="ap-deny">Deny</button></div>';
+      messagesEl.appendChild(card);
+      const finish = (approved, label) => {
+        vscode.postMessage({ type: "approvalResponse", requestId: msg.requestId, approved });
+        card.classList.add(approved ? "ap-allowed" : "ap-denied");
+        card.querySelector(".ap-actions").innerHTML = '<span class="ap-result">' + label + '</span>';
+      };
+      card.querySelector(".ap-allow").addEventListener("click", () => finish(true, "Allowed"));
+      card.querySelector(".ap-deny").addEventListener("click", () => finish(false, "Denied"));
       scrollToBottom();
       break;
     }

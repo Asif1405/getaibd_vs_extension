@@ -75,6 +75,7 @@ pub async fn agent_handler(
     let registry = crate::tools::ToolRegistry::build_default(&project_root);
     let sid = session_id.clone();
 
+    let sid_for_task = session_id.clone();
     tokio::spawn(async move {
         run_agent_task(
             &state,
@@ -84,6 +85,7 @@ pub async fn agent_handler(
             max_iter,
             project_root,
             gate,
+            sid_for_task,
             tx,
         )
         .await;
@@ -103,6 +105,7 @@ async fn run_agent_task(
     max_iter: u32,
     project_root: std::path::PathBuf,
     gate: Option<ApprovalGate>,
+    session_id_for_events: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let mut session =
@@ -131,8 +134,9 @@ async fn run_agent_task(
         enable_thinking: true,
     };
 
+    let approval_session = session_id_for_events.clone();
     let mut event_handler = |event: crate::agent::runtime::AgentEvent| {
-        if let Some(evt) = agent_event_to_sse(&event) {
+        if let Some(evt) = agent_event_to_sse(&event, &approval_session) {
             let _ = tx.try_send(Ok(evt));
         }
     };
@@ -164,7 +168,10 @@ async fn run_agent_task(
     }
 }
 
-fn agent_event_to_sse(event: &crate::agent::runtime::AgentEvent) -> Option<Event> {
+fn agent_event_to_sse(
+    event: &crate::agent::runtime::AgentEvent,
+    session_id: &str,
+) -> Option<Event> {
     let data = event.content.as_deref().unwrap_or("");
     match event.kind {
         AgentEventKind::Start => Some(Event::default().event("start").data("Agent started")),
@@ -187,6 +194,26 @@ fn agent_event_to_sse(event: &crate::agent::runtime::AgentEvent) -> Option<Event
             Some(Event::default().event("context_compressed").data(data))
         }
         AgentEventKind::FileEdit => Some(Event::default().event("file_edit").data(data)),
+        AgentEventKind::ApprovalRequired => {
+            let payload = inject_session_id(data, session_id);
+            Some(Event::default().event("approval_required").data(payload))
+        }
+    }
+}
+
+/// Adds the session id to an approval payload so the client can target this gate.
+fn inject_session_id(raw: &str, session_id: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+            v.to_string()
+        }
+        Err(_) => raw.to_string(),
     }
 }
 

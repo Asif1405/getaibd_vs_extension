@@ -35,6 +35,8 @@ pub struct OrchestratedRequest {
     pub use_memory: bool,
     #[serde(default)]
     pub history: Vec<HistoryMessage>,
+    #[serde(default)]
+    pub require_approval: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,8 +59,21 @@ pub async fn orchestrated_agent_handler(
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let gate = if req.require_approval {
+        let g = crate::tools::approval::ApprovalGate::new();
+        state.set_approval_gate(&session_id, g.clone());
+        Some(g)
+    } else {
+        None
+    };
+    let sid = session_id.clone();
+
     tokio::spawn(async move {
-        let result = run_orchestrated_task(&state, req, provider, registry, tx.clone()).await;
+        let result =
+            run_orchestrated_task(&state, req, provider, registry, gate, sid.clone(), tx.clone())
+                .await;
+        state.clear_approval_gate(&sid);
 
         match result {
             Ok(resp) => {
@@ -79,11 +94,14 @@ pub async fn orchestrated_agent_handler(
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_orchestrated_task(
     state: &AppState,
     req: OrchestratedRequest,
     provider: Arc<dyn crate::providers::Provider>,
     registry: ToolRegistry,
+    gate: Option<crate::tools::approval::ApprovalGate>,
+    session_id: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) -> Result<OrchestratedResponse, AppError> {
     let mut session = Session::new(&req.provider, &req.model, state.project_root.clone());
@@ -98,6 +116,10 @@ async fn run_orchestrated_task(
     }
 
     let mut orchestrator = Orchestrator::new(provider, registry).with_auto_mode(req.auto_mode);
+
+    if let Some(g) = gate {
+        orchestrator = orchestrator.with_approval_gate(g);
+    }
 
     if req.use_memory {
         if let (Some(store), Some(embedder)) = (&state.memory_store, &state.embedder) {
@@ -123,9 +145,13 @@ async fn run_orchestrated_task(
             AgentEventKind::Replanning => "replanning",
             AgentEventKind::ContextCompressed => "context_compressed",
             AgentEventKind::FileEdit => "file_edit",
+            AgentEventKind::ApprovalRequired => "approval_required",
         };
 
-        let data = event.content.unwrap_or_default();
+        let data = match event.kind {
+            AgentEventKind::ApprovalRequired => inject_session_id(&event.content, &session_id),
+            _ => event.content.unwrap_or_default(),
+        };
 
         let _ = tx.try_send(Ok(Event::default().event(event_name).data(data)));
     };
@@ -139,4 +165,21 @@ async fn run_orchestrated_task(
         result: result.final_response,
         iterations: result.iterations,
     })
+}
+
+/// Adds the session id to an approval payload so the client can target this gate.
+fn inject_session_id(content: &Option<String>, session_id: &str) -> String {
+    let raw = content.clone().unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+            v.to_string()
+        }
+        Err(_) => raw,
+    }
 }
