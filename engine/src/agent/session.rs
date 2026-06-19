@@ -11,6 +11,7 @@ pub struct Session {
     pub messages: Vec<ToolMessage>,
     pub max_iterations: u32,
     pub system_prompt: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl Session {
@@ -27,12 +28,19 @@ impl Session {
             messages: Vec::new(),
             max_iterations: 25,
             system_prompt: None,
+            reasoning_effort: None,
         }
     }
 
     #[must_use]
     pub fn with_max_iterations(mut self, max: u32) -> Self {
         self.max_iterations = max;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 

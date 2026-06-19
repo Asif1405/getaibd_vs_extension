@@ -446,7 +446,13 @@ export function streamOrchestrated(
   input: string,
   mode: string,
   callbacks: OrchestratedCallbacks,
-  options?: { apiKey?: string; history?: ChatMessage[]; requireApproval?: boolean; clientTerminal?: boolean },
+  options?: {
+    apiKey?: string;
+    history?: ChatMessage[];
+    requireApproval?: boolean;
+    clientTerminal?: boolean;
+    reasoningEffort?: string;
+  },
 ): AbortController {
   const controller = new AbortController();
 
@@ -464,6 +470,7 @@ export function streamOrchestrated(
         client_terminal: options?.clientTerminal ?? false,
       };
       if (options?.apiKey) {body.api_key = options.apiKey;}
+      if (options?.reasoningEffort) {body.reasoning_effort = options.reasoningEffort;}
 
       const resp = await fetch(`${getServerUrl()}/agent/orchestrated`, {
         method: "POST",

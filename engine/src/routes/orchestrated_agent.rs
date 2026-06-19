@@ -40,6 +40,9 @@ pub struct OrchestratedRequest {
     /// When true, run_command is delegated to the client's managed terminal.
     #[serde(default)]
     pub client_terminal: bool,
+    /// Reasoning effort hint (low/medium/high) for thinking-capable models.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,7 +127,8 @@ async fn run_orchestrated_task(
     session_id: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) -> Result<OrchestratedResponse, AppError> {
-    let mut session = Session::new(&req.provider, &req.model, state.project_root.clone());
+    let mut session = Session::new(&req.provider, &req.model, state.project_root.clone())
+        .with_reasoning_effort(req.reasoning_effort.clone());
 
     for h in &req.history {
         let msg = match h.role.as_str() {
