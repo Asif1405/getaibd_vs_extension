@@ -29,7 +29,7 @@ pub struct AgentRequest {
 }
 
 fn default_max_iterations() -> u32 {
-    25
+    40
 }
 
 #[derive(Debug, Deserialize)]

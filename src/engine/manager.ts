@@ -102,6 +102,24 @@ async function isHealthy(url: string, timeoutMs: number): Promise<boolean> {
   return false;
 }
 
+/** Adds `.getaibd/` to the workspace .gitignore so generated artifacts stay untracked. */
+function ensureGetaibdIgnored(projectRoot: string): void {
+  try {
+    if (!fs.existsSync(path.join(projectRoot, ".git"))) {
+      return;
+    }
+    const gi = path.join(projectRoot, ".gitignore");
+    const current = fs.existsSync(gi) ? fs.readFileSync(gi, "utf8") : "";
+    if (/^\.getaibd\/?\s*$/m.test(current)) {
+      return;
+    }
+    const prefix = current && !current.endsWith("\n") ? "\n" : "";
+    fs.appendFileSync(gi, `${prefix}.getaibd/\n`);
+  } catch {
+    /* best effort */
+  }
+}
+
 /** Ensures a healthy engine is running and returns its URL. Idempotent. */
 export async function ensureEngine(context: vscode.ExtensionContext): Promise<string> {
   if (engineProcess && engineProcess.exitCode === null) {
@@ -158,6 +176,8 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
   if (model) {
     env.GETAIBD_DEFAULT_MODEL = model;
   }
+
+  ensureGetaibdIgnored(projectRoot);
 
   await freePort(port);
 

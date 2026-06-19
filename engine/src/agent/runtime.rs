@@ -207,6 +207,7 @@ async fn agent_loop(
 ) -> Result<AgentResult, AppError> {
     let tool_defs = registry.definitions();
     let mut iterations = 0;
+    let mut last_text = String::new();
     let use_streaming = provider.supports_streaming_tools();
     let enable_thinking = options.is_none_or(|o| o.enable_thinking);
 
@@ -216,9 +217,38 @@ async fn agent_loop(
 
     loop {
         if iterations >= session.max_iterations {
-            return Err(AppError::InvalidRequest(
-                "Max agent iterations reached".into(),
+            session.push_message(ToolMessage::system(
+                "You have reached the step limit. Stop calling tools now and reply with a concise \
+                 summary of what you accomplished, what remains, and any next steps."
+                    .to_string(),
             ));
+            let wrap = ToolChatRequest {
+                model: session.model.clone(),
+                messages: session.messages.clone(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+            };
+            let summary = match chat_with_tools_retry_cb(provider, &wrap, None).await {
+                Ok(r) => r.content.filter(|c| !c.trim().is_empty()),
+                Err(_) => None,
+            };
+            let final_text = summary.unwrap_or_else(|| {
+                if last_text.trim().is_empty() {
+                    "Reached the step limit before finishing the task.".to_string()
+                } else {
+                    last_text.clone()
+                }
+            });
+            return finish_agent(
+                session,
+                Some(final_text),
+                memory,
+                provider,
+                iterations,
+                on_event,
+            )
+            .await;
         }
 
         const COMPRESS_THRESHOLD: usize = 30;
@@ -257,6 +287,12 @@ async fn agent_loop(
             chat_with_tools_retry_cb(provider, &request, cb).await?
         };
         iterations += 1;
+
+        if let Some(text) = &response.content {
+            if !text.trim().is_empty() {
+                last_text = text.clone();
+            }
+        }
 
         if enable_thinking {
             if let Some(text) = &response.content {
@@ -673,7 +709,9 @@ async fn execute_tool_calls(
     for call in calls {
         on_event(AgentEvent {
             kind: AgentEventKind::ToolCall,
-            content: Some(format!("{}({})", call.name, call.arguments)),
+            content: Some(
+                serde_json::json!({ "name": call.name, "arguments": call.arguments }).to_string(),
+            ),
         });
 
         let result = match registry.get(&call.name) {
@@ -702,7 +740,9 @@ async fn execute_tool_calls(
 
         on_event(AgentEvent {
             kind: AgentEventKind::ToolResult,
-            content: Some(serde_json::to_string(&result).unwrap_or_default()),
+            content: Some(
+                serde_json::json!({ "name": call.name, "result": result }).to_string(),
+            ),
         });
 
         let result_str = serde_json::to_string(&result).unwrap_or_default();

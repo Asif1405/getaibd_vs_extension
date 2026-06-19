@@ -148,8 +148,12 @@ pub async fn put_config(
         });
     }
 
-    let config_path = state.project_root.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let config_dir = state.project_root.join(".getaibd");
+    let _ = std::fs::create_dir_all(&config_dir);
+    let config_path = config_dir.join("config.toml");
+    let existing = std::fs::read_to_string(&config_path)
+        .or_else(|_| std::fs::read_to_string(state.project_root.join("config.toml")))
+        .unwrap_or_default();
 
     let mut doc: toml_edit::DocumentMut = existing
         .parse()
