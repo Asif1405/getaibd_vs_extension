@@ -119,15 +119,20 @@ pub async fn run_agent_with_memory(
 }
 
 async fn inject_context(session: &mut Session, task: &str, memory: Option<&MemoryContext<'_>>) {
+    // Build the static prefix (system prompt + long-term memory) and prepend it so it sits
+    // BEFORE the conversation history. This keeps the most recent turns closest to the task,
+    // which makes them the most salient context for the model.
+    let mut prefix: Vec<ToolMessage> = Vec::new();
+
     if let Some(sys) = &session.system_prompt {
-        session.push_message(ToolMessage::system(sys.clone()));
+        prefix.push(ToolMessage::system(sys.clone()));
     }
 
     let persistent = PersistentMemory::new(&session.project_root);
     if persistent.exists() {
         let facts = persistent.as_context();
         if !facts.is_empty() {
-            session.push_message(ToolMessage::system(facts));
+            prefix.push(ToolMessage::system(facts));
         }
     }
 
@@ -183,7 +188,7 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
 
         match ctx_result {
             Ok(ctx) if !ctx.is_empty() => {
-                session.push_message(ToolMessage::system(ctx));
+                prefix.push(ToolMessage::system(ctx));
             }
             _ => {
                 if let Ok(memories) =
@@ -191,11 +196,17 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
                 {
                     let ctx = format_context(&memories);
                     if !ctx.is_empty() {
-                        session.push_message(ToolMessage::system(ctx));
+                        prefix.push(ToolMessage::system(ctx));
                     }
                 }
             }
         }
+    }
+
+    if !prefix.is_empty() {
+        let mut combined = prefix;
+        combined.append(&mut session.messages);
+        session.messages = combined;
     }
 }
 
