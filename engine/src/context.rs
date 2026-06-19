@@ -244,6 +244,12 @@ pub fn trim_to_context_tool_messages(
     }
     kept.reverse();
 
+    // Never start the kept window with an orphaned tool result whose preceding
+    // assistant tool_call message was trimmed away — that corrupts the request.
+    while kept.first().is_some_and(|m| m.role == "tool") {
+        kept.remove(0);
+    }
+
     let trimmed = non_system.len() != kept.len();
 
     let mut result: Vec<ToolMessage> = system_msgs.into_iter().cloned().collect();
