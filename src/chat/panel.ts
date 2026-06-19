@@ -672,7 +672,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendOrchestrated(provider: string, model: string, text: string, mode: string) {
     if (!(await this.checkSecrets(text))) {return;}
-    const priorHistory = this.conversationMessages();
+    const priorHistory = [...this.conversationMessages(), ...this.buildFileContext()];
     this.history.push({ kind: "message", role: "user", content: text });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: text });
@@ -2358,6 +2358,16 @@ function renderProviderTabs() {
   if (!providerTabsEl) return;
   providerTabsEl.innerHTML = "";
 
+  const providerIds = getAllProviderIds().filter((pid) => {
+    return (curatedModels[pid] || []).length > 0 || (allModels[pid] || []).length > 0;
+  });
+  if (providerIds.length <= 1) {
+    providerTabsEl.style.display = "none";
+    activeProviderTab = "all";
+    return;
+  }
+  providerTabsEl.style.display = "";
+
   const allTab = document.createElement("button");
   allTab.className = "provider-tab" + (activeProviderTab === "all" ? " active" : "");
   allTab.textContent = "All";
@@ -2823,21 +2833,11 @@ function renderSettings(data) {
     + '<button class="small-btn" data-act="saveServerUrl">Save</button></div>';
   html += '</div>';
 
-  html += '<div class="settings-section"><h3>Providers</h3>';
-  for (const p of data.providers) {
-    html += renderProviderCard(p);
-  }
-  html += '</div>';
-
   html += '<div class="settings-section"><h3>Preferences</h3>';
   html += '<div class="pref-row"><label>Auto-attach open file</label>'
     + '<input type="checkbox" ' + (data.fileContextEnabled ? 'checked' : '') + ' data-act="savePref" data-arg="fileContext.enabled" /></div>';
   html += '<div class="pref-row"><label>Inline completions</label>'
     + '<input type="checkbox" ' + (data.inlineCompletionsEnabled ? 'checked' : '') + ' data-act="savePref" data-arg="inlineCompletions.enabled" /></div>';
-  html += '<div class="pref-row"><label>Inline provider</label>'
-    + '<input type="text" value="' + escapeHtml(data.inlineProvider) + '" style="width:120px" data-act="savePref" data-arg="inlineCompletions.provider" /></div>';
-  html += '<div class="pref-row"><label>Inline model</label>'
-    + '<input type="text" value="' + escapeHtml(data.inlineModel) + '" style="width:120px" data-act="savePref" data-arg="inlineCompletions.model" /></div>';
   html += '</div>';
 
   if (data.serverConfig) {
@@ -2876,51 +2876,6 @@ function renderSettings(data) {
   }
 
   settingsPanel.innerHTML = html;
-}
-
-function renderProviderCard(p) {
-  const checkedAttr = p.enabled ? "checked" : "";
-  const enabledClass = p.enabled ? " enabled" : "";
-  let body = '';
-
-  if (p.needsApiKey) {
-    const keyDisplay = p.hasKey ? "********" : "";
-    body += '<div class="key-row">'
-      + '<input type="password" placeholder="API Key" value="' + keyDisplay + '" id="key_' + p.id + '" />'
-      + '<button class="small-btn" data-act="toggleKeyVis" data-arg="' + p.id + '">Show</button>'
-      + '<button class="small-btn primary" data-act="saveKey" data-arg="' + p.id + '">Save</button>'
-      + '<button class="small-btn" data-act="testProvider" data-arg="' + p.id + '">Test</button>'
-      + '<span class="test-status" id="test_' + p.id + '"></span>'
-      + '</div>';
-    if (p.keyEnvHint) {
-      body += '<div style="font-size:10px;color:var(--muted);margin-top:2px;">Or set env: ' + p.keyEnvHint + '</div>';
-    }
-  }
-
-  if (p.needsUrl) {
-    body += '<div class="setting-row" style="margin-top:4px;margin-bottom:0"><label style="min-width:60px">URL</label>'
-      + '<input type="url" value="' + escapeHtml(p.url || '') + '" id="url_' + p.id + '" '
-      + 'data-act="saveProviderField" data-arg="' + p.id + '" /></div>';
-  }
-
-  if (p.needsEndpointId) {
-    body += '<div class="setting-row" style="margin-bottom:0"><label style="min-width:60px">Endpoint</label>'
-      + '<input type="text" value="' + escapeHtml(p.endpointId || '') + '" id="eid_' + p.id + '" '
-      + 'data-act="saveProviderField" data-arg="' + p.id + '" /></div>';
-  }
-
-  body += '<div class="setting-row" style="margin-top:4px;margin-bottom:0"><label style="min-width:60px">Model</label>'
-    + '<input type="text" value="' + escapeHtml(p.defaultModel) + '" id="model_' + p.id + '" '
-    + 'data-act="saveProviderField" data-arg="' + p.id + '" /></div>';
-
-  return '<div class="provider-card' + enabledClass + '" id="card_' + p.id + '">'
-    + '<div class="provider-card-header">'
-    + '<input type="checkbox" ' + checkedAttr + ' data-act="toggleProvider" data-arg="' + p.id + '" />'
-    + '<span class="provider-name">' + escapeHtml(p.label) + '</span>'
-    + (p.hasKey ? '<span style="color:var(--success);font-size:11px;">Key saved</span>' : '')
-    + '</div>'
-    + '<div class="provider-card-body">' + body + '</div>'
-    + '</div>';
 }
 
 /* ── Settings Actions ── */

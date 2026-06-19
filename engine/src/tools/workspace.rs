@@ -396,6 +396,133 @@ impl Tool for SearchFiles {
     }
 }
 
+pub struct MoveFile {
+    root: Arc<PathBuf>,
+}
+
+impl MoveFile {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for MoveFile {
+    fn name(&self) -> &'static str {
+        "move_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Move or rename a file or directory. Use this to relocate files (e.g. move SUMMARY.md into docs/) instead of recreating them."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "Existing path relative to project root" },
+                "to": { "type": "string", "description": "Destination path relative to project root" }
+            },
+            "required": ["from", "to"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let from_rel = input["from"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("from is required".into()))?;
+        let to_rel = input["to"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("to is required".into()))?;
+
+        let from = resolve_path(&self.root, from_rel)?;
+        let to = resolve_path(&self.root, to_rel)?;
+
+        if !from.exists() {
+            return Err(AppError::InvalidRequest(format!("Source not found: {from_rel}")));
+        }
+        if let Some(parent) = to.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::InvalidRequest(format!("Cannot create dirs: {e}")))?;
+        }
+        tokio::fs::rename(&from, &to)
+            .await
+            .map_err(|e| AppError::InvalidRequest(format!("Cannot move {from_rel} to {to_rel}: {e}")))?;
+
+        Ok(json!({ "moved": from_rel, "to": to_rel }))
+    }
+}
+
+pub struct DeleteFile {
+    root: Arc<PathBuf>,
+}
+
+impl DeleteFile {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for DeleteFile {
+    fn name(&self) -> &'static str {
+        "delete_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delete a file. Set recursive=true to remove a directory and its contents."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path relative to project root" },
+                "recursive": { "type": "boolean", "description": "Remove a directory recursively" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let rel = input["path"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
+        let recursive = input["recursive"].as_bool().unwrap_or(false);
+        let path = resolve_path(&self.root, rel)?;
+
+        if !path.exists() {
+            return Err(AppError::InvalidRequest(format!("Not found: {rel}")));
+        }
+        if path.is_dir() {
+            if recursive {
+                tokio::fs::remove_dir_all(&path)
+                    .await
+                    .map_err(|e| AppError::InvalidRequest(format!("Cannot remove {rel}: {e}")))?;
+            } else {
+                tokio::fs::remove_dir(&path)
+                    .await
+                    .map_err(|e| AppError::InvalidRequest(format!("Cannot remove {rel} (use recursive for non-empty dirs): {e}")))?;
+            }
+        } else {
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|e| AppError::InvalidRequest(format!("Cannot delete {rel}: {e}")))?;
+        }
+
+        Ok(json!({ "deleted": rel }))
+    }
+}
+
 async fn search_recursive(
     base: &Path,
     dir: &Path,
