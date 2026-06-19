@@ -1248,16 +1248,16 @@ body {
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 12px 16px;
+  padding: 10px 14px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
 }
 
 .message {
-  padding: 10px 14px;
+  padding: 4px 2px;
   border-radius: 8px;
-  line-height: 1.55;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
   position: relative;
@@ -1267,25 +1267,20 @@ body {
 .message.user {
   background: var(--user-bg);
   align-self: flex-end;
-  max-width: 85%;
+  max-width: 88%;
+  padding: 7px 12px;
   border-bottom-right-radius: 2px;
+  margin-top: 6px;
 }
 
 .message.assistant {
-  align-self: flex-start;
-  max-width: 95%;
-  border-bottom-left-radius: 2px;
-  padding-right: 60px;
+  align-self: stretch;
+  max-width: 100%;
+  padding: 2px 56px 2px 2px;
 }
 
 .message .role-label {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--muted);
-  margin-bottom: 4px;
-  display: block;
+  display: none;
 }
 
 .md { white-space: normal; }
