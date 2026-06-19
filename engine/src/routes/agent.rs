@@ -186,6 +186,7 @@ fn agent_event_to_sse(event: &crate::agent::runtime::AgentEvent) -> Option<Event
         AgentEventKind::ContextCompressed => {
             Some(Event::default().event("context_compressed").data(data))
         }
+        AgentEventKind::FileEdit => Some(Event::default().event("file_edit").data(data)),
     }
 }
 

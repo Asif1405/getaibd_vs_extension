@@ -122,6 +122,7 @@ async fn run_orchestrated_task(
             AgentEventKind::Reflecting => "reflecting",
             AgentEventKind::Replanning => "replanning",
             AgentEventKind::ContextCompressed => "context_compressed",
+            AgentEventKind::FileEdit => "file_edit",
         };
 
         let data = event.content.unwrap_or_default();

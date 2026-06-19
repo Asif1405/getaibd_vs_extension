@@ -8,6 +8,7 @@ import {
   sendApproval,
   testProviderConnection,
   type ChatMessage,
+  type FileEdit,
 } from "../client";
 import { scanText, formatWarning } from "../safetype/detector";
 import { ensureEngine } from "../engine/manager";
@@ -63,6 +64,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private activeSessionId = "";
   private history: HistoryEntry[] = [];
   private currentStreamContent = "";
+  private fileEdits = new Map<string, { path: string; oldContent: string; newContent: string }>();
+  private fileEditSeq = 0;
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -75,6 +78,17 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   /** Registers the chat as a full-height sidebar webview view. */
   static register(context: vscode.ExtensionContext): vscode.Disposable {
     const provider = new ChatPanel(context);
+    const diffProvider: vscode.TextDocumentContentProvider = {
+      provideTextDocumentContent(uri) {
+        const edit = provider.fileEdits.get(uri.query);
+        if (!edit) {return "";}
+        return uri.scheme === "getaibd-diff-new" ? edit.newContent : edit.oldContent;
+      },
+    };
+    context.subscriptions.push(
+      vscode.workspace.registerTextDocumentContentProvider("getaibd-diff", diffProvider),
+      vscode.workspace.registerTextDocumentContentProvider("getaibd-diff-new", diffProvider),
+    );
     return vscode.window.registerWebviewViewProvider(ChatPanel.viewType, provider, {
       webviewOptions: { retainContextWhenHidden: true },
     });
@@ -257,6 +271,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           this.saveSelections(msg.provider as string, msg.model as string);
           await this.sendOrchestrated(msg.provider as string, msg.model as string, msg.text as string, msg.mode as string);
         }
+        break;
+      case "openDiff":
+        if (msg.id) {await this.openDiff(msg.id as string);}
         break;
       case "clearHistory":
         this.history = [];
@@ -602,6 +619,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onContextCompressed: (content) => {
         this.post({ type: "agentContextCompressed", content });
       },
+      onFileEdit: (edit) => {
+        this.handleFileEdit(edit);
+      },
       onDone: (content) => {
         const clean = stripThinking(content);
         if (clean) {
@@ -667,6 +687,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onContextCompressed: (content) => {
         this.post({ type: "agentContextCompressed", content });
       },
+      onFileEdit: (edit) => {
+        this.handleFileEdit(edit);
+      },
       onDone: (content) => {
         const clean = stripThinking(content);
         if (clean) {
@@ -685,6 +708,46 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.maybeHandlePaymentError(error);
       },
     }, { apiKey, history: priorHistory });
+  }
+
+  private handleFileEdit(edit: FileEdit) {
+    const id = `edit-${++this.fileEditSeq}-${Date.now()}`;
+    const oldContent = edit.old_content ?? "";
+    const newContent = edit.new_content ?? "";
+    this.fileEdits.set(id, { path: edit.path, oldContent, newContent });
+    const { additions, deletions } = diffStat(oldContent, newContent);
+    this.post({
+      type: "fileEdit",
+      id,
+      path: edit.path,
+      additions,
+      deletions,
+      tooLarge: !!edit.too_large,
+    });
+  }
+
+  /** Opens the agent's edit as a native VS Code diff (original vs current file). */
+  private async openDiff(id: string) {
+    const edit = this.fileEdits.get(id);
+    if (!edit) {return;}
+    const leftUri = vscode.Uri.parse(`getaibd-diff:/${edit.path}?${id}`);
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const fileUri = folder ? vscode.Uri.joinPath(folder.uri, edit.path) : undefined;
+    let rightUri = vscode.Uri.parse(`getaibd-diff-new:/${edit.path}?${id}`);
+    if (fileUri) {
+      try {
+        await vscode.workspace.fs.stat(fileUri);
+        rightUri = fileUri;
+      } catch {
+        /* file removed; fall back to the captured new content */
+      }
+    }
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      leftUri,
+      rightUri,
+      `${edit.path} (agent edit)`,
+    );
   }
 
   private async previewPatch(llmResponse: string): Promise<void> {
@@ -885,6 +948,22 @@ function extractTaskId(text: string | undefined): string | null {
   if (!text) {return null;}
   const match = text.match(/"task_id"\s*:\s*"([^"]+)"/);
   return match ? match[1] : null;
+}
+
+/** Approximate per-line additions/deletions for an edit badge. */
+function diffStat(oldText: string, newText: string): { additions: number; deletions: number } {
+  const tally = (s: string): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const line of s.split("\n")) {m.set(line, (m.get(line) ?? 0) + 1);}
+    return m;
+  };
+  const a = tally(oldText);
+  const b = tally(newText);
+  let additions = 0;
+  let deletions = 0;
+  for (const [line, c] of b) {additions += Math.max(0, c - (a.get(line) ?? 0));}
+  for (const [line, c] of a) {deletions += Math.max(0, c - (b.get(line) ?? 0));}
+  return { additions, deletions };
 }
 
 /** Removes inline reasoning tags so saved/displayed answers stay clean. */
@@ -1210,6 +1289,13 @@ body {
 .tool-call .tool-args { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; color: var(--muted); white-space: pre-wrap; max-height: 120px; overflow-y: auto; margin-top: 4px; }
 .tool-result { background: var(--code-bg); border-left: 3px solid var(--btn-bg); border-radius: 0 6px 6px 0; padding: 6px 12px; font-size: 11px; font-family: var(--vscode-editor-font-family, monospace); white-space: pre-wrap; max-height: 200px; overflow-y: auto; color: var(--muted); margin: 2px 0; }
 .agent-status { padding: 4px 14px; font-size: 11px; color: var(--muted); font-style: italic; }
+.file-edit { display: flex; align-items: center; gap: 8px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 12px; margin: 4px 0; cursor: pointer; }
+.file-edit:hover { border-color: var(--btn-bg); background: var(--vscode-list-hoverBackground, var(--code-bg)); }
+.file-edit .fe-icon { opacity: 0.8; }
+.file-edit .fe-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vscode-editor-font-family, monospace); }
+.file-edit .fe-stat { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
+.file-edit .fe-stat .add { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+.file-edit .fe-stat .del { color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
 
 /* ── Thinking Blocks ── */
 .thinking-block {
@@ -2799,6 +2885,22 @@ window.addEventListener("message", (event) => {
       trDiv.className = "tool-result";
       trDiv.textContent = t.length > 500 ? t.slice(0, 500) + "..." : t;
       messagesEl.appendChild(trDiv);
+      scrollToBottom();
+      break;
+    }
+
+    case "fileEdit": {
+      agentTextEl = null;
+      const box = document.createElement("div");
+      box.className = "file-edit";
+      const stat = msg.tooLarge
+        ? '<span class="fe-stat">large file</span>'
+        : '<span class="fe-stat"><span class="add">+' + msg.additions + '</span> <span class="del">-' + msg.deletions + '</span></span>';
+      box.innerHTML = '<span class="fe-icon">\u270E</span><span class="fe-path">'
+        + escapeHtml(msg.path) + '</span>' + stat;
+      box.title = "Open diff in editor";
+      box.addEventListener("click", () => vscode.postMessage({ type: "openDiff", id: msg.id }));
+      messagesEl.appendChild(box);
       scrollToBottom();
       break;
     }
