@@ -412,20 +412,25 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private async onReady() {
+    this.post({ type: "bootStatus", state: "loading", text: "Getting ready…" });
     try {
-      await ensureEngine(this.context);
-    } catch {
-      /* engine errors are surfaced when the user sends */
-    }
-    await this.loadProviders();
-    this.sendSessions();
-    this.restoreHistory();
-    this.restoreSelections();
-    await this.refreshAuthMode();
-    this.ready = true;
-    const queued = this.pending.splice(0);
-    for (const fn of queued) {
-      fn();
+      try {
+        await ensureEngine(this.context);
+      } catch {
+        /* engine errors are surfaced when the user sends */
+      }
+      await this.loadProviders();
+      this.sendSessions();
+      this.restoreHistory();
+      this.restoreSelections();
+      await this.refreshAuthMode();
+    } finally {
+      this.ready = true;
+      this.post({ type: "bootStatus", state: "ready" });
+      const queued = this.pending.splice(0);
+      for (const fn of queued) {
+        fn();
+      }
     }
   }
 
@@ -1685,6 +1690,14 @@ body {
 .spinner::before { content: ''; width: 14px; height: 14px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Boot overlay (shown until the engine + providers are ready) ── */
+.boot-overlay { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: var(--bg); }
+.boot-overlay.hidden { display: none; }
+.boot-spinner { width: 30px; height: 30px; border: 3px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+.boot-text { color: var(--muted); font-size: 13px; max-width: 80%; text-align: center; line-height: 1.5; }
+.boot-overlay.error .boot-spinner { display: none; }
+.boot-overlay.error .boot-text { color: var(--error-fg); }
+
 .reconnect-banner { display: none; padding: 6px 14px; background: var(--warn-bg); color: var(--fg); font-size: 12px; text-align: center; border-radius: 4px; margin: 0 12px; }
 .reconnect-banner.visible { display: block; }
 
@@ -2319,6 +2332,11 @@ body {
 </head>
 <body>
 
+<div class="boot-overlay" id="bootOverlay">
+  <div class="boot-spinner"></div>
+  <div class="boot-text" id="bootText">Getting ready&hellip;</div>
+</div>
+
 <div id="diag" style="display:none;background:#5a1d1d;color:#fff;padding:6px 10px;font-size:11px;white-space:pre-wrap;line-height:1.4"></div>
 <div class="header">
   <button class="icon-btn" id="newChatBtn" title="New chat">&#x2795;</button>
@@ -2389,6 +2407,8 @@ window.addEventListener("error", function (ev) {
 });
 const vscode = acquireVsCodeApi();
 const messagesEl = document.getElementById("messages");
+const bootOverlay = document.getElementById("bootOverlay");
+const bootText = document.getElementById("bootText");
 const spinnerEl = document.getElementById("spinner");
 const reconnectBanner = document.getElementById("reconnectBanner");
 const inputEl = document.getElementById("input");
@@ -3358,6 +3378,18 @@ function saveServerCfg(section) {
 window.addEventListener("message", (event) => {
   const msg = event.data;
   switch (msg.type) {
+    case "bootStatus":
+      if (bootOverlay) {
+        if (msg.state === "ready") {
+          bootOverlay.classList.add("hidden");
+        } else {
+          bootOverlay.classList.remove("hidden");
+          bootOverlay.classList.toggle("error", msg.state === "error");
+          if (bootText && msg.text) { bootText.textContent = msg.text; }
+        }
+      }
+      break;
+
     case "curatedCatalog":
       curatedModels = msg.curatedModels || {};
       providerMeta = msg.providerMeta || {};
