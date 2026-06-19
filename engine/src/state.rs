@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 use crate::agent::task_queue::TaskQueue;
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -126,35 +126,35 @@ impl AppState {
     /// Register an approval gate for a specific agent session.
     pub fn set_approval_gate(&self, session_id: &str, gate: ApprovalGate) {
         self.approval_gates
-            .blocking_lock()
+            .lock().expect("state mutex poisoned")
             .insert(session_id.to_string(), gate);
     }
 
     /// Retrieve the approval gate for a session (clones it so callers hold their own handle).
     pub fn get_approval_gate(&self, session_id: &str) -> Option<ApprovalGate> {
-        self.approval_gates.blocking_lock().get(session_id).cloned()
+        self.approval_gates.lock().expect("state mutex poisoned").get(session_id).cloned()
     }
 
     /// Remove the approval gate after a session finishes.
     pub fn clear_approval_gate(&self, session_id: &str) {
-        self.approval_gates.blocking_lock().remove(session_id);
+        self.approval_gates.lock().expect("state mutex poisoned").remove(session_id);
     }
 
     /// Find any active gate — used as fallback when session_id is unknown.
     pub fn any_approval_gate(&self) -> Option<ApprovalGate> {
-        self.approval_gates.blocking_lock().values().next().cloned()
+        self.approval_gates.lock().expect("state mutex poisoned").values().next().cloned()
     }
 
     /// Store a patch snapshot for later rollback.
     pub fn store_snapshot(&self, patch_id: &str, snapshot: Snapshot) {
         self.patch_snapshots
-            .blocking_lock()
+            .lock().expect("state mutex poisoned")
             .insert(patch_id.to_string(), snapshot);
     }
 
     /// Take (consume) a snapshot, removing it from the store.
     pub fn take_snapshot(&self, patch_id: &str) -> Option<Snapshot> {
-        self.patch_snapshots.blocking_lock().remove(patch_id)
+        self.patch_snapshots.lock().expect("state mutex poisoned").remove(patch_id)
     }
 
     fn build_embedder(config: &AppConfig) -> Option<Arc<dyn EmbeddingProvider>> {
