@@ -129,6 +129,16 @@ impl ToolMessage {
         }
     }
 
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
         Self {
             role: "assistant".into(),
