@@ -342,13 +342,27 @@ function processAgentEvent(
   try {
     switch (event) {
       case "tool_call": {
-        const parsed = JSON.parse(data);
-        callbacks.onToolCall(parsed.name, parsed.arguments ?? {});
+        let parsed: { name?: string; arguments?: Record<string, unknown> };
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          parsed = { name: data || "tool", arguments: {} };
+        }
+        callbacks.onToolCall(parsed.name ?? "tool", parsed.arguments ?? {});
         break;
       }
       case "tool_result": {
-        const parsed = JSON.parse(data);
-        callbacks.onToolResult(parsed.name, parsed.result);
+        let parsed: { name?: string; result?: unknown };
+        try {
+          const obj = JSON.parse(data);
+          parsed =
+            obj && typeof obj === "object" && ("result" in obj || "name" in obj)
+              ? obj
+              : { result: obj };
+        } catch {
+          parsed = { result: data };
+        }
+        callbacks.onToolResult(parsed.name ?? "", parsed.result);
         break;
       }
       case "approval_required": {

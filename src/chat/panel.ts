@@ -603,8 +603,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.post({ type: "agentContextCompressed", content });
       },
       onDone: (content) => {
-        if (content) {
-          this.history.push({ kind: "message", role: "assistant", content });
+        const clean = stripThinking(content);
+        if (clean) {
+          this.history.push({ kind: "message", role: "assistant", content: clean });
           this.saveHistory();
         }
         this.post({ type: "agentDone", content });
@@ -666,8 +667,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.post({ type: "agentContextCompressed", content });
       },
       onDone: (content) => {
-        if (content) {
-          this.history.push({ kind: "message", role: "assistant", content });
+        const clean = stripThinking(content);
+        if (clean) {
+          this.history.push({ kind: "message", role: "assistant", content: clean });
           this.saveHistory();
         }
         this.post({ type: "agentDone", content });
@@ -871,6 +873,17 @@ function extractTaskId(text: string | undefined): string | null {
   if (!text) {return null;}
   const match = text.match(/"task_id"\s*:\s*"([^"]+)"/);
   return match ? match[1] : null;
+}
+
+/** Removes inline reasoning tags so saved/displayed answers stay clean. */
+function stripThinking(text: string): string {
+  if (!text) {return "";}
+  return text
+    .replace(/<plan>[\s\S]*?<\/plan>/gi, "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/<reflection>[\s\S]*?<\/reflection>/gi, "")
+    .replace(/<\/?(plan|thinking|reflection)>/gi, "")
+    .trim();
 }
 
 /* ───────────────────────────── WEBVIEW HTML ───────────────────────────── */
@@ -1852,6 +1865,9 @@ let streamEl = null;
 let streamContent = "";
 let agentTextEl = null;
 let agentTextContent = "";
+let thoughtEl = null;
+let thoughtBodyEl = null;
+let thoughtStart = 0;
 let currentMode = "agent";
 let settingsOpen = false;
 
@@ -2312,17 +2328,52 @@ function scrollToBottom() {
 }
 
 function appendThinkingBlock(cssClass, label, content) {
-  const details = document.createElement("details");
-  details.className = "thinking-block " + cssClass;
-  const summary = document.createElement("summary");
-  summary.textContent = label;
-  const contentDiv = document.createElement("div");
-  contentDiv.className = "thinking-content";
-  contentDiv.textContent = content || "";
-  details.appendChild(summary);
-  details.appendChild(contentDiv);
-  messagesEl.appendChild(details);
+  const text = (content || "").trim();
+  if (!text) return;
+  if (!thoughtEl) {
+    thoughtStart = Date.now();
+    thoughtEl = document.createElement("details");
+    thoughtEl.className = "thinking-block thinking";
+    const summary = document.createElement("summary");
+    summary.textContent = "Thinking\u2026";
+    thoughtBodyEl = document.createElement("div");
+    thoughtBodyEl.className = "thinking-content";
+    thoughtEl.appendChild(summary);
+    thoughtEl.appendChild(thoughtBodyEl);
+    messagesEl.appendChild(thoughtEl);
+  }
+  const line = document.createElement("div");
+  line.className = "thought-line";
+  line.textContent = label === "Thinking" ? text : label + ": " + text;
+  thoughtBodyEl.appendChild(line);
+  updateThoughtSummary();
   scrollToBottom();
+}
+
+function updateThoughtSummary() {
+  if (!thoughtEl) return;
+  const secs = Math.max(1, Math.round((Date.now() - thoughtStart) / 1000));
+  const summary = thoughtEl.querySelector("summary");
+  if (summary) summary.textContent = "Thought for " + secs + "s";
+}
+
+function finalizeThought() {
+  updateThoughtSummary();
+  thoughtEl = null;
+  thoughtBodyEl = null;
+  thoughtStart = 0;
+}
+
+function stripThinkingTags(text) {
+  if (!text) return "";
+  let out = text
+    .replace(/<plan>[\s\S]*?<\/plan>/gi, "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/<reflection>[\s\S]*?<\/reflection>/gi, "");
+  out = out.replace(/<\/?(plan|thinking|reflection)>/gi, "");
+  const open = out.search(/<(plan|thinking|reflection)>[^]*$/i);
+  if (open !== -1) out = out.slice(0, open);
+  return out;
 }
 
 /* ── Settings Renderer ── */
@@ -2706,6 +2757,9 @@ window.addEventListener("message", (event) => {
       streaming = true;
       agentTextEl = null;
       agentTextContent = "";
+      thoughtEl = null;
+      thoughtBodyEl = null;
+      thoughtStart = 0;
       sendBtn.innerHTML = "&#9632;";
       sendBtn.classList.add("stop");
       spinnerEl.textContent = "Agent working...";
@@ -2725,10 +2779,12 @@ window.addEventListener("message", (event) => {
 
     case "agentToolResult": {
       agentTextEl = null;
+      let t = msg.result == null
+        ? ""
+        : (typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result, null, 2));
+      if (!t || t === "undefined" || t === "null") break;
       const trDiv = document.createElement("div");
       trDiv.className = "tool-result";
-      let t = typeof msg.result === "string" ? msg.result : JSON.stringify(msg.result, null, 2);
-      if (t == null) t = String(msg.result);
       trDiv.textContent = t.length > 500 ? t.slice(0, 500) + "..." : t;
       messagesEl.appendChild(trDiv);
       scrollToBottom();
@@ -2738,10 +2794,14 @@ window.addEventListener("message", (event) => {
     case "agentText": {
       if (!agentTextEl) {
         agentTextContent = "";
-        agentTextEl = addMessage("assistant", "");
       }
       agentTextContent += msg.content || "";
-      agentTextEl.innerHTML = '<span class="role-label">assistant</span><div class="md">' + mdToHtml(agentTextContent) + "</div>";
+      const clean = stripThinkingTags(agentTextContent);
+      if (!clean.trim()) break;
+      if (!agentTextEl) {
+        agentTextEl = addMessage("assistant", "");
+      }
+      agentTextEl.innerHTML = '<span class="role-label">assistant</span><div class="md">' + mdToHtml(clean) + "</div>";
       scrollToBottom();
       break;
     }
@@ -2777,11 +2837,16 @@ window.addEventListener("message", (event) => {
     }
 
     case "agentDone":
+      finalizeThought();
       if (agentTextEl) {
-        if (agentTextContent) appendActionBtns(agentTextEl, agentTextContent);
+        const clean = stripThinkingTags(agentTextContent);
+        if (clean.trim()) appendActionBtns(agentTextEl, clean);
       } else if (msg.content) {
-        const el = addMessage("assistant", msg.content);
-        appendActionBtns(el, msg.content);
+        const clean = stripThinkingTags(msg.content);
+        if (clean.trim()) {
+          const el = addMessage("assistant", clean);
+          appendActionBtns(el, clean);
+        }
       }
       agentTextEl = null;
       agentTextContent = "";
@@ -2789,7 +2854,11 @@ window.addEventListener("message", (event) => {
 
     case "agentComplete":
       streaming = false;
-      if (agentTextEl && agentTextContent) appendActionBtns(agentTextEl, agentTextContent);
+      finalizeThought();
+      if (agentTextEl) {
+        const clean = stripThinkingTags(agentTextContent);
+        if (clean.trim()) appendActionBtns(agentTextEl, clean);
+      }
       agentTextEl = null;
       agentTextContent = "";
       sendBtn.innerHTML = "&#9654;";
@@ -2806,6 +2875,7 @@ window.addEventListener("message", (event) => {
 
     case "agentError":
       streaming = false;
+      finalizeThought();
       agentTextEl = null;
       agentTextContent = "";
       sendBtn.innerHTML = "&#9654;";

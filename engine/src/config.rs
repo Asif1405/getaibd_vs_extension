@@ -94,7 +94,7 @@ fn default_project_root() -> String {
     ".".to_string()
 }
 fn default_max_iterations() -> u32 {
-    25
+    40
 }
 fn default_command_allowlist() -> Vec<String> {
     crate::tools::command::default_allowlist()

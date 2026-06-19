@@ -62,7 +62,7 @@ pub struct EnvRecord {
 
 // ── persistent store ─────────────────────────────────────────────────
 
-const ENVS_FILE: &str = ".mcp-envs.json";
+const ENVS_FILE: &str = "envs.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct EnvStore {
@@ -72,7 +72,9 @@ struct EnvStore {
 
 impl EnvStore {
     fn path_for(root: &Path) -> PathBuf {
-        root.join(ENVS_FILE)
+        let dir = root.join(".getaibd");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(ENVS_FILE)
     }
 
     fn load(root: &Path) -> Self {
