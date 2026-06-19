@@ -1,3 +1,4 @@
+use mcp_universal::tools::edits::EditTracker;
 use mcp_universal::tools::workspace::{ListDirectory, PatchFile, ReadFile, SearchFiles, WriteFile};
 use mcp_universal::tools::Tool;
 use serde_json::json;
@@ -59,7 +60,7 @@ async fn write_file_happy_path() {
     let tmp = TempDir::new().unwrap();
     let root = Arc::new(tmp.path().to_path_buf());
 
-    let tool = WriteFile::new(root);
+    let tool = WriteFile::new(root, EditTracker::new());
     let result = tool
         .execute(json!({ "path": "out.txt", "content": "written content" }))
         .await
@@ -79,7 +80,7 @@ async fn write_file_with_create_dirs() {
     let tmp = TempDir::new().unwrap();
     let root = Arc::new(tmp.path().to_path_buf());
 
-    let tool = WriteFile::new(root);
+    let tool = WriteFile::new(root, EditTracker::new());
     let result = tool
         .execute(json!({
             "path": "a/b/c/nested.txt",
@@ -102,7 +103,7 @@ async fn write_file_path_escaping_rejected() {
     let tmp = TempDir::new().unwrap();
     let root = Arc::new(tmp.path().to_path_buf());
 
-    let tool = WriteFile::new(root);
+    let tool = WriteFile::new(root, EditTracker::new());
     let result = tool
         .execute(json!({
             "path": "../../../etc/pwned",
@@ -125,7 +126,7 @@ async fn patch_file_happy_path() {
     let path = tmp.path().join("patch.txt");
     tokio::fs::write(&path, "foo bar baz").await.unwrap();
 
-    let tool = PatchFile::new(root);
+    let tool = PatchFile::new(root, EditTracker::new());
     let result = tool
         .execute(json!({
             "path": "patch.txt",
@@ -148,7 +149,7 @@ async fn patch_file_old_text_not_found_errors() {
     let path = tmp.path().join("patch.txt");
     tokio::fs::write(&path, "foo bar baz").await.unwrap();
 
-    let tool = PatchFile::new(root);
+    let tool = PatchFile::new(root, EditTracker::new());
     let result = tool
         .execute(json!({
             "path": "patch.txt",
@@ -169,7 +170,7 @@ async fn patch_file_path_escaping_rejected() {
     let tmp = TempDir::new().unwrap();
     let root = Arc::new(tmp.path().to_path_buf());
 
-    let tool = PatchFile::new(root);
+    let tool = PatchFile::new(root, EditTracker::new());
     let result = tool
         .execute(json!({
             "path": "../../../etc/passwd",
