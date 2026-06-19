@@ -110,6 +110,13 @@ impl<'a> ContextBuilder<'a> {
         let mut file_contexts = self.extract_file_contexts(&relevant_memories, current_files);
         let symbol_contexts = self.extract_symbol_contexts(&relevant_memories);
 
+        window.codebase_facts = relevant_memories
+            .iter()
+            .filter(|m| self.extract_file_path(&m.source).is_none())
+            .take(8)
+            .map(|m| m.content.clone())
+            .collect();
+
         self.boost_with_project_graph(&mut file_contexts, current_files);
         self.boost_with_recent_changes(&mut file_contexts);
 

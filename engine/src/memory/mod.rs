@@ -94,6 +94,7 @@ impl MemorySource {
 }
 
 pub struct RetrievedMemory {
+    pub id: String,
     pub content: String,
     pub score: f32,
     pub source: MemorySource,
@@ -106,7 +107,10 @@ pub async fn retrieve_context(
     top_k: usize,
 ) -> Result<Vec<RetrievedMemory>, AppError> {
     let query_emb = embedder.embed(query).await?;
-    store.hybrid_search(&query_emb, query, top_k)
+    let results = store.hybrid_search(&query_emb, query, top_k)?;
+    let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
+    let _ = store.touch_many(&ids);
+    Ok(results)
 }
 
 pub fn format_context(memories: &[RetrievedMemory]) -> String {

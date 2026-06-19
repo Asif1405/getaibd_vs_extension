@@ -175,7 +175,7 @@ export function streamChat(
         buffer = lines.pop() ?? "";
 
         for (const raw of lines) {
-          const line = raw.trim();
+          const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
 
           if (line === "") {
             if (currentData) {
@@ -190,7 +190,7 @@ export function streamChat(
           if (line.startsWith("event:")) {
             currentEvent = line.slice(6).trim();
           } else if (line.startsWith("data:")) {
-            const chunk = line.slice(5).trim();
+            const chunk = line.charAt(5) === " " ? line.slice(6) : line.slice(5);
             currentData = currentData ? `${currentData}\n${chunk}` : chunk;
           }
         }
@@ -302,7 +302,7 @@ export function streamAgent(
         buffer = lines.pop() ?? "";
 
         for (const raw of lines) {
-          const line = raw.trim();
+          const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
 
           if (line === "") {
             if (currentData) {
@@ -316,7 +316,7 @@ export function streamAgent(
           if (line.startsWith("event:")) {
             currentEvent = line.slice(6).trim();
           } else if (line.startsWith("data:")) {
-            const chunk = line.slice(5).trim();
+            const chunk = line.charAt(5) === " " ? line.slice(6) : line.slice(5);
             currentData = currentData ? `${currentData}\n${chunk}` : chunk;
           }
         }
@@ -448,7 +448,7 @@ export function streamOrchestrated(
         buffer = lines.pop() ?? "";
 
         for (const raw of lines) {
-          const line = raw.trim();
+          const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
 
           if (line === "") {
             if (currentData) {
@@ -462,7 +462,7 @@ export function streamOrchestrated(
           if (line.startsWith("event:")) {
             currentEvent = line.slice(6).trim();
           } else if (line.startsWith("data:")) {
-            const chunk = line.slice(5).trim();
+            const chunk = line.charAt(5) === " " ? line.slice(6) : line.slice(5);
             currentData = currentData ? `${currentData}\n${chunk}` : chunk;
           }
         }

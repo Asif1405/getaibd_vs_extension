@@ -11,7 +11,10 @@ use crate::memory::persistent::PersistentMemory;
 use crate::memory::store::MemoryStore;
 use crate::memory::{format_context, retrieve_context};
 use crate::context::{trim_to_context_tool_messages, ContextConfig};
-use crate::models::{ToolCall, ToolChatRequest, ToolChatResponse, ToolMessage, ToolStreamDelta};
+use crate::models::{
+    ChatRequest, Message, ToolCall, ToolChatRequest, ToolChatResponse, ToolMessage,
+    ToolStreamDelta,
+};
 use crate::providers::Provider;
 use crate::retry::chat_with_tools_retry_cb;
 use crate::tools::approval::ApprovalGate;
@@ -220,10 +223,10 @@ async fn agent_loop(
 
         const COMPRESS_THRESHOLD: usize = 30;
         if session.messages.len() > COMPRESS_THRESHOLD {
-            session.compress_messages();
+            summarize_old_messages(session, provider).await;
             on_event(AgentEvent {
                 kind: AgentEventKind::ContextCompressed,
-                content: Some("Conversation memory compressed".into()),
+                content: Some("Conversation summarized to keep context focused".into()),
             });
         }
 
@@ -262,7 +265,8 @@ async fn agent_loop(
         }
 
         if response.tool_calls.is_empty() {
-            return finish_agent(session, response.content, memory, iterations, on_event).await;
+            return finish_agent(session, response.content, memory, provider, iterations, on_event)
+                .await;
         }
 
         if !use_streaming {
@@ -389,10 +393,83 @@ async fn collect_streaming_response(
     })
 }
 
+/// Replaces the older half of the conversation with a faithful LLM-generated
+/// summary, falling back to truncation if the model call fails.
+async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provider>) {
+    if session.messages.len() <= 4 {
+        return;
+    }
+    let keep_count = session.messages.len() / 2;
+    let to_summarize = session.messages.len() - keep_count;
+    let old: Vec<ToolMessage> = session.messages.drain(..to_summarize).collect();
+
+    let transcript = old
+        .iter()
+        .filter_map(|m| {
+            let c = m.content.as_deref().unwrap_or("");
+            if c.is_empty() {
+                None
+            } else {
+                Some(format!("[{}] {}", m.role, c))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if transcript.trim().is_empty() {
+        return;
+    }
+
+    let req = ChatRequest {
+        provider: session.provider_id.clone(),
+        model: session.model.clone(),
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: "You compress a coding agent's conversation. Produce a concise but \
+                          lossless summary that preserves: the user's goal, decisions made, \
+                          files created or modified, important facts learned about the codebase, \
+                          the current task state, and any unresolved TODOs. Use short bullet points."
+                    .to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: transcript,
+            },
+        ],
+        temperature: Some(0.2),
+        max_tokens: Some(800),
+        api_key: None,
+    };
+
+    let summary = match provider.chat(&req).await {
+        Ok(resp) if !resp.content.trim().is_empty() => resp.content,
+        _ => old
+            .iter()
+            .filter_map(|m| {
+                let c = m.content.as_deref().unwrap_or("");
+                if c.is_empty() {
+                    None
+                } else {
+                    let cut = c.char_indices().nth(200).map_or(c.len(), |(i, _)| i);
+                    Some(format!("[{}] {}", m.role, &c[..cut]))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+
+    session.messages.insert(
+        0,
+        ToolMessage::system(format!("Previous conversation summary:\n{summary}")),
+    );
+}
+
 async fn finish_agent(
     session: &Session,
     content: Option<String>,
     memory: Option<&MemoryContext<'_>>,
+    provider: &Arc<dyn Provider>,
     iterations: u32,
     on_event: &mut impl FnMut(AgentEvent),
 ) -> Result<AgentResult, AppError> {
@@ -403,8 +480,42 @@ async fn finish_agent(
     });
 
     if let Some(mem) = memory {
+        let reflection = reflect(session, provider).await;
         let indexer = MemoryIndexer::new(mem.store, mem.embedder);
-        let _ = indexer.index_session(&session.id, &session.messages).await;
+        let _ = indexer.index_episode(&session.id, &reflection.episode).await;
+
+        for f in &reflection.facts {
+            let fact = f.fact.trim();
+            if fact.is_empty() {
+                continue;
+            }
+            let category = if f.category.trim().is_empty() {
+                "General"
+            } else {
+                f.category.trim()
+            };
+            let content = format!("Fact [{category}]: {fact}");
+            let id = format!("fact-{}", stable_hash(&content));
+            let _ = indexer.index_persistent_fact(&id, &content).await;
+        }
+
+        if let Some(pb) = &reflection.playbook {
+            let title = pb.title.trim();
+            if !title.is_empty() && !pb.steps.is_empty() {
+                let steps = pb
+                    .steps
+                    .iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .enumerate()
+                    .map(|(i, s)| format!("{}. {}", i + 1, s.trim()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let content = format!("Playbook: {title}\n{steps}");
+                let id = format!("playbook-{}", stable_hash(title));
+                let _ = indexer.index_persistent_fact(&id, &content).await;
+            }
+        }
+
         let _ = mem.store.prune_oldest(mem.max_entries);
     }
 
@@ -413,6 +524,141 @@ async fn finish_agent(
         iterations,
         mode: None,
     })
+}
+
+#[derive(Default)]
+struct Reflection {
+    episode: String,
+    facts: Vec<ReflectFact>,
+    playbook: Option<ReflectPlaybook>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReflectFact {
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    fact: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ReflectPlaybook {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    steps: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReflectionJson {
+    #[serde(default)]
+    episode: String,
+    #[serde(default)]
+    facts: Vec<ReflectFact>,
+    #[serde(default)]
+    playbook: Option<ReflectPlaybook>,
+}
+
+fn build_transcript(session: &Session) -> String {
+    let mut transcript = String::new();
+    for m in &session.messages {
+        if let Some(c) = m.content.as_deref() {
+            if !c.is_empty() {
+                let cut = c.char_indices().nth(600).map_or(c.len(), |(i, _)| i);
+                transcript.push_str(&format!("[{}] {}\n", m.role, &c[..cut]));
+            }
+        }
+        if let Some(calls) = &m.tool_calls {
+            for call in calls {
+                transcript.push_str(&format!("[{} -> {}]\n", m.role, call.name));
+            }
+        }
+    }
+    transcript.trim().to_string()
+}
+
+fn stable_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+fn parse_reflection(raw: &str) -> Option<ReflectionJson> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&raw[start..=end]).ok()
+}
+
+/// Single end-of-task reflection: distills an episode and extracts durable facts
+/// and an optional reusable playbook, all stored in the vector memory.
+async fn reflect(session: &Session, provider: &Arc<dyn Provider>) -> Reflection {
+    let transcript = build_transcript(session);
+    if transcript.is_empty() {
+        return Reflection::default();
+    }
+
+    let req = ChatRequest {
+        provider: session.provider_id.clone(),
+        model: session.model.clone(),
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: "You are the reflection step of a coding agent. Read the completed task \
+                          transcript and return ONLY a JSON object (no prose, no code fences) with \
+                          keys: \"episode\" (string: a compact recap of the goal, files changed, \
+                          tools used, outcome, and gotchas); \"facts\" (array of {\"category\", \
+                          \"fact\"} for durable, reusable knowledge about this project or the \
+                          user's preferences, e.g. build/test commands, conventions, key paths; \
+                          empty if none); \"playbook\" (object {\"title\", \"steps\"[]} ONLY if a \
+                          reusable multi-step procedure was discovered that would speed up a \
+                          similar future task, otherwise null)."
+                    .to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: transcript.clone(),
+            },
+        ],
+        temperature: Some(0.2),
+        max_tokens: Some(800),
+        api_key: None,
+    };
+
+    match provider.chat(&req).await {
+        Ok(resp) if !resp.content.trim().is_empty() => {
+            if let Some(parsed) = parse_reflection(&resp.content) {
+                let episode = if parsed.episode.trim().is_empty() {
+                    resp.content.clone()
+                } else {
+                    parsed.episode
+                };
+                Reflection {
+                    episode,
+                    facts: parsed.facts,
+                    playbook: parsed.playbook,
+                }
+            } else {
+                Reflection {
+                    episode: resp.content,
+                    ..Reflection::default()
+                }
+            }
+        }
+        _ => {
+            let cut = transcript
+                .char_indices()
+                .nth(1500)
+                .map_or(transcript.len(), |(i, _)| i);
+            Reflection {
+                episode: format!("Task transcript:\n{}", &transcript[..cut]),
+                ..Reflection::default()
+            }
+        }
+    }
 }
 
 async fn execute_tool_calls(
