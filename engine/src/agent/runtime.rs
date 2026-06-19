@@ -47,6 +47,7 @@ pub enum AgentEventKind {
     Replanning,
     /// Context was compressed/summarized to fit the window.
     ContextCompressed,
+    FileEdit,
 }
 
 pub struct AgentResult {
@@ -755,6 +756,14 @@ async fn execute_tool_calls(
             }
             None => serde_json::json!({ "error": format!("Unknown tool: {}", call.name) }),
         };
+
+        let mut result = result;
+        if let Some(edit) = result.as_object_mut().and_then(|o| o.remove("_edit")) {
+            on_event(AgentEvent {
+                kind: AgentEventKind::FileEdit,
+                content: Some(edit.to_string()),
+            });
+        }
 
         on_event(AgentEvent {
             kind: AgentEventKind::ToolResult,

@@ -239,6 +239,14 @@ export interface AgentCallbacks {
   onReflecting?: (content: string) => void;
   onReplanning?: (content: string) => void;
   onContextCompressed?: (content: string) => void;
+  onFileEdit?: (edit: FileEdit) => void;
+}
+
+export interface FileEdit {
+  path: string;
+  old_content?: string;
+  new_content?: string;
+  too_large?: boolean;
 }
 
 export async function sendApproval(requestId: string, approved: boolean): Promise<void> {
@@ -399,6 +407,12 @@ function processAgentEvent(
       case "context_compressed":
         callbacks.onContextCompressed?.(data);
         break;
+      case "file_edit": {
+        try {
+          callbacks.onFileEdit?.(JSON.parse(data));
+        } catch {}
+        break;
+      }
     }
   } catch {}
 }

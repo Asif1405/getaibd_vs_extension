@@ -6,6 +6,19 @@ use std::sync::Arc;
 use crate::error::AppError;
 use crate::tools::Tool;
 
+/// Builds the diff payload surfaced to the UI. Skips bodies for very large files.
+fn edit_payload(path: &str, old_content: &str, new_content: &str) -> Value {
+    const MAX_DIFF_BYTES: usize = 512 * 1024;
+    if old_content.len() > MAX_DIFF_BYTES || new_content.len() > MAX_DIFF_BYTES {
+        return json!({ "path": path, "too_large": true });
+    }
+    json!({
+        "path": path,
+        "old_content": old_content,
+        "new_content": new_content,
+    })
+}
+
 fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
     let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let candidate = if Path::new(relative).is_absolute() {
@@ -170,12 +183,18 @@ impl Tool for WriteFile {
             }
         }
 
+        let old_content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+
         let bytes = content.len();
         tokio::fs::write(&path, content)
             .await
             .map_err(|e| AppError::InvalidRequest(format!("Cannot write {rel}: {e}")))?;
 
-        Ok(json!({ "written": rel, "bytes": bytes }))
+        Ok(json!({
+            "written": rel,
+            "bytes": bytes,
+            "_edit": edit_payload(rel, &old_content, content)
+        }))
     }
 }
 
@@ -242,7 +261,10 @@ impl Tool for PatchFile {
             .await
             .map_err(|e| AppError::InvalidRequest(format!("Cannot write {rel}: {e}")))?;
 
-        Ok(json!({ "patched": rel }))
+        Ok(json!({
+            "patched": rel,
+            "_edit": edit_payload(rel, &content, &updated)
+        }))
     }
 }
 
