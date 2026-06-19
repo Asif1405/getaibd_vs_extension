@@ -208,6 +208,7 @@ async fn agent_loop(
     let tool_defs = registry.definitions();
     let mut iterations = 0;
     let mut last_text = String::new();
+    let mut nudged = false;
     let use_streaming = provider.supports_streaming_tools();
     let enable_thinking = options.is_none_or(|o| o.enable_thinking);
 
@@ -301,6 +302,23 @@ async fn agent_loop(
         }
 
         if response.tool_calls.is_empty() {
+            // In action modes the model sometimes only describes a plan instead of
+            // executing it. Nudge it once to actually use the tools before finishing.
+            let described_only = !nudged
+                && !tool_defs.is_empty()
+                && session.max_iterations > 1
+                && iterations < session.max_iterations;
+            if described_only {
+                nudged = true;
+                session.push_message(ToolMessage::system(
+                    "Do not stop at describing a plan. If you have enough information, call the \
+                     tools now to actually perform the task end to end. Only ask the user a \
+                     question if you are genuinely blocked or the request is ambiguous or \
+                     destructive."
+                        .to_string(),
+                ));
+                continue;
+            }
             return finish_agent(session, response.content, memory, provider, iterations, on_event)
                 .await;
         }

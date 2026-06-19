@@ -17,6 +17,12 @@ use crate::state::AppState;
 use crate::tools::ToolRegistry;
 
 #[derive(Debug, Deserialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct OrchestratedRequest {
     pub provider: String,
     pub model: String,
@@ -27,6 +33,8 @@ pub struct OrchestratedRequest {
     pub auto_mode: bool,
     #[serde(default)]
     pub use_memory: bool,
+    #[serde(default)]
+    pub history: Vec<HistoryMessage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +88,15 @@ async fn run_orchestrated_task(
 ) -> Result<OrchestratedResponse, AppError> {
     let mut session = Session::new(&req.provider, &req.model, state.project_root.clone());
 
+    for h in &req.history {
+        let msg = match h.role.as_str() {
+            "assistant" => crate::models::ToolMessage::assistant(h.content.clone()),
+            "system" => crate::models::ToolMessage::system(h.content.clone()),
+            _ => crate::models::ToolMessage::user(h.content.clone()),
+        };
+        session.push_message(msg);
+    }
+
     let mut orchestrator = Orchestrator::new(provider, registry).with_auto_mode(req.auto_mode);
 
     if req.use_memory {
@@ -97,7 +114,7 @@ async fn run_orchestrated_task(
             AgentEventKind::ToolCall => "tool_call",
             AgentEventKind::ToolResult => "tool_result",
             AgentEventKind::Response => "response",
-            AgentEventKind::Complete => "complete",
+            AgentEventKind::Complete => "done",
             AgentEventKind::Error => "error",
             AgentEventKind::ModeSelected => "mode_selected",
             AgentEventKind::Planning => "planning",

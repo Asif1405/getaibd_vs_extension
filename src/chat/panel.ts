@@ -629,6 +629,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendOrchestrated(provider: string, model: string, text: string, mode: string) {
     if (!(await this.checkSecrets(text))) {return;}
+    const priorHistory = this.conversationMessages();
     this.history.push({ kind: "message", role: "user", content: text });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: text });
@@ -683,7 +684,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey });
+    }, { apiKey, history: priorHistory });
   }
 
   private async previewPatch(llmResponse: string): Promise<void> {
@@ -749,6 +750,17 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private saveHistory() {
     this.globalState.update(SESSION_HISTORY_PREFIX + this.activeSessionId, this.history);
     this.maybeTitleFromHistory();
+  }
+
+  /** Prior user/assistant turns for this session, capped to keep context affordable. */
+  private conversationMessages(): ChatMessage[] {
+    const msgs: ChatMessage[] = [];
+    for (const e of this.history) {
+      if (e.kind !== "message" || !e.content) {continue;}
+      if (e.role !== "user" && e.role !== "assistant") {continue;}
+      msgs.push({ role: e.role, content: e.content });
+    }
+    return msgs.slice(-20);
   }
 
   /** Loads session metadata, migrating any legacy single-history into a first session. */

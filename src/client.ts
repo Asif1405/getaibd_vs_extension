@@ -413,7 +413,7 @@ export function streamOrchestrated(
   input: string,
   mode: string,
   callbacks: OrchestratedCallbacks,
-  options?: { apiKey?: string },
+  options?: { apiKey?: string; history?: ChatMessage[] },
 ): AbortController {
   const controller = new AbortController();
 
@@ -426,6 +426,7 @@ export function streamOrchestrated(
         mode: mode === "auto" ? null : mode,
         auto_mode: mode === "auto",
         use_memory: true,
+        history: options?.history ?? [],
       };
       if (options?.apiKey) {body.api_key = options.apiKey;}
 
