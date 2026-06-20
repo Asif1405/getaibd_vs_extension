@@ -12,14 +12,16 @@ import {
   type FileEdit,
 } from "../client";
 import { scanText, formatWarning } from "../safetype/detector";
-import { ensureEngine } from "../engine/manager";
+import { ensureEngine, restartEngine } from "../engine/manager";
 import { PatchPreviewPanel } from "./patchPreview";
 import { EditReviewManager } from "./editReview";
 import { AgentTerminal } from "./terminal";
+import { createFreeSession } from "../free";
 import {
   getServerUrl,
   authHeaders,
   getApiKey,
+  setApiKey,
   isFreeToken,
   FREE_MODEL_ID,
   FREE_MODEL_LABEL,
@@ -63,6 +65,7 @@ const SESSION_HISTORY_PREFIX = "getaibd.history.";
 const PROVIDER_KEY = "getaibd.lastProvider";
 const MODEL_KEY = "getaibd.lastModel";
 const MODE_KEY = "getaibd.lastMode";
+const ALWAYS_ALLOW_KEY = "getaibd.alwaysAllowTools";
 const MAX_RECONNECT = 3;
 
 export class ChatPanel implements vscode.WebviewViewProvider {
@@ -86,6 +89,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private editContents = new Map<string, { originalOld: string; latestNew: string }>();
   private editReview = new EditReviewManager(vscode.workspace.workspaceFolders?.[0]?.uri);
   private pendingApprovals = new Map<string, string | undefined>();
+  private pendingApprovalTools = new Map<string, string>();
   private lastDiffPath: string | undefined;
   private currentTurnId: string | undefined;
   private agentTerminal = new AgentTerminal(vscode.workspace.workspaceFolders?.[0]?.uri);
@@ -192,6 +196,33 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   startNewSession() {
     this.whenReady(() => this.newSession());
+  }
+
+  /**
+   * Restarts the engine so it re-reads the new GetAIBD key, then refreshes the
+   * webview (auth mode, models, balance). Falls back to a Reload Window prompt.
+   */
+  private async applyGetaibdKeyChange() {
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "GetAIBD: applying API key…" },
+        async () => {
+          await restartEngine(this.context);
+        },
+      );
+      await this.refreshAuthMode();
+      await this.refreshModels();
+      void vscode.commands.executeCommand("getaibd.refreshBalance");
+      void vscode.window.showInformationMessage("GetAIBD API key applied.");
+    } catch {
+      const choice = await vscode.window.showWarningMessage(
+        "GetAIBD: couldn't restart the engine automatically. Reload the window to apply the key.",
+        "Reload Window",
+      );
+      if (choice === "Reload Window") {
+        void vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
+    }
   }
 
   /** Re-reads the stored credential and tells the webview whether it is free-tier. */
@@ -341,7 +372,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         if (msg.path) {await this.undoEdit(msg.path as string);}
         break;
       case "approvalResponse":
-        if (msg.requestId) {await this.resolveApproval(msg.requestId as string, !!msg.approved);}
+        if (msg.requestId) {await this.resolveApproval(msg.requestId as string, !!msg.approved, !!msg.always);}
+        break;
+      case "removeAlwaysAllow":
+        if (msg.tool) {
+          const list = this.getAlwaysAllow().filter((t) => t !== msg.tool);
+          await this.globalState.update(ALWAYS_ALLOW_KEY, list);
+          await this.sendSettings();
+        }
         break;
       case "clearHistory":
         this.history = [];
@@ -392,11 +430,26 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         await this.handleSaveProvider(msg);
         break;
       case "saveApiKey":
-        await this.store.setApiKey(msg.providerId as string, msg.key as string);
+        if (msg.providerId === "getaibd") {
+          await setApiKey(this.context.secrets, (msg.key as string) || "");
+          await this.applyGetaibdKeyChange();
+        } else {
+          await this.store.setApiKey(msg.providerId as string, msg.key as string);
+        }
         await this.sendSettings();
         break;
       case "removeApiKey":
-        await this.store.setApiKey(msg.providerId as string, "");
+        if (msg.providerId === "getaibd") {
+          try {
+            const free = await createFreeSession(this.context);
+            await setApiKey(this.context.secrets, free.token);
+          } catch {
+            await setApiKey(this.context.secrets, "");
+          }
+          await this.applyGetaibdKeyChange();
+        } else {
+          await this.store.setApiKey(msg.providerId as string, "");
+        }
         await this.sendSettings();
         break;
       case "testProvider":
@@ -521,14 +574,17 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendSettings() {
     const snapshot = await this.store.getFullSettingsSnapshot();
-    let serverConfig = null;
-    try {
-      const resp = await fetch(`${getServerUrl()}/config`, { headers: authHeaders() });
-      if (resp.ok) {
-        serverConfig = await resp.json();
-      }
-    } catch { /* server not reachable */ }
-    this.post({ type: "settings", ...snapshot, serverConfig });
+    const platformKey = await getApiKey(this.context.secrets);
+    const hasRealKey = !!platformKey && !isFreeToken(platformKey);
+    const providers = snapshot.providers.map((p) =>
+      p.id === "getaibd" ? { ...p, hasKey: hasRealKey } : p,
+    );
+    this.post({
+      type: "settings",
+      ...snapshot,
+      providers,
+      alwaysAllow: this.getAlwaysAllow(),
+    });
   }
 
   private async handleSaveProvider(msg: WebviewMessage) {
@@ -1071,15 +1127,34 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Tools the user marked "Always allow", which run without prompting. */
+  private getAlwaysAllow(): string[] {
+    return this.globalState.get<string[]>(ALWAYS_ALLOW_KEY, []);
+  }
+
   private handleApprovalRequest(requestId: string, sessionId: string | undefined, toolName: string, args: Record<string, unknown>) {
     this.pendingApprovals.set(requestId, sessionId);
+    this.pendingApprovalTools.set(requestId, toolName);
+    if (this.getAlwaysAllow().includes(toolName)) {
+      void this.resolveApproval(requestId, true);
+      return;
+    }
     this.post({ type: "approvalRequest", requestId, toolName, args });
   }
 
   /** Resolves an inline approval card click by notifying the engine gate. */
-  private async resolveApproval(requestId: string, approved: boolean) {
+  private async resolveApproval(requestId: string, approved: boolean, always = false) {
     const sessionId = this.pendingApprovals.get(requestId);
+    const toolName = this.pendingApprovalTools.get(requestId);
     this.pendingApprovals.delete(requestId);
+    this.pendingApprovalTools.delete(requestId);
+    if (always && approved && toolName) {
+      const list = this.getAlwaysAllow();
+      if (!list.includes(toolName)) {
+        list.push(toolName);
+        await this.globalState.update(ALWAYS_ALLOW_KEY, list);
+      }
+    }
     await sendApproval(requestId, approved, sessionId);
   }
 
@@ -1759,6 +1834,7 @@ body {
 .approval-card button { font-size: 11px; padding: 3px 14px; border-radius: 4px; border: 1px solid var(--border); cursor: pointer; background: transparent; color: var(--fg); }
 .approval-card .ap-allow { background: var(--btn-bg); color: var(--btn-fg); border-color: var(--btn-bg); }
 .approval-card .ap-allow:hover { opacity: 0.9; }
+.approval-card .ap-always:hover { border-color: var(--btn-bg); color: var(--btn-bg); }
 .approval-card .ap-deny:hover { border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
 .approval-card .ap-result { color: var(--muted); font-style: italic; }
 .approval-card.ap-allowed { border-color: var(--border); opacity: 0.8; }
@@ -2444,12 +2520,11 @@ if (settingsPanel) {
     const act = t.getAttribute("data-act");
     const arg = t.getAttribute("data-arg");
     if (act === "closeSettings") { closeSettings(); }
-    else if (act === "saveServerUrl") { saveServerUrl(); }
-    else if (act === "saveServerCfg") { saveServerCfg(arg); }
     else if (act === "toggleKeyVis") { toggleKeyVis(arg); }
     else if (act === "saveKey") { saveKey(arg); }
     else if (act === "removeKey") { removeKey(arg); }
     else if (act === "testProvider") { testProvider(arg); }
+    else if (act === "removeAlwaysAllow") { vscode.postMessage({ type: "removeAlwaysAllow", tool: arg }); }
   });
   settingsPanel.addEventListener("change", (e) => {
     const t = e.target.closest("[data-act]");
@@ -3227,12 +3302,6 @@ function renderSettings(data) {
     + '<span style="font-size:14px;font-weight:600;">Settings</span>'
     + '<button class="small-btn" data-act="closeSettings">Close</button></div>';
 
-  html += '<div class="settings-section"><h3>Server</h3>';
-  html += '<div class="setting-row"><label>Server URL</label>'
-    + '<input type="url" value="' + escapeHtml(data.serverUrl) + '" id="settingServerUrl" />'
-    + '<button class="small-btn" data-act="saveServerUrl">Save</button></div>';
-  html += '</div>';
-
   html += '<div class="settings-section"><h3>Preferences</h3>';
   html += '<div class="pref-row"><label>Auto-attach open file</label>'
     + '<input type="checkbox" ' + (data.fileContextEnabled ? 'checked' : '') + ' data-act="savePref" data-arg="fileContext.enabled" /></div>';
@@ -3257,40 +3326,18 @@ function renderSettings(data) {
     html += '</div>';
   }
 
-  if (data.serverConfig) {
-    const sc = data.serverConfig;
-    html += '<div class="settings-section"><h3>Agent</h3>';
-    html += '<div class="setting-row"><label>Project root</label>'
-      + '<input type="text" disabled value="' + escapeHtml(sc.agent.project_root) + '" style="opacity:0.6" /></div>';
-    html += '<div class="setting-row"><label>Max iterations</label>'
-      + '<input type="number" id="cfgMaxIter" value="' + sc.agent.max_iterations + '" style="width:80px" />'
-      + '<button class="small-btn primary" data-act="saveServerCfg" data-arg="agent">Save</button></div>';
-    html += '</div>';
-
-    html += '<div class="settings-section"><h3>Memory</h3>';
-    html += '<div class="pref-row"><label>Enabled</label><span>' + (sc.memory.enabled ? 'Yes' : 'No') + '</span></div>';
-    html += '<div class="pref-row"><label>Top K</label><span>' + sc.memory.top_k + '</span></div>';
-    html += '<div class="pref-row"><label>Max entries</label><span>' + sc.memory.max_entries + '</span></div>';
-    html += '</div>';
-
-    html += '<div class="settings-section"><h3>Context Management</h3>';
-    html += '<div class="pref-row"><label>Enabled</label>'
-      + '<input type="checkbox" id="cfgCtxEnabled" ' + (sc.context.enabled ? 'checked' : '') + ' /></div>';
-    html += '<div class="setting-row"><label>Max tokens</label>'
-      + '<input type="number" id="cfgCtxMaxTokens" value="' + (sc.context.max_tokens || '') + '" placeholder="Auto" style="width:100px" /></div>';
-    html += '<div class="setting-row"><label>Reserve ratio</label>'
-      + '<input type="number" id="cfgCtxReserve" value="' + sc.context.reserve_for_completion + '" step="0.05" min="0" max="1" style="width:80px" /></div>';
-    html += '<div class="pref-row"><label>Strategy</label><span>' + escapeHtml(sc.context.strategy) + '</span></div>';
-    html += '<button class="small-btn primary" data-act="saveServerCfg" data-arg="context" style="margin-top:4px">Save Context</button>';
-    html += '</div>';
-
-    if (sc.server) {
-      html += '<div class="settings-section"><h3>Server</h3>';
-      html += '<div class="pref-row"><label>Public URL</label><span>' + escapeHtml(sc.server.public_url || 'None') + '</span></div>';
-      html += '<div class="pref-row"><label>Auth token</label><span>' + (sc.server.has_auth_token ? 'Configured' : 'None') + '</span></div>';
-      html += '</div>';
+  const allow = data.alwaysAllow || [];
+  html += '<div class="settings-section"><h3>Auto-approved tools</h3>';
+  if (allow.length === 0) {
+    html += '<p class="setting-hint">Tools you mark "Always allow" run without asking. None yet.</p>';
+  } else {
+    html += '<p class="setting-hint">These tools run automatically without asking. Remove one to require approval again.</p>';
+    for (const tool of allow) {
+      html += '<div class="pref-row"><label>' + escapeHtml(tool) + '</label>'
+        + '<button class="small-btn danger" data-act="removeAlwaysAllow" data-arg="' + escapeHtml(tool) + '">Remove</button></div>';
     }
   }
+  html += '</div>';
 
   settingsPanel.innerHTML = html;
 }
@@ -3825,15 +3872,17 @@ window.addEventListener("message", (event) => {
         + '<span class="ap-title">Allow <b>' + escapeHtml(info.verb || msg.toolName) + '</b>?</span></div>'
         + (detail ? '<div class="ap-detail">' + detail + '</div>' : '')
         + '<div class="ap-actions"><button class="ap-allow">Allow</button>'
+        + '<button class="ap-always">Always allow</button>'
         + '<button class="ap-deny">Deny</button></div>';
       messagesEl.appendChild(card);
-      const finish = (approved, label) => {
-        vscode.postMessage({ type: "approvalResponse", requestId: msg.requestId, approved });
+      const finish = (approved, always, label) => {
+        vscode.postMessage({ type: "approvalResponse", requestId: msg.requestId, approved, always });
         card.classList.add(approved ? "ap-allowed" : "ap-denied");
         card.querySelector(".ap-actions").innerHTML = '<span class="ap-result">' + label + '</span>';
       };
-      card.querySelector(".ap-allow").addEventListener("click", () => finish(true, "Allowed"));
-      card.querySelector(".ap-deny").addEventListener("click", () => finish(false, "Denied"));
+      card.querySelector(".ap-allow").addEventListener("click", () => finish(true, false, "Allowed"));
+      card.querySelector(".ap-always").addEventListener("click", () => finish(true, true, "Always allowed"));
+      card.querySelector(".ap-deny").addEventListener("click", () => finish(false, false, "Denied"));
       scrollToBottom();
       break;
     }

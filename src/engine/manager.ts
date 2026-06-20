@@ -102,21 +102,47 @@ async function isHealthy(url: string, timeoutMs: number): Promise<boolean> {
   return false;
 }
 
-/** Adds `.getaibd/` to the workspace .gitignore so generated artifacts stay untracked. */
+/** Ignore files we extend when the project already uses them (never created). */
+const EXTRA_IGNORE_FILES = [
+  ".cursorignore",
+  ".dockerignore",
+  ".vscodeignore",
+  ".npmignore",
+  ".eslintignore",
+  ".prettierignore",
+  ".aiexclude",
+  ".aiignore",
+];
+
+/**
+ * Keeps `.getaibd/` out of source control and tooling: creates/updates
+ * `.gitignore` in git repos and appends to any other ignore files the project
+ * already uses (without creating new ones).
+ */
 function ensureGetaibdIgnored(projectRoot: string): void {
-  try {
-    if (!fs.existsSync(path.join(projectRoot, ".git"))) {
-      return;
+  const append = (file: string, createIfMissing: boolean): void => {
+    try {
+      const target = path.join(projectRoot, file);
+      const exists = fs.existsSync(target);
+      if (!exists && !createIfMissing) {
+        return;
+      }
+      const current = exists ? fs.readFileSync(target, "utf8") : "";
+      if (/^\.getaibd\/?\s*$/m.test(current)) {
+        return;
+      }
+      const prefix = current && !current.endsWith("\n") ? "\n" : "";
+      fs.appendFileSync(target, `${prefix}.getaibd/\n`);
+    } catch {
+      /* best effort */
     }
-    const gi = path.join(projectRoot, ".gitignore");
-    const current = fs.existsSync(gi) ? fs.readFileSync(gi, "utf8") : "";
-    if (/^\.getaibd\/?\s*$/m.test(current)) {
-      return;
-    }
-    const prefix = current && !current.endsWith("\n") ? "\n" : "";
-    fs.appendFileSync(gi, `${prefix}.getaibd/\n`);
-  } catch {
-    /* best effort */
+  };
+
+  if (fs.existsSync(path.join(projectRoot, ".git"))) {
+    append(".gitignore", true);
+  }
+  for (const file of EXTRA_IGNORE_FILES) {
+    append(file, false);
   }
 }
 
