@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.9]
+
+- Fixed wrong terminal commands on **Windows**. The agent is now told which OS and shell it's running in, so it stops emitting bash-only syntax (`&&`, heredocs, `sed`/`grep`/multi-line `python -c`) that PowerShell rejects. The extension also chains its `cd` step with a separator the active shell actually accepts (PowerShell `;`, cmd/POSIX `&&`).
+
 ## [0.4.8]
 
 - Rebranded the listing and docs: GetAIBD is now described as an **AI coding agent for Bangladeshi developers** (no more "Cursor-style"), billed in BDT to one balance with no markup.

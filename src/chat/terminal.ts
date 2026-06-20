@@ -47,6 +47,37 @@ function buildLine(cmd: string, args: string[]): string {
   return [cmd, ...args].map(quote).join(" ");
 }
 
+type ShellKind = "powershell" | "cmd" | "posix";
+
+/** Best-effort detection of the integrated terminal's shell family. */
+function detectShell(): ShellKind {
+  const s = (vscode.env.shell || "").toLowerCase();
+  if (s.includes("powershell") || s.includes("pwsh")) {
+    return "powershell";
+  }
+  if (s.includes("cmd.exe") || /(^|[\\/])cmd$/.test(s)) {
+    return "cmd";
+  }
+  if (s) {
+    return "posix";
+  }
+  return process.platform === "win32" ? "powershell" : "posix";
+}
+
+/** Prefixes a command with a `cd` using a separator the target shell accepts. */
+function chainCd(dir: string, line: string, shell: ShellKind): string {
+  const d = buildLine(dir, []);
+  if (shell === "powershell") {
+    // PowerShell rejects `&&`; `;` chains, and `if ($?)` skips the command if cd fails.
+    return `cd ${d}; if ($?) { ${line} }`;
+  }
+  if (shell === "cmd") {
+    // `/d` lets cd switch drives (e.g. d:) as well as directories.
+    return `cd /d ${d} && ${line}`;
+  }
+  return `cd ${d} && ${line}`;
+}
+
 /** Runs agent shell commands in a persistent, visible terminal with streamed output. */
 export class AgentTerminal {
   private terminal: vscode.Terminal | undefined;
@@ -106,13 +137,13 @@ export class AgentTerminal {
     this.cancelled = false;
     const line = buildLine(cmd, args);
     const targetDir = this.resolveDir(cwd);
-    const full = targetDir ? `cd ${buildLine(targetDir, [])} && ${line}` : line;
+    const full = targetDir ? chainCd(targetDir, line, detectShell()) : line;
     const term = this.ensureTerminal();
     term.show(true);
 
     const si = await this.waitForShellIntegration(term, 6000);
     if (!si) {
-      return this.runFallback(full, line, cwd, onChunk);
+      return this.runFallback(line, cwd, onChunk);
     }
     try {
       const execution = si.executeCommand(full);
@@ -178,7 +209,7 @@ export class AgentTerminal {
       }
       return { stdout: out, stderr: "", exit_code: exitCode };
     } catch {
-      return this.runFallback(full, line, cwd, onChunk);
+      return this.runFallback(line, cwd, onChunk);
     }
   }
 
@@ -218,7 +249,6 @@ export class AgentTerminal {
   /** Headless capture when shell integration is unavailable; output is not visible live.
    * Long-running commands are detached (left running) and released instead of hanging. */
   private runFallback(
-    full: string,
     line: string,
     cwd: string | undefined,
     onChunk: (s: string) => void,
@@ -228,12 +258,15 @@ export class AgentTerminal {
     const isServer = SERVER_HINT.test(line);
     const idleMs = isServer ? SERVER_IDLE_MS : DEFAULT_IDLE_MS;
     const maxMs = isServer ? SERVER_MAX_MS : DEFAULT_MAX_MS;
+    // `cwd` is set via exec options, so the bare command runs as-is. Use PowerShell on
+    // Windows to match the integrated terminal (and the engine's command guidance).
+    const shell = process.platform === "win32" ? "powershell.exe" : undefined;
     return new Promise((resolve) => {
       let out = "";
       let errOut = "";
       let lastAt = Date.now();
       let done = false;
-      const child = exec(full, { cwd: cwdAbs, maxBuffer: 16 * 1024 * 1024 });
+      const child = exec(line, { cwd: cwdAbs, shell, maxBuffer: 16 * 1024 * 1024 });
       const finish = (code: number, note?: string) => {
         if (done) {
           return;

@@ -126,6 +126,34 @@ pub async fn run_agent_with_memory(
     agent_loop(session, provider, registry, memory, options, on_event).await
 }
 
+/// A system note describing the host OS and shell so generated terminal
+/// commands match the environment they actually run in. Derived from the OS the
+/// engine binary runs on, which is the user's machine.
+fn environment_note() -> String {
+    match std::env::consts::OS {
+        "windows" => "ENVIRONMENT — IMPORTANT\n\
+            The user is on Windows and terminal commands run in PowerShell. Generate \
+            commands accordingly:\n\
+            - Chain steps with `;` — PowerShell rejects `&&`. Better: run ONE command per \
+            tool call and check its result before the next.\n\
+            - Do NOT use POSIX-only tools (sed, awk, grep, touch, rm, cat heredocs). Use \
+            PowerShell equivalents (Set-Content, Add-Content, Select-String, Remove-Item, \
+            New-Item) or the dedicated file-editing tools instead.\n\
+            - Do NOT run multi-line `python -c \"...\"` or bash heredocs; write a temporary \
+            script file and execute it, or use a single-line command.\n\
+            - Paths use backslashes; quote any path containing spaces."
+            .to_string(),
+        "macos" => "ENVIRONMENT\n\
+            The user is on macOS; terminal commands run in a POSIX shell (zsh/bash). Use \
+            POSIX syntax (chain with `&&`)."
+            .to_string(),
+        _ => "ENVIRONMENT\n\
+            The user is on Linux; terminal commands run in a POSIX shell (bash). Use POSIX \
+            syntax (chain with `&&`)."
+            .to_string(),
+    }
+}
+
 async fn inject_context(session: &mut Session, task: &str, memory: Option<&MemoryContext<'_>>) {
     // Build the static prefix (system prompt + long-term memory) and prepend it so it sits
     // BEFORE the conversation history. This keeps the most recent turns closest to the task,
@@ -135,6 +163,10 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
     if let Some(sys) = &session.system_prompt {
         prefix.push(ToolMessage::system(sys.clone()));
     }
+
+    // Make the model aware of the host OS/shell so it never emits commands for the
+    // wrong platform (e.g. bash `&&`/heredocs/`sed` on Windows PowerShell).
+    prefix.push(ToolMessage::system(environment_note()));
 
     let persistent = PersistentMemory::new(&session.project_root);
     if persistent.exists() {
