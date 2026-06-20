@@ -52,6 +52,8 @@ pub enum AgentEventKind {
     ApprovalRequired,
     /// A shell command should be executed by the client in a managed terminal.
     TerminalExec,
+    /// The agent is asking the user a clarifying question with options.
+    AskRequired,
 }
 
 pub struct AgentResult {
@@ -72,6 +74,7 @@ pub struct MemoryContext<'a> {
 pub struct AgentOptions {
     pub approval_gate: Option<ApprovalGate>,
     pub terminal_gate: Option<crate::tools::terminal_gate::TerminalGate>,
+    pub ask_gate: Option<crate::tools::ask_gate::AskGate>,
     pub tool_timeout_secs: u64,
     pub circuit_breaker: Option<Arc<CircuitBreaker>>,
     pub context_config: Option<ContextConfig>,
@@ -83,6 +86,7 @@ impl Default for AgentOptions {
         Self {
             approval_gate: None,
             terminal_gate: None,
+            ask_gate: None,
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: None,
@@ -790,11 +794,15 @@ async fn execute_tool_calls(
             Some(tool) => {
                 let approved = check_approval(tool.as_ref(), call, options, on_event).await;
                 if approved {
-                    let terminal_gate =
-                        options.and_then(|o| o.terminal_gate.as_ref()).filter(|_| {
-                            call.name == "run_command"
-                        });
-                    if let Some(gate) = terminal_gate {
+                    let ask_gate = options
+                        .and_then(|o| o.ask_gate.as_ref())
+                        .filter(|_| call.name == "ask_question");
+                    let terminal_gate = options
+                        .and_then(|o| o.terminal_gate.as_ref())
+                        .filter(|_| call.name == "run_command");
+                    if let Some(gate) = ask_gate {
+                        delegate_ask(call, gate, on_event).await
+                    } else if let Some(gate) = terminal_gate {
                         delegate_terminal(call, gate, on_event).await
                     } else {
                         let execution = tool.execute(call.arguments.clone());
@@ -859,6 +867,31 @@ async fn delegate_terminal(
         Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "stdout": raw, "stderr": "", "exit_code": 0 })),
         None => serde_json::json!({ "error": "Terminal execution timed out or was cancelled" }),
+    }
+}
+
+/// Asks the user a clarifying question through the client and returns their answer.
+async fn delegate_ask(
+    call: &ToolCall,
+    gate: &crate::tools::ask_gate::AskGate,
+    on_event: &mut impl FnMut(AgentEvent),
+) -> serde_json::Value {
+    let req_id = format!("{}_ask", call.id);
+    on_event(AgentEvent {
+        kind: AgentEventKind::AskRequired,
+        content: Some(
+            serde_json::json!({
+                "request_id": req_id,
+                "question": call.arguments.get("question").cloned().unwrap_or_default(),
+                "options": call.arguments.get("options").cloned().unwrap_or_default(),
+                "multiple": call.arguments.get("multiple").cloned().unwrap_or(serde_json::Value::Bool(false)),
+            })
+            .to_string(),
+        ),
+    });
+    match gate.request(req_id).await {
+        Some(answer) => serde_json::json!({ "answer": answer }),
+        None => serde_json::json!({ "error": "The question timed out or was dismissed without an answer" }),
     }
 }
 

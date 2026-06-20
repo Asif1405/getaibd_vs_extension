@@ -7,6 +7,7 @@ import {
   streamOrchestrated,
   sendApproval,
   sendTerminalResult,
+  sendAskResult,
   testProviderConnection,
   type ChatMessage,
   type FileEdit,
@@ -90,6 +91,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private editReview = new EditReviewManager(vscode.workspace.workspaceFolders?.[0]?.uri);
   private pendingApprovals = new Map<string, string | undefined>();
   private pendingApprovalTools = new Map<string, string>();
+  private pendingAsks = new Map<string, string | undefined>();
   private lastDiffPath: string | undefined;
   private currentTurnId: string | undefined;
   private agentTerminal = new AgentTerminal(vscode.workspace.workspaceFolders?.[0]?.uri);
@@ -373,6 +375,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         break;
       case "approvalResponse":
         if (msg.requestId) {await this.resolveApproval(msg.requestId as string, !!msg.approved, !!msg.always);}
+        break;
+      case "askResponse":
+        if (msg.requestId) {await this.resolveAsk(msg.requestId as string, (msg.answer as string) ?? "");}
         break;
       case "removeAlwaysAllow":
         if (msg.tool) {
@@ -733,6 +738,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onTerminalExec: (requestId, sessionId, args) => {
         void this.handleTerminalExec(requestId, sessionId, args);
       },
+      onAskRequired: (requestId, sessionId, question, options, multiple) => {
+        this.handleAskRequest(requestId, sessionId, question, options, multiple);
+      },
       onText: (text) => {
         this.post({ type: "agentText", content: text });
       },
@@ -812,6 +820,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       },
       onTerminalExec: (requestId, sessionId, args) => {
         void this.handleTerminalExec(requestId, sessionId, args);
+      },
+      onAskRequired: (requestId, sessionId, question, options, multiple) => {
+        this.handleAskRequest(requestId, sessionId, question, options, multiple);
       },
       onText: (text) => {
         this.post({ type: "agentText", content: text });
@@ -1178,6 +1189,25 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }
     this.activeTerminalReq = undefined;
     await sendTerminalResult(requestId, result, sessionId);
+  }
+
+  /** Surfaces a clarifying question with options as an interactive card in the chat. */
+  private handleAskRequest(
+    requestId: string,
+    sessionId: string | undefined,
+    question: string,
+    options: string[],
+    multiple: boolean,
+  ) {
+    this.pendingAsks.set(requestId, sessionId);
+    this.post({ type: "askRequest", requestId, question, options, multiple });
+  }
+
+  /** Sends the user's answer for a clarifying question back to the engine gate. */
+  private async resolveAsk(requestId: string, answer: string) {
+    const sessionId = this.pendingAsks.get(requestId);
+    this.pendingAsks.delete(requestId);
+    await sendAskResult(requestId, answer, sessionId);
   }
 
   /** Cancels any in-flight terminal command and unblocks the engine. */
@@ -1839,6 +1869,24 @@ body {
 .approval-card .ap-result { color: var(--muted); font-style: italic; }
 .approval-card.ap-allowed { border-color: var(--border); opacity: 0.8; }
 .approval-card.ap-denied { border-color: var(--border); opacity: 0.6; }
+
+.ask-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: var(--vscode-editorWidget-background, var(--code-bg)); }
+.ask-card .ask-head { display: flex; gap: 8px; align-items: flex-start; }
+.ask-card .ask-icon { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: var(--btn-bg); color: var(--btn-fg); font-size: 12px; font-weight: 700; flex-shrink: 0; margin-top: 1px; }
+.ask-card .ask-q { font-weight: 600; line-height: 1.4; }
+.ask-card .ask-opts { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 8px; }
+.ask-card .ask-opt { display: flex; align-items: center; gap: 8px; text-align: left; width: 100%; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--fg); cursor: pointer; font-size: 12px; }
+.ask-card .ask-opt:hover { border-color: var(--btn-bg); }
+.ask-card .ask-opt.sel { border-color: var(--btn-bg); background: var(--vscode-list-activeSelectionBackground, rgba(120,160,255,0.15)); }
+.ask-card .ask-opt .ask-box { width: 12px; height: 12px; border: 1px solid var(--border); border-radius: 3px; flex-shrink: 0; }
+.ask-card .ask-opt.sel .ask-box { background: var(--btn-bg); border-color: var(--btn-bg); }
+.ask-card .ask-opt:disabled { opacity: 0.55; cursor: default; }
+.ask-card .ask-other { margin: 6px 0; }
+.ask-card .ask-input { width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--vscode-input-background, var(--code-bg)); color: var(--fg); font-size: 12px; box-sizing: border-box; }
+.ask-card .ask-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
+.ask-card .ask-send { font-size: 11px; padding: 4px 16px; border-radius: 4px; border: 1px solid var(--btn-bg); background: var(--btn-bg); color: var(--btn-fg); cursor: pointer; }
+.ask-card .ask-result { color: var(--muted); font-style: italic; }
+.ask-card.ask-done { opacity: 0.85; }
 
 .md ul li.task-item { list-style: none; margin-left: -18px; display: flex; align-items: flex-start; gap: 6px; }
 .md li.task-item .task-box { flex: 0 0 14px; width: 14px; height: 14px; border: 1px solid var(--border); border-radius: 3px; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; line-height: 1; margin-top: 2px; color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
@@ -3883,6 +3931,70 @@ window.addEventListener("message", (event) => {
       card.querySelector(".ap-allow").addEventListener("click", () => finish(true, false, "Allowed"));
       card.querySelector(".ap-always").addEventListener("click", () => finish(true, true, "Always allowed"));
       card.querySelector(".ap-deny").addEventListener("click", () => finish(false, false, "Denied"));
+      scrollToBottom();
+      break;
+    }
+
+    case "askRequest": {
+      agentTextEl = null;
+      const opts = Array.isArray(msg.options) ? msg.options : [];
+      const multiple = msg.multiple === true;
+      const card = document.createElement("div");
+      card.className = "ask-card";
+      let optsHtml = "";
+      for (let i = 0; i < opts.length; i++) {
+        optsHtml += '<button class="ask-opt" data-i="' + i + '">'
+          + (multiple ? '<span class="ask-box"></span>' : '')
+          + '<span>' + escapeHtml(String(opts[i])) + '</span></button>';
+      }
+      card.innerHTML = '<div class="ask-head"><span class="ask-icon">?</span>'
+        + '<span class="ask-q">' + escapeHtml(msg.question || "") + '</span></div>'
+        + (optsHtml ? '<div class="ask-opts">' + optsHtml + '</div>' : '')
+        + '<div class="ask-other"><input type="text" class="ask-input" placeholder="'
+        + (opts.length ? 'Other\u2026' : 'Type your answer\u2026') + '" /></div>'
+        + '<div class="ask-actions"><button class="ask-send">'
+        + (multiple ? 'Send' : (opts.length ? 'Send' : 'Send')) + '</button></div>';
+      messagesEl.appendChild(card);
+
+      const selected = new Set();
+      const input = card.querySelector(".ask-input");
+      const submit = (answer) => {
+        if (!answer.trim()) { return; }
+        vscode.postMessage({ type: "askResponse", requestId: msg.requestId, answer: answer });
+        card.classList.add("ask-done");
+        card.querySelector(".ask-actions").innerHTML = '<span class="ask-result">' + escapeHtml(answer) + '</span>';
+        const oi = card.querySelector(".ask-other");
+        if (oi) { oi.remove(); }
+        card.querySelectorAll(".ask-opt").forEach((b) => { b.disabled = true; });
+      };
+
+      card.querySelectorAll(".ask-opt").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const i = btn.getAttribute("data-i");
+          const label = String(opts[i]);
+          if (multiple) {
+            if (selected.has(label)) { selected.delete(label); btn.classList.remove("sel"); }
+            else { selected.add(label); btn.classList.add("sel"); }
+          } else {
+            submit(label);
+          }
+        });
+      });
+      card.querySelector(".ask-send").addEventListener("click", () => {
+        const typed = input ? input.value.trim() : "";
+        if (multiple) {
+          const parts = Array.from(selected);
+          if (typed) { parts.push(typed); }
+          submit(parts.join(", "));
+        } else {
+          submit(typed);
+        }
+      });
+      if (input) {
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); card.querySelector(".ask-send").click(); }
+        });
+      }
       scrollToBottom();
       break;
     }

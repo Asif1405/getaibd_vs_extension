@@ -18,6 +18,7 @@ pub struct Orchestrator {
     auto_mode: bool,
     approval_gate: Option<crate::tools::approval::ApprovalGate>,
     terminal_gate: Option<crate::tools::terminal_gate::TerminalGate>,
+    ask_gate: Option<crate::tools::ask_gate::AskGate>,
 }
 
 impl Orchestrator {
@@ -30,6 +31,7 @@ impl Orchestrator {
             auto_mode: true,
             approval_gate: None,
             terminal_gate: None,
+            ask_gate: None,
         }
     }
 
@@ -40,6 +42,11 @@ impl Orchestrator {
 
     pub fn with_terminal_gate(mut self, gate: crate::tools::terminal_gate::TerminalGate) -> Self {
         self.terminal_gate = Some(gate);
+        self
+    }
+
+    pub fn with_ask_gate(mut self, gate: crate::tools::ask_gate::AskGate) -> Self {
+        self.ask_gate = Some(gate);
         self
     }
 
@@ -127,13 +134,22 @@ impl Orchestrator {
         session.push_message(ToolMessage::user(input));
 
         let memory_ctx = self.memory_context();
+        let options = AgentOptions {
+            approval_gate: self.approval_gate.clone(),
+            terminal_gate: self.terminal_gate.clone(),
+            ask_gate: self.ask_gate.clone(),
+            tool_timeout_secs: 300,
+            circuit_breaker: None,
+            context_config: Some(crate::context::ContextConfig::default()),
+            enable_thinking: true,
+        };
         run_agent_with_memory(
             session,
             input,
             &self.provider,
             &self.registry,
             memory_ctx.as_ref(),
-            None,
+            Some(&options),
             on_event,
         )
         .await
@@ -156,6 +172,7 @@ impl Orchestrator {
         let options = AgentOptions {
             approval_gate: self.approval_gate.clone(),
             terminal_gate: self.terminal_gate.clone(),
+            ask_gate: self.ask_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
@@ -196,6 +213,7 @@ impl Orchestrator {
         let options = AgentOptions {
             approval_gate: self.approval_gate.clone(),
             terminal_gate: self.terminal_gate.clone(),
+            ask_gate: self.ask_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),

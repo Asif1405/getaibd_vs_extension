@@ -69,6 +69,11 @@ pub async fn agent_handler(
     } else {
         None
     };
+    let ask_gate = {
+        let g = crate::tools::ask_gate::AskGate::new();
+        state.set_ask_gate(&session_id, g.clone());
+        g
+    };
 
     let project_root = state.project_root.clone();
     let max_iter = req.max_iterations.min(state.max_iterations);
@@ -85,11 +90,13 @@ pub async fn agent_handler(
             max_iter,
             project_root,
             gate,
+            ask_gate,
             sid_for_task,
             tx,
         )
         .await;
         state.clear_approval_gate(&sid);
+        state.clear_ask_gate(&sid);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -105,6 +112,7 @@ async fn run_agent_task(
     max_iter: u32,
     project_root: std::path::PathBuf,
     gate: Option<ApprovalGate>,
+    ask_gate: crate::tools::ask_gate::AskGate,
     session_id_for_events: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) {
@@ -129,6 +137,7 @@ async fn run_agent_task(
     let opts = AgentOptions {
         approval_gate: gate,
         terminal_gate: None,
+        ask_gate: Some(ask_gate),
         tool_timeout_secs: 300,
         circuit_breaker: Some(state.circuit_breaker.clone()),
         context_config: Some(state.context_config.clone()),
@@ -203,6 +212,10 @@ fn agent_event_to_sse(
             let payload = inject_session_id(data, session_id);
             Some(Event::default().event("terminal_exec").data(payload))
         }
+        AgentEventKind::AskRequired => {
+            let payload = inject_session_id(data, session_id);
+            Some(Event::default().event("ask_required").data(payload))
+        }
     }
 }
 
@@ -269,6 +282,36 @@ pub async fn terminal_result_handler(
     } else {
         Err(AppError::InvalidRequest(
             "No active agent session awaiting terminal result".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AskResultRequest {
+    pub request_id: String,
+    /// Session UUID returned in the ask_required SSE event.
+    pub session_id: Option<String>,
+    /// The user's selected/typed answer.
+    pub answer: String,
+}
+
+#[allow(clippy::unused_async)]
+pub async fn ask_result_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AskResultRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let gate = if let Some(sid) = &req.session_id {
+        state.get_ask_gate(sid)
+    } else {
+        state.any_ask_gate()
+    };
+
+    if let Some(gate) = gate {
+        let sent = gate.respond(&req.request_id, req.answer).await;
+        Ok(Json(serde_json::json!({ "acknowledged": sent })))
+    } else {
+        Err(AppError::InvalidRequest(
+            "No active agent session awaiting an answer".into(),
         ))
     }
 }
