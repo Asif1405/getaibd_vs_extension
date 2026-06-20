@@ -225,6 +225,9 @@ fn agent_event_to_sse(
             let payload = inject_session_id(data, session_id);
             Some(Event::default().event("ask_required").data(payload))
         }
+        AgentEventKind::StepLimitReached => {
+            Some(Event::default().event("step_limit").data(data))
+        }
     }
 }
 

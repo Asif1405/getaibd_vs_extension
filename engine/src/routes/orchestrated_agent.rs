@@ -196,6 +196,7 @@ async fn run_orchestrated_task(
             AgentEventKind::ApprovalRequired => "approval_required",
             AgentEventKind::TerminalExec => "terminal_exec",
             AgentEventKind::AskRequired => "ask_required",
+            AgentEventKind::StepLimitReached => "step_limit",
         };
 
         let data = match event.kind {

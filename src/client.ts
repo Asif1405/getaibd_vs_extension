@@ -249,6 +249,7 @@ export interface AgentCallbacks {
   onReplanning?: (content: string) => void;
   onContextCompressed?: (content: string) => void;
   onFileEdit?: (edit: FileEdit) => void;
+  onStepLimit?: () => void;
 }
 
 export interface FileEdit {
@@ -463,6 +464,9 @@ function processAgentEvent(
         break;
       case "context_compressed":
         callbacks.onContextCompressed?.(data);
+        break;
+      case "step_limit":
+        callbacks.onStepLimit?.();
         break;
       case "file_edit": {
         try {

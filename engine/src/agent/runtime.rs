@@ -54,6 +54,8 @@ pub enum AgentEventKind {
     TerminalExec,
     /// The agent is asking the user a clarifying question with options.
     AskRequired,
+    /// The run stopped because it reached the step-limit brake; the user can continue.
+    StepLimitReached,
 }
 
 pub struct AgentResult {
@@ -273,6 +275,10 @@ async fn agent_loop(
 
     loop {
         if iterations >= session.max_iterations {
+            on_event(AgentEvent {
+                kind: AgentEventKind::StepLimitReached,
+                content: Some(iterations.to_string()),
+            });
             session.push_message(ToolMessage::system(
                 "You have reached the step limit. Stop calling tools now and reply with a concise \
                  summary of what you accomplished, what remains, and any next steps."

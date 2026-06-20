@@ -94,6 +94,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private pendingAsks = new Map<string, string | undefined>();
   private lastDiffPath: string | undefined;
   private currentTurnId: string | undefined;
+  private stepLimitHit = false;
   private agentTerminal = new AgentTerminal(vscode.workspace.workspaceFolders?.[0]?.uri);
   private activeTerminalReq: { requestId: string; sessionId: string | undefined } | undefined;
 
@@ -795,6 +796,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     reasoningEffort?: string,
   ) {
     if (!(await this.checkSecrets(text))) {return;}
+    this.stepLimitHit = false;
     const priorHistory = [...this.buildFileContext(), ...this.conversationMessages()];
     const turnId = newId();
     this.currentTurnId = turnId;
@@ -842,6 +844,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onContextCompressed: (content) => {
         this.post({ type: "agentContextCompressed", content });
       },
+      onStepLimit: () => {
+        this.stepLimitHit = true;
+      },
       onFileEdit: (edit) => {
         this.handleFileEdit(edit);
       },
@@ -854,7 +859,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.post({ type: "agentDone", content });
       },
       onComplete: (iterations) => {
-        this.post({ type: "agentComplete", iterations });
+        this.post({ type: "agentComplete", iterations, stepLimit: this.stepLimitHit });
+        this.stepLimitHit = false;
         this.abortController = undefined;
       },
       onError: (error) => {
@@ -1810,6 +1816,11 @@ body {
 .tool-call .tool-args { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; color: var(--muted); white-space: pre-wrap; max-height: 120px; overflow-y: auto; margin-top: 4px; }
 .tool-result { background: var(--code-bg); border-left: 3px solid var(--btn-bg); border-radius: 0 6px 6px 0; padding: 6px 12px; font-size: 11px; font-family: var(--vscode-editor-font-family, monospace); white-space: pre-wrap; max-height: 200px; overflow-y: auto; color: var(--muted); margin: 2px 0; }
 .agent-status { padding: 4px 14px; font-size: 11px; color: var(--muted); font-style: italic; }
+.continue-card { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 14px 12px; }
+.continue-note { font-size: 11px; color: var(--muted); }
+.continue-btn { padding: 5px 14px; font-size: 12px; font-weight: 600; border: none; border-radius: 6px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.continue-btn:hover:not(:disabled) { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+.continue-btn:disabled { opacity: 0.5; cursor: default; }
 .file-edit { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; margin: 4px 0; font-size: 12px; overflow: hidden; }
 .file-edit.fe-accepted { border-color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); opacity: 0.75; }
 .file-edit.fe-reverted { opacity: 0.5; }
@@ -3075,6 +3086,20 @@ function send() {
   });
 }
 
+/** Resumes a run that paused at the step limit, reusing the current selection. */
+function continueRun() {
+  if (!currentProvider || !currentModel) return;
+  const reasoning = currentModelSupportsThinking() ? currentReasoning : "off";
+  vscode.postMessage({
+    type: "orchestratedSend",
+    provider: currentProvider,
+    model: currentModel,
+    text: "Continue from where you left off and finish the task.",
+    mode: currentMode,
+    reasoningEffort: reasoning === "off" ? null : reasoning,
+  });
+}
+
 /* ── Messages ── */
 function addMessage(role, content, opts) {
   const div = document.createElement("div");
@@ -3889,6 +3914,18 @@ window.addEventListener("message", (event) => {
         cd.className = "agent-status";
         cd.textContent = "Agent completed (" + msg.iterations + " iterations)";
         messagesEl.appendChild(cd);
+        if (msg.stepLimit) {
+          const cont = document.createElement("div");
+          cont.className = "continue-card";
+          cont.innerHTML = '<span class="continue-note">Paused at the step limit \u2014 the task may not be finished.</span>'
+            + '<button class="continue-btn">Continue</button>';
+          const btn = cont.querySelector(".continue-btn");
+          btn.addEventListener("click", () => {
+            btn.disabled = true;
+            continueRun();
+          });
+          messagesEl.appendChild(cont);
+        }
         scrollToBottom();
       }
       break;

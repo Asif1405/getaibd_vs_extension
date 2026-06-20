@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.14]
+
+- If a run ever does reach the step-limit brake, it no longer dead-ends: you get a **Continue** button that resumes the task from where it stopped (history is preserved).
+
 ## [0.4.13]
 
 - The agent no longer stops mid-task on long jobs. Per-mode step limits were raised dramatically (Ask 1→25, Plan 16→100, Debug 30→150, Agent 40→250) so real exploration and multi-step work runs to completion. The cap now only exists as a far-off brake against a runaway loop, not something you should hit.
