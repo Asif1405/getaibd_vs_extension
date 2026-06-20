@@ -3,6 +3,7 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+*.vsix.zip
 
 # Rust engine
 engine/target

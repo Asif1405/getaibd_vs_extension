@@ -83,7 +83,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: vsix-${{ matrix.target }}
-          path: "*.vsix"
+          path: "getaibd-${{ matrix.target }}.vsix"
 
   publish:
     needs: build
@@ -103,14 +103,14 @@ jobs:
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: vsix/*.vsix
+          files: vsix/getaibd-*.vsix
 
       - name: Publish to VS Code Marketplace + Open VSX
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
-          for f in vsix/*.vsix; do
+          for f in vsix/getaibd-*.vsix; do
             echo "publishing $f"
             [ -n "$VSCE_PAT" ] && npx @vscode/vsce publish --packagePath "$f" --pat "$VSCE_PAT" || echo "vsce skipped/failed for $f"
             [ -n "$OVSX_PAT" ] && npx ovsx publish "$f" -p "$OVSX_PAT" || echo "ovsx skipped/failed for $f"
