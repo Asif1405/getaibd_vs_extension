@@ -39,11 +39,13 @@ impl AgentMode {
     }
 
     pub fn max_iterations(self) -> u32 {
+        // High enough that real tasks finish on their own; the cap is only a
+        // far-off runaway-loop brake, not a stop the user should ever hit.
         match self {
-            Self::Plan => 16,
-            Self::Ask => 1,
-            Self::Agent => 40,
-            Self::Debug => 30,
+            Self::Plan => 100,
+            Self::Ask => 25,
+            Self::Agent => 250,
+            Self::Debug => 150,
         }
     }
 

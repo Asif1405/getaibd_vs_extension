@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.13]
+
+- The agent no longer stops mid-task on long jobs. Per-mode step limits were raised dramatically (Ask 1→25, Plan 16→100, Debug 30→150, Agent 40→250) so real exploration and multi-step work runs to completion. The cap now only exists as a far-off brake against a runaway loop, not something you should hit.
+
 ## [0.4.12]
 
 - Listing links now point to [getaibd.com](https://getaibd.com) instead of a source repository, so the Marketplace page has no dead links.
