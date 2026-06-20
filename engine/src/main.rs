@@ -100,6 +100,10 @@ async fn main() {
             post(routes::agent::terminal_result_handler),
         )
         .route(
+            "/agent/ask_result",
+            post(routes::agent::ask_result_handler),
+        )
+        .route(
             "/agent/orchestrated",
             post(routes::orchestrated_agent::orchestrated_agent_handler),
         )

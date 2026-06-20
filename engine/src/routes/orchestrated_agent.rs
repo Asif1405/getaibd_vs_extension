@@ -80,6 +80,12 @@ pub async fn orchestrated_agent_handler(
     } else {
         None
     };
+    // The agent can always ask the user a clarifying question.
+    let ask_gate = {
+        let g = crate::tools::ask_gate::AskGate::new();
+        state.set_ask_gate(&session_id, g.clone());
+        g
+    };
     let sid = session_id.clone();
 
     tokio::spawn(async move {
@@ -90,12 +96,14 @@ pub async fn orchestrated_agent_handler(
             registry,
             gate,
             term_gate,
+            ask_gate,
             sid.clone(),
             tx.clone(),
         )
         .await;
         state.clear_approval_gate(&sid);
         state.clear_terminal_gate(&sid);
+        state.clear_ask_gate(&sid);
 
         match result {
             Ok(resp) => {
@@ -124,6 +132,7 @@ async fn run_orchestrated_task(
     registry: ToolRegistry,
     gate: Option<crate::tools::approval::ApprovalGate>,
     term_gate: Option<crate::tools::terminal_gate::TerminalGate>,
+    ask_gate: crate::tools::ask_gate::AskGate,
     session_id: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) -> Result<OrchestratedResponse, AppError> {
@@ -139,7 +148,9 @@ async fn run_orchestrated_task(
         session.push_message(msg);
     }
 
-    let mut orchestrator = Orchestrator::new(provider, registry).with_auto_mode(req.auto_mode);
+    let mut orchestrator = Orchestrator::new(provider, registry)
+        .with_auto_mode(req.auto_mode)
+        .with_ask_gate(ask_gate);
 
     if let Some(g) = gate {
         orchestrator = orchestrator.with_approval_gate(g);
@@ -175,12 +186,13 @@ async fn run_orchestrated_task(
             AgentEventKind::FileEdit => "file_edit",
             AgentEventKind::ApprovalRequired => "approval_required",
             AgentEventKind::TerminalExec => "terminal_exec",
+            AgentEventKind::AskRequired => "ask_required",
         };
 
         let data = match event.kind {
-            AgentEventKind::ApprovalRequired | AgentEventKind::TerminalExec => {
-                inject_session_id(&event.content, &session_id)
-            }
+            AgentEventKind::ApprovalRequired
+            | AgentEventKind::TerminalExec
+            | AgentEventKind::AskRequired => inject_session_id(&event.content, &session_id),
             _ => event.content.unwrap_or_default(),
         };
 

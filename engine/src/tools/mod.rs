@@ -1,4 +1,6 @@
 pub mod approval;
+pub mod ask;
+pub mod ask_gate;
 pub mod command;
 pub mod edits;
 pub mod env_manager;
@@ -83,6 +85,7 @@ impl ToolRegistry {
             env_mgr.clone(),
         )));
         registry.register(Arc::new(env_manager::ManageEnv::new(env_mgr)));
+        registry.register(Arc::new(ask::AskQuestion::new()));
 
         registry
     }

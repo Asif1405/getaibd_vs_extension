@@ -36,6 +36,8 @@ pub struct AppState {
     approval_gates: Mutex<HashMap<String, ApprovalGate>>,
     /// Session-scoped terminal gates keyed by session UUID
     terminal_gates: Mutex<HashMap<String, crate::tools::terminal_gate::TerminalGate>>,
+    /// Session-scoped ask gates (clarifying questions) keyed by session UUID
+    ask_gates: Mutex<HashMap<String, crate::tools::ask_gate::AskGate>>,
     /// Snapshots for patch rollback, keyed by patch ID (UUID)
     pub patch_snapshots: Mutex<HashMap<String, Snapshot>>,
     pub context_config: crate::context::ContextConfig,
@@ -121,6 +123,7 @@ impl AppState {
             analysis_cache,
             approval_gates: Mutex::new(HashMap::new()),
             terminal_gates: Mutex::new(HashMap::new()),
+            ask_gates: Mutex::new(HashMap::new()),
             patch_snapshots: Mutex::new(HashMap::new()),
             context_config: config.context.clone(),
         }
@@ -175,6 +178,28 @@ impl AppState {
     /// Find any active terminal gate — fallback when session_id is unknown.
     pub fn any_terminal_gate(&self) -> Option<crate::tools::terminal_gate::TerminalGate> {
         self.terminal_gates.lock().expect("state mutex poisoned").values().next().cloned()
+    }
+
+    /// Register an ask gate (clarifying questions) for a specific agent session.
+    pub fn set_ask_gate(&self, session_id: &str, gate: crate::tools::ask_gate::AskGate) {
+        self.ask_gates
+            .lock().expect("state mutex poisoned")
+            .insert(session_id.to_string(), gate);
+    }
+
+    /// Retrieve the ask gate for a session.
+    pub fn get_ask_gate(&self, session_id: &str) -> Option<crate::tools::ask_gate::AskGate> {
+        self.ask_gates.lock().expect("state mutex poisoned").get(session_id).cloned()
+    }
+
+    /// Remove the ask gate after a session finishes.
+    pub fn clear_ask_gate(&self, session_id: &str) {
+        self.ask_gates.lock().expect("state mutex poisoned").remove(session_id);
+    }
+
+    /// Find any active ask gate — fallback when session_id is unknown.
+    pub fn any_ask_gate(&self) -> Option<crate::tools::ask_gate::AskGate> {
+        self.ask_gates.lock().expect("state mutex poisoned").values().next().cloned()
     }
 
     /// Store a patch snapshot for later rollback.

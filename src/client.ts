@@ -231,6 +231,13 @@ export interface AgentCallbacks {
   onToolResult: (name: string, result: unknown) => void;
   onApprovalRequired?: (requestId: string, sessionId: string | undefined, toolName: string, args: Record<string, unknown>) => void;
   onTerminalExec?: (requestId: string, sessionId: string | undefined, args: Record<string, unknown>) => void;
+  onAskRequired?: (
+    requestId: string,
+    sessionId: string | undefined,
+    question: string,
+    options: string[],
+    multiple: boolean,
+  ) => void;
   onText: (text: string) => void;
   onDone: (content: string) => void;
   onComplete: (iterations: number) => void;
@@ -268,6 +275,19 @@ export async function sendTerminalResult(
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ request_id: requestId, session_id: sessionId, result: JSON.stringify(result) }),
+  });
+}
+
+/** Posts the user's answer to a clarifying question back to the engine. */
+export async function sendAskResult(
+  requestId: string,
+  answer: string,
+  sessionId?: string,
+): Promise<void> {
+  await fetch(`${getServerUrl()}/agent/ask_result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ request_id: requestId, session_id: sessionId, answer }),
   });
 }
 
@@ -395,6 +415,20 @@ function processAgentEvent(
       case "terminal_exec": {
         const parsed = JSON.parse(data);
         callbacks.onTerminalExec?.(parsed.request_id, parsed.session_id, parsed.arguments ?? {});
+        break;
+      }
+      case "ask_required": {
+        const parsed = JSON.parse(data);
+        const options = Array.isArray(parsed.options)
+          ? parsed.options.filter((o: unknown): o is string => typeof o === "string")
+          : [];
+        callbacks.onAskRequired?.(
+          parsed.request_id,
+          parsed.session_id,
+          typeof parsed.question === "string" ? parsed.question : "",
+          options,
+          parsed.multiple === true,
+        );
         break;
       }
       case "text":
