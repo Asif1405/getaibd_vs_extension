@@ -1,9 +1,10 @@
-# GetAIBD — Cursor-style AI coding agent for VS Code
+# GetAIBD — AI coding agent for Bangladeshi developers
 
-GetAIBD is a Cursor-like AI coding agent for VS Code. The extension embeds a
-high-performance Rust agent engine (chat, agent loop, multi-mode orchestration,
-RAG memory, patch apply/revert, tool calling) and routes **all** inference and
-embeddings through your GetAIBD account using a single API key.
+GetAIBD is an AI coding agent for VS Code, built for Bangladeshi developers. The
+extension embeds a high-performance Rust agent engine (chat, agent loop,
+multi-mode orchestration, RAG memory, patch apply/revert, tool calling) and
+routes **all** inference and embeddings through your GetAIBD account using a
+single API key — billed in BDT to one balance, with no markup.
 
 This repository is the merge of two projects:
 

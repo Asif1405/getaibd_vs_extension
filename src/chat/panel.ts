@@ -2029,7 +2029,7 @@ body {
 .send-btn:hover { background: var(--btn-hover); }
 .send-btn.stop { background: var(--error-fg); }
 
-/* ── Cursor-style composer ── */
+/* ── Composer ── */
 .brand { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.3px; }
 
 .composer {
@@ -2634,7 +2634,7 @@ const MODE_META = {
   ask:   { icon: "\uD83D\uDCAC", label: "Ask" },
 };
 
-/* ── Mode switcher (Cursor-style) ── */
+/* ── Mode switcher ── */
 function switchMode(mode) {
   currentMode = mode;
   const meta = MODE_META[mode] || MODE_META.agent;
