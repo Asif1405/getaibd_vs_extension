@@ -2861,7 +2861,9 @@ function updateModelPill() {
 }
 
 const REASON_LEVELS = ["off", "low", "medium", "high"];
-let currentReasoning = "off";
+// Default to maximum reasoning so thinking-capable models always think hard unless
+// the user explicitly dials it down via the pill.
+let currentReasoning = "high";
 
 function modelCaps(provider, modelId) {
   const api = (allModels[provider] || []).find(m => m.id === modelId);
@@ -2879,7 +2881,9 @@ function updateReasonPill() {
   if (!reasonPill) return;
   const supported = currentModel && currentModelSupportsThinking();
   reasonPill.style.display = supported ? "" : "none";
-  if (!supported) {currentReasoning = "off";}
+  // For thinking-capable models, default to high; keep the preference (don't force
+  // off) when an unsupported model is selected so it returns to high on switch back.
+  if (supported && currentReasoning === "off") {currentReasoning = "high";}
   const label = currentReasoning === "off"
     ? "Reasoning: Off"
     : "Reasoning: " + currentReasoning.charAt(0).toUpperCase() + currentReasoning.slice(1);
@@ -3044,11 +3048,17 @@ function formatToolRow(name, args) {
       return { verb: "Searched", arg: args.query || args.pattern || path };
     case "run_command":
     case "run_terminal":
-    case "shell":
-      return { verb: "Ran", arg: args.command || args.cmd };
+    case "shell": {
+      const base = args.command || args.cmd || "";
+      const extra = Array.isArray(args.args)
+        ? args.args.join(" ")
+        : (typeof args.args === "string" ? args.args : "");
+      return { verb: "Ran", arg: (base + " " + extra).trim() || base };
+    }
     default:
       if (name && name.indexOf("git") === 0) {
-        return { verb: name.replace(/_/g, " "), arg: args.args };
+        const gitExtra = Array.isArray(args.args) ? args.args.join(" ") : (args.args || "");
+        return { verb: name.replace(/_/g, " "), arg: gitExtra };
       }
       return { verb: (name || "tool").replace(/_/g, " "), arg: path };
   }
