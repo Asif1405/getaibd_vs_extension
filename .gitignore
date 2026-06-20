@@ -13,3 +13,6 @@ bin/
 *.mcp-memory.db
 .mcp-memory.db
 dist-vsix/
+
+# macOS
+.DS_Store
