@@ -11,9 +11,34 @@ import { fetchAccountStatus } from "./client";
 import { createFreeSession } from "./free";
 
 const SIGNUP_URL = "https://getaibd.com";
+const CHANGELOG_URL = "https://marketplace.visualstudio.com/items/dmsbilas.getaibd/changelog";
+
+/** Shows a one-time toast after the extension is upgraded (auto-update is silent
+ * otherwise). Fires at most once per version, and never on a fresh install. */
+async function maybeShowWhatsNew(context: vscode.ExtensionContext): Promise<void> {
+  const current = String(context.extension.packageJSON.version ?? "");
+  if (!current) {
+    return;
+  }
+  const KEY = "getaibd.lastVersion";
+  const previous = context.globalState.get<string>(KEY);
+  await context.globalState.update(KEY, current);
+  if (!previous || previous === current) {
+    return;
+  }
+  const choice = await vscode.window.showInformationMessage(
+    `GetAIBD updated to v${current}.`,
+    "What's new",
+  );
+  if (choice === "What's new") {
+    void vscode.env.openExternal(vscode.Uri.parse(CHANGELOG_URL));
+  }
+}
 
 export function activate(context: vscode.ExtensionContext) {
   activateDiagnostics(context);
+
+  void maybeShowWhatsNew(context);
 
   const openItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   openItem.text = "$(sparkle) GetAIBD";
