@@ -1,0 +1,216 @@
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::Json;
+use futures::stream::Stream;
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::agent::modes::AgentMode;
+use crate::agent::orchestrator::Orchestrator;
+use crate::agent::runtime::AgentEventKind;
+use crate::agent::session::Session;
+use crate::error::AppError;
+use crate::state::AppState;
+use crate::tools::ToolRegistry;
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrchestratedRequest {
+    pub provider: String,
+    pub model: String,
+    pub input: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub auto_mode: bool,
+    #[serde(default)]
+    pub use_memory: bool,
+    #[serde(default)]
+    pub history: Vec<HistoryMessage>,
+    #[serde(default)]
+    pub require_approval: bool,
+    /// When true, run_command is delegated to the client's managed terminal.
+    #[serde(default)]
+    pub client_terminal: bool,
+    /// Reasoning effort hint (low/medium/high) for thinking-capable models.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrchestratedResponse {
+    pub mode: String,
+    pub result: String,
+    pub iterations: u32,
+}
+
+#[allow(clippy::unused_async)]
+pub async fn orchestrated_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OrchestratedRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let provider = state
+        .get_provider(&req.provider)
+        .ok_or_else(|| AppError::UnknownProvider(req.provider.clone()))?;
+
+    let registry = ToolRegistry::build_default(&state.project_root);
+
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let gate = if req.require_approval {
+        let g = crate::tools::approval::ApprovalGate::new();
+        state.set_approval_gate(&session_id, g.clone());
+        Some(g)
+    } else {
+        None
+    };
+    let term_gate = if req.client_terminal {
+        let g = crate::tools::terminal_gate::TerminalGate::new();
+        state.set_terminal_gate(&session_id, g.clone());
+        Some(g)
+    } else {
+        None
+    };
+    let sid = session_id.clone();
+
+    tokio::spawn(async move {
+        let result = run_orchestrated_task(
+            &state,
+            req,
+            provider,
+            registry,
+            gate,
+            term_gate,
+            sid.clone(),
+            tx.clone(),
+        )
+        .await;
+        state.clear_approval_gate(&sid);
+        state.clear_terminal_gate(&sid);
+
+        match result {
+            Ok(resp) => {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("complete")
+                        .data(serde_json::to_string(&resp).unwrap_or_default())))
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Ok(Event::default().event("error").data(e.to_string())))
+                    .await;
+            }
+        }
+    });
+
+    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_orchestrated_task(
+    state: &AppState,
+    req: OrchestratedRequest,
+    provider: Arc<dyn crate::providers::Provider>,
+    registry: ToolRegistry,
+    gate: Option<crate::tools::approval::ApprovalGate>,
+    term_gate: Option<crate::tools::terminal_gate::TerminalGate>,
+    session_id: String,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+) -> Result<OrchestratedResponse, AppError> {
+    let mut session = Session::new(&req.provider, &req.model, state.project_root.clone())
+        .with_reasoning_effort(req.reasoning_effort.clone());
+
+    for h in &req.history {
+        let msg = match h.role.as_str() {
+            "assistant" => crate::models::ToolMessage::assistant(h.content.clone()),
+            "system" => crate::models::ToolMessage::system(h.content.clone()),
+            _ => crate::models::ToolMessage::user(h.content.clone()),
+        };
+        session.push_message(msg);
+    }
+
+    let mut orchestrator = Orchestrator::new(provider, registry).with_auto_mode(req.auto_mode);
+
+    if let Some(g) = gate {
+        orchestrator = orchestrator.with_approval_gate(g);
+    }
+
+    if let Some(g) = term_gate {
+        orchestrator = orchestrator.with_terminal_gate(g);
+    }
+
+    if req.use_memory {
+        if let (Some(store), Some(embedder)) = (&state.memory_store, &state.embedder) {
+            orchestrator = orchestrator.with_memory(store.clone().into(), embedder.clone_box());
+        }
+    }
+
+    let mode = req.mode.as_deref().map(AgentMode::from_str);
+
+    let mut on_event = |event: crate::agent::runtime::AgentEvent| {
+        let event_name = match event.kind {
+            AgentEventKind::Start => "start",
+            AgentEventKind::Think => "think",
+            AgentEventKind::ToolCall => "tool_call",
+            AgentEventKind::ToolResult => "tool_result",
+            AgentEventKind::Response => "response",
+            AgentEventKind::Complete => "done",
+            AgentEventKind::Error => "error",
+            AgentEventKind::ModeSelected => "mode_selected",
+            AgentEventKind::Planning => "planning",
+            AgentEventKind::Thinking => "thinking",
+            AgentEventKind::Reflecting => "reflecting",
+            AgentEventKind::Replanning => "replanning",
+            AgentEventKind::ContextCompressed => "context_compressed",
+            AgentEventKind::FileEdit => "file_edit",
+            AgentEventKind::ApprovalRequired => "approval_required",
+            AgentEventKind::TerminalExec => "terminal_exec",
+        };
+
+        let data = match event.kind {
+            AgentEventKind::ApprovalRequired | AgentEventKind::TerminalExec => {
+                inject_session_id(&event.content, &session_id)
+            }
+            _ => event.content.unwrap_or_default(),
+        };
+
+        let _ = tx.try_send(Ok(Event::default().event(event_name).data(data)));
+    };
+
+    let result = orchestrator
+        .execute(&mut session, &req.input, mode, &mut on_event)
+        .await?;
+
+    Ok(OrchestratedResponse {
+        mode: result.mode.unwrap_or_else(|| "ask".to_string()),
+        result: result.final_response,
+        iterations: result.iterations,
+    })
+}
+
+/// Adds the session id to an approval payload so the client can target this gate.
+fn inject_session_id(content: &Option<String>, session_id: &str) -> String {
+    let raw = content.clone().unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+            v.to_string()
+        }
+        Err(_) => raw,
+    }
+}

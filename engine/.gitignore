@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target
+tauri-app/src-tauri/target/
+
+# Tauri generated files
+tauri-app/src-tauri/gen/
+tauri-app/src-tauri/Cargo.lock
+
+# Sidecar binaries (built locally, not committed)
+tauri-app/src-tauri/binaries/mcp-universal-*
+!tauri-app/src-tauri/binaries/.gitkeep
+
+# Config / secrets
+config.toml
+.env
+
+# VSCode extension
+*.vsix
+vscode-extension/dist/
+vscode-extension/out/
+vscode-extension/node_modules/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
