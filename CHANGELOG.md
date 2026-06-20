@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.12]
+
+- Listing links now point to [getaibd.com](https://getaibd.com) instead of a source repository, so the Marketplace page has no dead links.
+
 ## [0.4.11]
 
 - After the extension auto-updates (which VS Code does silently), you now get a one-time **"GetAIBD updated to vX.Y.Z"** notice with a **What's new** button that opens the changelog. It fires once per version and never on a fresh install.

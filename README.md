@@ -6,11 +6,11 @@ multi-mode orchestration, RAG memory, patch apply/revert, tool calling) and
 routes **all** inference and embeddings through your GetAIBD account using a
 single API key — billed in BDT to one balance, with no markup.
 
-This repository is the merge of two projects:
+Under the hood it is the merge of two projects:
 
-- The Rust agent engine (adapted from `universal-mcp`), kept under [`engine/`](engine/).
+- The Rust agent engine (adapted from `universal-mcp`), kept under `engine/`.
 - The GetAIBD VS Code extension (the gate: API key, GetAIBD branding, and the
-  engine lifecycle), kept under [`src/`](src/).
+  engine lifecycle), kept under `src/`.
 
 ## Architecture
 
