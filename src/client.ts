@@ -1,4 +1,5 @@
 import { getServerUrl, getBaseUrl, authHeaders } from "./util/config";
+import { describeEnvironment } from "./util/environment";
 
 export interface AccountStatus {
   free: boolean;
@@ -302,11 +303,14 @@ export function streamAgent(
 
   (async () => {
     try {
+      const env = describeEnvironment();
       const body: Record<string, unknown> = {
         provider,
         model,
         task,
         require_approval: options?.requireApproval ?? false,
+        os: env.os,
+        shell: env.shell,
       };
       if (options?.systemPrompt) {body.system_prompt = options.systemPrompt;}
       if (options?.apiKey) {body.api_key = options.apiKey;}
@@ -492,6 +496,7 @@ export function streamOrchestrated(
 
   (async () => {
     try {
+      const env = describeEnvironment();
       const body: Record<string, unknown> = {
         provider,
         model,
@@ -502,6 +507,8 @@ export function streamOrchestrated(
         history: options?.history ?? [],
         require_approval: options?.requireApproval ?? false,
         client_terminal: options?.clientTerminal ?? false,
+        os: env.os,
+        shell: env.shell,
       };
       if (options?.apiKey) {body.api_key = options.apiKey;}
       if (options?.reasoningEffort) {body.reasoning_effort = options.reasoningEffort;}

@@ -43,6 +43,12 @@ pub struct OrchestratedRequest {
     /// Reasoning effort hint (low/medium/high) for thinking-capable models.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Host OS reported by the client (e.g. "Windows", "macOS", "Linux").
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Active shell reported by the client (e.g. "PowerShell", "zsh", "bash").
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,8 +142,11 @@ async fn run_orchestrated_task(
     session_id: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) -> Result<OrchestratedResponse, AppError> {
+    let environment =
+        crate::agent::runtime::format_environment(req.os.as_deref(), req.shell.as_deref());
     let mut session = Session::new(&req.provider, &req.model, state.project_root.clone())
-        .with_reasoning_effort(req.reasoning_effort.clone());
+        .with_reasoning_effort(req.reasoning_effort.clone())
+        .with_environment(environment);
 
     for h in &req.history {
         let msg = match h.role.as_str() {

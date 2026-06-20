@@ -26,6 +26,12 @@ pub struct AgentRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub require_approval: bool,
+    /// Host OS reported by the client (e.g. "Windows", "macOS", "Linux").
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Active shell reported by the client (e.g. "PowerShell", "zsh", "bash").
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -116,8 +122,11 @@ async fn run_agent_task(
     session_id_for_events: String,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) {
-    let mut session =
-        Session::new(&req.provider, &req.model, project_root).with_max_iterations(max_iter);
+    let environment =
+        crate::agent::runtime::format_environment(req.os.as_deref(), req.shell.as_deref());
+    let mut session = Session::new(&req.provider, &req.model, project_root)
+        .with_max_iterations(max_iter)
+        .with_environment(environment);
 
     if let Some(sys) = req.system_prompt {
         session = session.with_system_prompt(sys);

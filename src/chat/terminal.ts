@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { exec } from "child_process";
+import { detectShellKind, type ShellKind } from "../util/environment";
 
 export interface CommandResult {
   stdout: string;
@@ -45,23 +46,6 @@ function buildLine(cmd: string, args: string[]): string {
   const quote = (a: string) =>
     /[^A-Za-z0-9_/:=@%.,+-]/.test(a) ? "'" + a.replace(/'/g, "'\\''") + "'" : a;
   return [cmd, ...args].map(quote).join(" ");
-}
-
-type ShellKind = "powershell" | "cmd" | "posix";
-
-/** Best-effort detection of the integrated terminal's shell family. */
-function detectShell(): ShellKind {
-  const s = (vscode.env.shell || "").toLowerCase();
-  if (s.includes("powershell") || s.includes("pwsh")) {
-    return "powershell";
-  }
-  if (s.includes("cmd.exe") || /(^|[\\/])cmd$/.test(s)) {
-    return "cmd";
-  }
-  if (s) {
-    return "posix";
-  }
-  return process.platform === "win32" ? "powershell" : "posix";
 }
 
 /** Prefixes a command with a `cd` using a separator the target shell accepts. */
@@ -137,7 +121,7 @@ export class AgentTerminal {
     this.cancelled = false;
     const line = buildLine(cmd, args);
     const targetDir = this.resolveDir(cwd);
-    const full = targetDir ? chainCd(targetDir, line, detectShell()) : line;
+    const full = targetDir ? chainCd(targetDir, line, detectShellKind()) : line;
     const term = this.ensureTerminal();
     term.show(true);
 

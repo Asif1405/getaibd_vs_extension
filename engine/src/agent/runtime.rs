@@ -126,32 +126,31 @@ pub async fn run_agent_with_memory(
     agent_loop(session, provider, registry, memory, options, on_event).await
 }
 
-/// A system note describing the host OS and shell so generated terminal
-/// commands match the environment they actually run in. Derived from the OS the
-/// engine binary runs on, which is the user's machine.
-fn environment_note() -> String {
-    match std::env::consts::OS {
-        "windows" => "ENVIRONMENT — IMPORTANT\n\
-            The user is on Windows and terminal commands run in PowerShell. Generate \
-            commands accordingly:\n\
-            - Chain steps with `;` — PowerShell rejects `&&`. Better: run ONE command per \
-            tool call and check its result before the next.\n\
-            - Do NOT use POSIX-only tools (sed, awk, grep, touch, rm, cat heredocs). Use \
-            PowerShell equivalents (Set-Content, Add-Content, Select-String, Remove-Item, \
-            New-Item) or the dedicated file-editing tools instead.\n\
-            - Do NOT run multi-line `python -c \"...\"` or bash heredocs; write a temporary \
-            script file and execute it, or use a single-line command.\n\
-            - Paths use backslashes; quote any path containing spaces."
-            .to_string(),
-        "macos" => "ENVIRONMENT\n\
-            The user is on macOS; terminal commands run in a POSIX shell (zsh/bash). Use \
-            POSIX syntax (chain with `&&`)."
-            .to_string(),
-        _ => "ENVIRONMENT\n\
-            The user is on Linux; terminal commands run in a POSIX shell (bash). Use POSIX \
-            syntax (chain with `&&`)."
-            .to_string(),
+/// Build the environment descriptor (OS + shell) reported by the client, if any.
+pub fn format_environment(os: Option<&str>, shell: Option<&str>) -> Option<String> {
+    let os = os.map(str::trim).filter(|s| !s.is_empty());
+    let shell = shell.map(str::trim).filter(|s| !s.is_empty());
+    match (os, shell) {
+        (Some(os), Some(sh)) => Some(format!("Host OS: {os}. Active shell: {sh}.")),
+        (Some(os), None) => Some(format!("Host OS: {os}.")),
+        (None, Some(sh)) => Some(format!("Active shell: {sh}.")),
+        (None, None) => None,
     }
+}
+
+/// A system note that tells the model the host OS and shell and asks it to
+/// generate commands dynamically for that environment. The client reports the
+/// real shell; if it doesn't, we fall back to the OS the engine runs on.
+fn environment_note(env: Option<&str>) -> String {
+    let desc = env
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Host OS: {}.", std::env::consts::OS));
+    format!(
+        "ENVIRONMENT\n{desc}\n\
+        Generate every terminal command using the exact syntax, built-in commands, command \
+        chaining/operators, path style, and quoting rules of that shell on that OS. Use only \
+        tools that exist in that environment, and never assume a different shell or OS."
+    )
 }
 
 async fn inject_context(session: &mut Session, task: &str, memory: Option<&MemoryContext<'_>>) {
@@ -164,9 +163,11 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
         prefix.push(ToolMessage::system(sys.clone()));
     }
 
-    // Make the model aware of the host OS/shell so it never emits commands for the
-    // wrong platform (e.g. bash `&&`/heredocs/`sed` on Windows PowerShell).
-    prefix.push(ToolMessage::system(environment_note()));
+    // Make the model aware of the host OS/shell so it always generates commands for the
+    // shell they actually run in, instead of assuming a POSIX/bash environment.
+    prefix.push(ToolMessage::system(environment_note(
+        session.environment.as_deref(),
+    )));
 
     let persistent = PersistentMemory::new(&session.project_root);
     if persistent.exists() {

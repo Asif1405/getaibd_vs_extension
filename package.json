@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "AI coding agent for Bangladeshi developers, powered by GetAIBD",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "repository": {
     "type": "git",
     "url": "https://github.com/dmsbilas/getaibd_vs_extension.git"

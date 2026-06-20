@@ -12,6 +12,8 @@ pub struct Session {
     pub max_iterations: u32,
     pub system_prompt: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Host OS + shell the client runs in, so generated commands match it.
+    pub environment: Option<String>,
 }
 
 impl Session {
@@ -29,7 +31,14 @@ impl Session {
             max_iterations: 25,
             system_prompt: None,
             reasoning_effort: None,
+            environment: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_environment(mut self, environment: Option<String>) -> Self {
+        self.environment = environment;
+        self
     }
 
     #[must_use]
