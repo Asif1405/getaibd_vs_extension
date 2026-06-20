@@ -2,69 +2,260 @@
   "name": "getaibd",
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
-  "description": "AI supported coding assistant powered by GetAIBD",
-  "version": "0.0.1",
+  "description": "Cursor-style AI coding agent powered by GetAIBD",
+  "version": "0.4.5",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dmsbilas/getaibd_vs_extension.git"
+  },
   "icon": "media/logo.png",
   "engines": {
-    "vscode": "^1.125.0"
+    "vscode": "^1.106.0"
   },
   "categories": [
     "AI",
     "Chat",
+    "Programming Languages",
     "Other"
   ],
   "activationEvents": [
-    "onView:getaibd.agentView",
-    "onCommand:getaibd.refreshModels",
-    "onCommand:getaibd.openSettings"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
-    "configuration": {
-      "title": "GetAIBD",
-      "properties": {
-        "getaibd.apiKey": {
-          "type": "string",
-          "default": "",
-          "description": "Your GetAIBD API Key. Get one at https://getaibd.com",
-          "order": 1
-        },
-        "getaibd.model": {
-          "type": "string",
-          "default": "",
-          "description": "Selected AI model for generation",
-          "order": 2
-        }
-      }
-    },
     "viewsContainers": {
-      "panel": [
+      "secondarySidebar": [
         {
-          "id": "getaibd-panel",
+          "id": "getaibd",
           "title": "GetAIBD",
           "icon": "media/icon.svg"
         }
       ]
     },
     "views": {
-      "getaibd-panel": [
+      "getaibd": [
         {
-          "id": "getaibd.agentView",
-          "name": "GetAIBD Agent",
+          "id": "getaibd.chatView",
+          "name": "Chat",
           "type": "webview"
         }
       ]
     },
     "commands": [
       {
-        "command": "getaibd.refreshModels",
-        "title": "GetAIBD: Refresh Models"
+        "command": "getaibd.openChat",
+        "title": "GetAIBD: Open Chat"
+      },
+      {
+        "command": "getaibd.newChat",
+        "title": "GetAIBD: New Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "getaibd.openAgent",
+        "title": "GetAIBD: Open Agent"
+      },
+      {
+        "command": "getaibd.completeSelection",
+        "title": "GetAIBD: Complete Selection"
+      },
+      {
+        "command": "getaibd.explainSelection",
+        "title": "GetAIBD: Explain Selection"
+      },
+      {
+        "command": "getaibd.generateTests",
+        "title": "GetAIBD: Generate Tests"
       },
       {
         "command": "getaibd.openSettings",
-        "title": "GetAIBD: Open Settings"
+        "title": "GetAIBD: Open Settings",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "getaibd.setApiKey",
+        "title": "GetAIBD: Set API Key"
+      },
+      {
+        "command": "getaibd.restartEngine",
+        "title": "GetAIBD: Restart Engine"
+      },
+      {
+        "command": "getaibd.refreshBalance",
+        "title": "GetAIBD: Refresh Credit Balance"
+      },
+      {
+        "command": "getaibd.useFree",
+        "title": "GetAIBD: Use Free Tier"
+      },
+      {
+        "command": "getaibd.acceptActiveDiff",
+        "title": "GetAIBD: Accept Agent Edit",
+        "icon": "$(check)"
+      },
+      {
+        "command": "getaibd.rejectActiveDiff",
+        "title": "GetAIBD: Reject Agent Edit",
+        "icon": "$(discard)"
       }
-    ]
+    ],
+    "keybindings": [
+      {
+        "command": "getaibd.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "getaibd.completeSelection",
+        "key": "ctrl+shift+k",
+        "mac": "cmd+shift+k"
+      },
+      {
+        "command": "getaibd.openSettings",
+        "key": "ctrl+shift+,",
+        "mac": "cmd+shift+,"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "getaibd.acceptActiveDiff",
+          "when": "getaibd.diffOpen",
+          "group": "navigation@1"
+        },
+        {
+          "command": "getaibd.rejectActiveDiff",
+          "when": "getaibd.diffOpen",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "getaibd.explainSelection",
+          "when": "editorHasSelection",
+          "group": "getaibd"
+        },
+        {
+          "command": "getaibd.completeSelection",
+          "when": "editorHasSelection",
+          "group": "getaibd"
+        },
+        {
+          "command": "getaibd.generateTests",
+          "group": "getaibd"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "GetAIBD",
+      "properties": {
+        "getaibd.apiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Deprecated: set your key via the **GetAIBD: Set API Key** command instead. Keys are now stored securely in the OS keychain (SecretStorage), not in settings. Any value here is migrated on startup and then cleared.",
+          "markdownDeprecationMessage": "Use the **GetAIBD: Set API Key** command — keys are stored securely in SecretStorage.",
+          "order": 1
+        },
+        "getaibd.model": {
+          "type": "string",
+          "default": "qwen-flash",
+          "description": "Default model id. 'qwen-flash' is free; other models use your GetAIBD credit balance.",
+          "order": 2
+        },
+        "getaibd.memory": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the agent's project memory and codebase indexing. The memory database is stored in the extension's storage, not your project.",
+          "order": 2
+        },
+        "getaibd.baseUrl": {
+          "type": "string",
+          "default": "https://getaibd.com/v1/api",
+          "description": "GetAIBD OpenAI-compatible base URL the engine routes requests through.",
+          "order": 3
+        },
+        "getaibd.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:39377",
+          "description": "Local address the GetAIBD engine binds to. Change the port if 39377 is in use.",
+          "order": 4
+        },
+        "getaibd.enginePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to the GetAIBD engine binary. Leave empty to use the bundled binary or a local engine/target build.",
+          "order": 5
+        },
+        "getaibd.fileContext.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically attach the open file's content to chat messages."
+        },
+        "getaibd.inlineCompletions.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable inline ghost-text completions."
+        },
+        "getaibd.inlineCompletions.provider": {
+          "type": "string",
+          "default": "getaibd",
+          "description": "Provider for inline completions."
+        },
+        "getaibd.inlineCompletions.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model for inline completions (leave empty to use the default model)."
+        },
+        "getaibd.editReview.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open each file in the editor as the agent edits it, with inline Accept/Reject."
+        },
+        "getaibd.chat.defaultProvider": {
+          "type": "string",
+          "default": "getaibd",
+          "description": "Default provider for chat."
+        },
+        "getaibd.chat.defaultModel": {
+          "type": "string",
+          "default": "qwen-flash",
+          "description": "Default model for chat. 'qwen-flash' is free; other models require your own provider API key."
+        },
+        "getaibd.chat.defaultMode": {
+          "type": "string",
+          "default": "agent",
+          "enum": [
+            "agent",
+            "plan",
+            "ask",
+            "debug"
+          ],
+          "description": "Default mode when opening the chat panel."
+        },
+        "getaibd.agent.maxIterations": {
+          "type": "number",
+          "default": 25,
+          "description": "Maximum iterations (model calls) per agent task. Lower values cap cost and runaway loops."
+        },
+        "getaibd.agent.toolTimeout": {
+          "type": "number",
+          "default": 300,
+          "description": "Tool execution timeout in seconds."
+        },
+        "getaibd.agent.autoMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "ask",
+            "plan",
+            "agent",
+            "debug"
+          ],
+          "description": "Agent mode selection (auto = detect from the prompt)."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
@@ -73,23 +264,20 @@
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "package": "npm run check-types && npm run lint && node esbuild.js --production",
-    "compile-tests": "tsc -p . --outDir out",
-    "watch-tests": "tsc -p . -w --outDir out",
-    "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "engine:build": "cargo build --release --manifest-path engine/Cargo.toml"
   },
   "devDependencies": {
-    "@types/vscode": "^1.125.0",
-    "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "typescript-eslint": "^8.56.1",
-    "eslint": "^9.39.3",
+    "@types/vscode": "^1.106.0",
     "esbuild": "^0.27.3",
+    "eslint": "^9.39.3",
     "npm-run-all": "^4.1.5",
     "typescript": "^5.9.3",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2"
+    "typescript-eslint": "^8.56.1"
+  },
+  "dependencies": {
+    "marked": "^14.1.4"
   }
 }
