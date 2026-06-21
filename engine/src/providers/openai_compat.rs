@@ -41,8 +41,14 @@ impl OpenAiCompatProvider {
         let base_url = base_url.trim_end_matches('/').to_string();
 
         Self {
+            // Long generations (high reasoning, big outputs) must not be killed mid-stream,
+            // so we avoid a short total timeout. Instead: fail fast on a dead connection
+            // (connect), fail on an idle/hung stream (read_timeout resets on every token),
+            // and keep only a very generous absolute backstop.
             client: Client::builder()
-                .timeout(Duration::from_secs(timeout_secs))
+                .connect_timeout(Duration::from_secs(30))
+                .read_timeout(Duration::from_secs(timeout_secs))
+                .timeout(Duration::from_secs(1800))
                 .build()
                 .unwrap_or_default(),
             base_url,

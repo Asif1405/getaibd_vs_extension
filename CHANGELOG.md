@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.17]
+
+- Long-running model calls are no longer cut off. The engine used to apply a 60s total timeout to each request, which killed any single step whose generation ran longer (heavy reasoning, large outputs). It now uses a connect timeout + an idle/read timeout that resets on every token, so an actively streaming response can take as long as it needs — only a genuinely stalled or dead connection fails.
+
 ## [0.4.16]
 
 - Further reduced mid-task stops. The "you replied without calling a tool" nudge budget is now counted per *consecutive* narration and refills whenever the agent actually does work — previously a few narrations anywhere in a run would make it give up the moment it next paused. Bumped the budget and strengthened the agent's "run to completion, don't yield with work remaining" instruction.

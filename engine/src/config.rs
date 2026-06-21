@@ -160,7 +160,11 @@ fn default_port() -> u16 {
     3333
 }
 fn default_timeout() -> u64 {
-    60
+    // Idle/read timeout: max seconds with no bytes from the model before we treat the
+    // stream as dead. Active generations reset this on every token, so a long-but-live
+    // response is never cut off; only a truly stalled connection fails. Generous enough
+    // to tolerate a slow first token on heavy reasoning / buffering gateways.
+    300
 }
 fn default_retries() -> u32 {
     3
