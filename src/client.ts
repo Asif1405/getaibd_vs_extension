@@ -250,6 +250,8 @@ export interface AgentCallbacks {
   onContextCompressed?: (content: string) => void;
   onFileEdit?: (edit: FileEdit) => void;
   onStepLimit?: () => void;
+  /** A provisional assistant draft was superseded; drop the last streamed assistant text. */
+  onDiscardDraft?: () => void;
 }
 
 export interface FileEdit {
@@ -467,6 +469,9 @@ function processAgentEvent(
         break;
       case "step_limit":
         callbacks.onStepLimit?.();
+        break;
+      case "discard_draft":
+        callbacks.onDiscardDraft?.();
         break;
       case "file_edit": {
         try {

@@ -1,55 +1,29 @@
-# GetAIBD — AI coding agent for Bangladeshi developers
+# GetAIBD — AI coding agent for VS Code
 
-GetAIBD is an AI coding agent for VS Code, built for Bangladeshi developers. The
-extension embeds a high-performance Rust agent engine (chat, agent loop,
-multi-mode orchestration, RAG memory, patch apply/revert, tool calling) and
-routes **all** inference and embeddings through your GetAIBD account using a
-single API key — billed in BDT to one balance, with no markup.
+GetAIBD brings an AI coding agent right into your editor: chat with your
+codebase, make multi-file edits with inline review, and hand off whole tasks to
+an autonomous agent — all with a single GetAIBD account, billed in BDT to one
+balance.
 
-Under the hood it is the merge of two projects:
+## Features
 
-- The Rust agent engine (adapted from `universal-mcp`), kept under `engine/`.
-- The GetAIBD VS Code extension (the gate: API key, GetAIBD branding, and the
-  engine lifecycle), kept under `src/`.
-
-## Architecture
-
-```
-VS Code  ──spawns──▶  engine/ (getaibd-agent, Rust)  ──HTTPS──▶  getaibd.com/v1/api
-   src/ (extension)        local 127.0.0.1:39377            (chat + embeddings)
-```
-
-- The extension reads `getaibd.apiKey` and spawns the local engine binary with
-  `GETAIBD_API_KEY` / `GETAIBD_BASE_URL` set.
-- With those env vars present, the engine registers **GetAIBD as the sole
-  provider** (chat) and embedding source, and disables the other built-in
-  providers — this is the GetAIBD gate.
-- The extension talks to the engine over HTTP at `getaibd.serverUrl`
-  (default `http://127.0.0.1:39377`).
-
-## Build
-
-Prerequisites: Node.js 20+, Rust (stable), VS Code 1.125+.
-
-```bash
-# 1. Build the Rust engine (produces engine/target/release/getaibd-agent)
-npm run engine:build
-
-# 2. Build the extension bundle (dist/extension.js)
-npm install
-npm run compile
-```
-
-For packaging, copy the engine binary for the target platform into `bin/`
-(`bin/getaibd-agent` or `bin/getaibd-agent.exe`); the extension prefers a
-bundled binary, then falls back to `engine/target/{release,debug}` for local
-development, then to the `getaibd.enginePath` override.
+- **Chat & agent in the sidebar** — ask questions, get explanations, or let the
+  agent plan and carry out changes end to end.
+- **Multi-file edits with review** — every change opens in your editor with
+  inline Accept/Reject, so you stay in control.
+- **Modes** — `agent`, `plan`, `ask`, and `debug`, or `auto` to pick the best
+  fit for your prompt.
+- **Project-aware** — understands the file you're working on and your project
+  for more relevant answers.
+- **Quick code actions** — complete a selection, explain code, or generate
+  tests from the editor context menu.
+- **One key, one balance** — pay in Taka, use your credits across models.
 
 ## Getting started
 
 1. Create an account and subscription at [getaibd.com](https://www.getaibd.com).
 2. Generate an API key from the **Integration** dashboard.
-3. In VS Code, run **GetAIBD: Set API Key** (or set `getaibd.apiKey` in Settings).
+3. In VS Code, run **GetAIBD: Set API Key**.
 4. Open the agent with **GetAIBD: Open Chat** (`Cmd/Ctrl+Shift+A`).
 
 ## Commands
@@ -63,18 +37,16 @@ development, then to the `getaibd.enginePath` override.
 | `GetAIBD: Generate Tests` | Generate unit tests |
 | `GetAIBD: Open Settings` | Open the in-panel settings |
 | `GetAIBD: Set API Key` | Store the GetAIBD API key |
-| `GetAIBD: Restart Engine` | Restart the local engine |
 
 ## Settings
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `getaibd.apiKey` | `""` | GetAIBD API key (the only required credential) |
-| `getaibd.model` | `""` | Default model id |
-| `getaibd.baseUrl` | `https://getaibd.com/v1/api` | GetAIBD OpenAI-compatible base URL |
-| `getaibd.serverUrl` | `http://127.0.0.1:39377` | Local engine bind address |
-| `getaibd.enginePath` | `""` | Optional path to the engine binary |
+| `getaibd.model` | `qwen-flash` | Default model id |
+| `getaibd.memory` | `true` | Enable project memory for more relevant context |
+| `getaibd.fileContext.enabled` | `true` | Attach the open file to chat messages |
 | `getaibd.agent.autoMode` | `auto` | `auto`/`ask`/`plan`/`agent`/`debug` |
+| `getaibd.agent.maxIterations` | `25` | Max model calls per agent task |
 
 ## Support
 

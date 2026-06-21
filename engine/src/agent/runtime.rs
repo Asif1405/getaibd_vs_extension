@@ -56,6 +56,10 @@ pub enum AgentEventKind {
     AskRequired,
     /// The run stopped because it reached the step-limit brake; the user can continue.
     StepLimitReached,
+    /// A provisional assistant message that was already streamed is being superseded
+    /// (e.g. the completion reviewer decided more work is needed). The client should
+    /// drop the last streamed assistant draft so it is not shown as a duplicate.
+    DiscardDraft,
 }
 
 pub struct AgentResult {
@@ -286,9 +290,6 @@ async fn agent_loop(
     let mut force_continue = 0u32;
     let mut tool_calls_total = 0usize;
     let mut tool_calls_at_last_force = 0usize;
-    // Progress point at which the worker last self-assessed completion, so we ask it to
-    // double-check itself at most once per batch of work before escalating to the reviewer.
-    let mut self_checked_at: Option<usize> = None;
 
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
@@ -449,33 +450,11 @@ async fn agent_loop(
                 continue;
             }
 
-            // Auto-complete, step 1: ask the WORKER itself to honestly re-check its work against
-            // the original task before we finish. This is cheap (a normal worker turn with tools)
-            // and the model often catches its own omissions. Done at most once per batch of work
-            // (guarded by self_checked_at) so it can't self-loop, and only after real tool work.
-            if auto_complete
-                && !looks_like_user_question(content_txt)
-                && tool_calls_total > 0
-                && self_checked_at != Some(tool_calls_total)
-            {
-                self_checked_at = Some(tool_calls_total);
-                on_event(AgentEvent {
-                    kind: AgentEventKind::Reflecting,
-                    content: Some("Double-checking the task is fully complete…".into()),
-                });
-                session.push_message(ToolMessage::system(
-                    "Before you stop: re-read the ORIGINAL task and honestly verify that EVERY part \
-                     is actually done — files written, commands run, edits applied and verified — not \
-                     merely described. If anything is missing or incomplete, keep working NOW by \
-                     calling the appropriate tools. Only if everything is genuinely complete, reply \
-                     with a short final summary and no tool calls.",
-                ));
-                continue;
-            }
-
-            // Auto-complete, step 2: the worker still says it's done. A strict reviewer (same model)
-            // independently checks the result against the ORIGINAL task. If work remains, force the
-            // agent to keep going. Bounded by MAX_FORCE_CONTINUE and a no-progress guard.
+            // Auto-complete: the worker says it's done. A strict reviewer (same model)
+            // independently checks the result against the ORIGINAL task. If everything is
+            // genuinely complete the agent QUITS immediately with this summary (no extra
+            // re-summarization round). Only when real work is still missing do we force it to
+            // keep going. Bounded by MAX_FORCE_CONTINUE and a no-progress guard.
             if auto_complete
                 && !looks_like_user_question(content_txt)
                 && force_continue < MAX_FORCE_CONTINUE
@@ -495,6 +474,12 @@ async fn agent_loop(
                     force_continue += 1;
                     tool_calls_at_last_force = tool_calls_total;
                     nudge_count = 0;
+                    // The summary we just streamed is being superseded by more work — tell the
+                    // client to drop it so the user never sees a duplicate "done" message.
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::DiscardDraft,
+                        content: None,
+                    });
                     let remaining = format_missing(&verdict.missing);
                     on_event(AgentEvent {
                         kind: AgentEventKind::Reflecting,

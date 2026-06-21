@@ -859,6 +859,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onContextCompressed: (content) => {
         this.post({ type: "agentContextCompressed", content });
       },
+      onDiscardDraft: () => {
+        this.post({ type: "agentDiscardDraft" });
+      },
       onFileEdit: (edit) => {
         this.handleFileEdit(edit);
       },
@@ -945,6 +948,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       },
       onStepLimit: () => {
         this.stepLimitHit = true;
+      },
+      onDiscardDraft: () => {
+        this.post({ type: "agentDiscardDraft" });
       },
       onFileEdit: (edit) => {
         this.handleFileEdit(edit);
@@ -4049,6 +4055,16 @@ window.addEventListener("message", (event) => {
       scrollToBottom();
       break;
     }
+
+    case "agentDiscardDraft":
+      // A provisional "done" summary was superseded by more work — remove the
+      // bubble that was just streamed so the user never sees a duplicate.
+      if (agentTextEl) {
+        agentTextEl.remove();
+      }
+      agentTextEl = null;
+      agentTextContent = "";
+      break;
 
     case "agentDone":
       finalizeThought();

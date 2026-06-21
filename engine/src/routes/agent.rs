@@ -229,6 +229,9 @@ fn agent_event_to_sse(
         AgentEventKind::StepLimitReached => {
             Some(Event::default().event("step_limit").data(data))
         }
+        AgentEventKind::DiscardDraft => {
+            Some(Event::default().event("discard_draft").data(""))
+        }
     }
 }
 
