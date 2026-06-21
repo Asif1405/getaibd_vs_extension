@@ -1747,6 +1747,36 @@ body {
 .md th { background: var(--list-hover); font-weight: 600; }
 .md img { max-width: 100%; border-radius: 6px; }
 
+/* Per-block copy header injected around fenced code blocks. */
+.code-block {
+  margin: 0 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.code-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 6px 2px 10px;
+  background: var(--list-hover);
+  border-bottom: 1px solid var(--border);
+}
+.code-block-lang { font-size: 10px; color: var(--muted); text-transform: lowercase; }
+.code-copy-btn {
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 16px;
+}
+.code-copy-btn:hover { color: var(--fg); border-color: var(--fg); }
+.md .code-block pre { margin: 0; border: none; border-radius: 0; }
+
 .message code {
   background: var(--code-bg);
   padding: 1px 5px;
@@ -3108,6 +3138,7 @@ function addMessage(role, content, opts) {
     ? '<div class="md">' + mdToHtml(content) + "</div>"
     : escapeHtml(content);
   div.innerHTML = '<span class="role-label">' + role + "</span>" + body;
+  if (role === "assistant") enhanceCodeBlocks(div);
   if (role === "assistant" && content) appendActionBtns(div, content);
   if (opts && opts.canRestore && opts.turnId) appendRestoreBtn(div, opts.turnId);
   messagesEl.appendChild(div);
@@ -3150,6 +3181,45 @@ function appendActionBtns(container, rawContent) {
 
 function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/* Wrap each fenced code block in the rendered markdown with a header that has a
+   per-block Copy button. Idempotent: skips blocks already wrapped. */
+function enhanceCodeBlocks(root) {
+  if (!root) return;
+  const pres = root.querySelectorAll(".md pre");
+  for (let i = 0; i < pres.length; i++) {
+    const pre = pres[i];
+    if (pre.parentElement && pre.parentElement.classList.contains("code-block")) continue;
+    const codeEl = pre.querySelector("code");
+    const codeText = codeEl ? codeEl.textContent : pre.textContent;
+    let lang = "code";
+    if (codeEl && codeEl.className) {
+      const m = /language-([\w+#.-]+)/.exec(codeEl.className);
+      if (m) lang = m[1];
+    }
+    const wrap = document.createElement("div");
+    wrap.className = "code-block";
+    const head = document.createElement("div");
+    head.className = "code-block-head";
+    const langSpan = document.createElement("span");
+    langSpan.className = "code-block-lang";
+    langSpan.textContent = lang;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "code-copy-btn";
+    btn.textContent = "Copy";
+    btn.addEventListener("click", () => {
+      vscode.postMessage({ type: "copy", content: codeText });
+      btn.textContent = "Copied";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    });
+    head.appendChild(langSpan);
+    head.appendChild(btn);
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(head);
+    wrap.appendChild(pre);
+  }
 }
 
 function mdToHtml(text) {
@@ -3653,6 +3723,7 @@ window.addEventListener("message", (event) => {
       if (streamEl) {
         streamContent += msg.content;
         streamEl.innerHTML = '<span class="role-label">assistant</span><div class="md">' + mdToHtml(streamContent) + "</div>";
+        enhanceCodeBlocks(streamEl);
         scrollToBottom();
       }
       break;
@@ -3845,6 +3916,7 @@ window.addEventListener("message", (event) => {
         agentTextEl = addMessage("assistant", "");
       }
       agentTextEl.innerHTML = '<span class="role-label">assistant</span><div class="md">' + mdToHtml(clean) + "</div>";
+      enhanceCodeBlocks(agentTextEl);
       scrollToBottom();
       break;
     }

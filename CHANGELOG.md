@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.19]
+
+- Every code block in a chat reply now has its own **Copy** button in a small header (with the language label), so you can grab a single snippet without selecting it by hand or copying the whole message.
+
 ## [0.4.18]
 
 - The agent now **auto-continues until the task is truly done** instead of stopping early and waiting for a Continue click. When it thinks it's finished, it first **self-checks** its work against your original request, and then a strict **reviewer** (same model) independently confirms completion — if anything is missing, the agent keeps working on its own. Safety rails keep this bounded: it only kicks in after real work, never interrupts plain answers or questions, caps forced continuations, and falls back to the manual Continue button if it ever hits that cap. (Agent and Debug modes; Plan/Ask still yield as before.)
