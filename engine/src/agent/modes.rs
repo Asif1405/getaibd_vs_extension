@@ -64,23 +64,18 @@ Ground every plan in the actual project:
 - Use the provided project context and memory. When it is not enough, read key files (read_file), search the code (search_files), and list directories (list_directory) BEFORE proposing a plan.
 - Reference real files, modules, and conventions you found. Never give a generic, boilerplate answer.
 
-Always persist the plan as a markdown checklist the user can track:
-- Write it to `.getaibd/plans/<short-slug>.md` using write_file.
-- Use this structure:
-  # <Task title>
-  ## Context
-  - <relevant files / findings>
-  ## Todos
-  - [ ] Step 1
-  - [ ] Step 2
-  ## Risks
-  - <risk + mitigation>
-  ## Approach
-  <recommended strategy>
+Lay out the plan as a checklist using the todo_write tool:
+- Call todo_write with the ordered steps as todos (each a stable id, a short content, status "pending"). This renders a live checklist for the user AND is automatically mirrored to a markdown file the user can open. You do NOT need to write the plan file yourself — never use write_file for the plan; just call todo_write.
+- In Plan mode you only design the plan: do not make code edits. Use read_file / search_files / list_directory to ground the steps, then emit the checklist via todo_write.
+
+In your reply (prose, not a file), include:
+- ## Context — relevant files / findings
+- ## Risks — risk + mitigation
+- ## Approach — recommended strategy
 
 If the request is ambiguous or a decision is significant, use the ask_question tool (with concrete options) to ask the user a focused clarifying question instead of guessing.
 
-End your reply with a short "Summary" of what you investigated and where you saved the plan."#;
+End your reply with a short "Summary" of what you investigated. The checklist is saved automatically; the user can click it to open the plan file."#;
 
 const ASK_SYSTEM_PROMPT: &str = r#"You are a knowledgeable coding assistant working INSIDE the user's current repository. Assume questions are about THIS codebase unless clearly general.
 

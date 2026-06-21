@@ -14,6 +14,7 @@ import {
   testProviderConnection,
   type ChatMessage,
   type FileEdit,
+  type TodoItem,
 } from "../client";
 import { scanText, formatWarning } from "../safetype/detector";
 import { ensureEngine, restartEngine } from "../engine/manager";
@@ -189,6 +190,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private lastDiffPath: string | undefined;
   private currentTurnId: string | undefined;
   private stepLimitHit = false;
+  private planTodoPath: string | undefined;
   private agentTerminal = new AgentTerminal(vscode.workspace.workspaceFolders?.[0]?.uri);
   private activeTerminalReq: { requestId: string; sessionId: string | undefined } | undefined;
 
@@ -478,6 +480,11 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         break;
       case "askResponse":
         if (msg.requestId) {await this.resolveAsk(msg.requestId as string, (msg.answer as string) ?? "");}
+        break;
+      case "openTodoFile":
+        if (msg.path) {
+          await vscode.window.showTextDocument(vscode.Uri.file(msg.path as string), { preview: true });
+        }
         break;
       case "removeAlwaysAllow":
         if (msg.tool) {
@@ -817,6 +824,43 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.streamToPanel(provider, model, messages, apiKey);
   }
 
+  /**
+   * Plan mode only: mirror the live checklist into a Markdown file under
+   * `<workspace>/.getaibd/plans/` so the inline card can be opened in the editor.
+   * Only the latest plan file is kept; older ones are pruned to stay small.
+   * Returns the fsPath of the plan file, or undefined if it could not be written.
+   */
+  private async persistPlanTodos(todos: TodoItem[]): Promise<string | undefined> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {return undefined;}
+    const plansDir = vscode.Uri.joinPath(folder.uri, ".getaibd", "plans");
+    try {
+      await vscode.workspace.fs.createDirectory(plansDir);
+      if (!this.planTodoPath) {
+        // New plan run: prune any leftover plan files before creating this one.
+        try {
+          const entries = await vscode.workspace.fs.readDirectory(plansDir);
+          for (const [name, fileType] of entries) {
+            if (fileType === vscode.FileType.File && name.endsWith(".md")) {
+              await vscode.workspace.fs
+                .delete(vscode.Uri.joinPath(plansDir, name))
+                .then(undefined, () => {});
+            }
+          }
+        } catch {
+          // directory may be empty/unreadable; ignore
+        }
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        this.planTodoPath = vscode.Uri.joinPath(plansDir, `plan-${stamp}.md`).fsPath;
+      }
+      const uri = vscode.Uri.file(this.planTodoPath);
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(planTodosMarkdown(todos), "utf8"));
+      return this.planTodoPath;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async sendAgentTask(provider: string, model: string, task: string) {
     if (!(await this.checkSecrets(task))) {return;}
     this.history.push({ kind: "message", role: "user", content: task });
@@ -902,6 +946,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   ) {
     if (!(await this.checkSecrets(text))) {return;}
     this.stepLimitHit = false;
+    this.planTodoPath = undefined;
     const priorHistory = [...this.buildFileContext(), ...this.conversationMessages()];
     const turnId = newId();
     this.currentTurnId = turnId;
@@ -959,7 +1004,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.handleFileEdit(edit);
       },
       onTodoUpdate: (todos) => {
-        this.post({ type: "agentTodoUpdate", todos });
+        if (mode === "plan") {
+          void this.persistPlanTodos(todos).then((planPath) => {
+            this.post({ type: "agentTodoUpdate", todos, planPath });
+          });
+        } else {
+          this.post({ type: "agentTodoUpdate", todos });
+        }
       },
       onDone: (content) => {
         const clean = stripThinking(content);
@@ -1521,6 +1572,20 @@ function newId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+function planTodosMarkdown(todos: TodoItem[]): string {
+  const lines = ["# Plan", ""];
+  for (const t of todos) {
+    const status = t?.status || "pending";
+    const box = status === "completed" ? "[x]" : "[ ]";
+    let text = t?.content || "";
+    if (status === "in_progress") {text = `${text} _(in progress)_`;}
+    if (status === "cancelled") {text = `~~${text}~~`;}
+    lines.push(`- ${box} ${text}`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
 function looksLikePatch(text: string): boolean {
   return (text.includes('"edits"') || text.includes('"plan"')) && text.includes('"file"') && text.includes('"operation"');
 }
@@ -2058,8 +2123,12 @@ body {
 
 /* ── Todo checklist ── */
 .todo-card { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 6px 0; font-size: 12px; }
+.todo-card.todo-clickable { cursor: pointer; }
+.todo-card.todo-clickable:hover { border-color: var(--accent, #4a9eff); }
 .todo-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.todo-right { display: flex; align-items: center; gap: 8px; }
 .todo-title { font-weight: 600; color: var(--fg); letter-spacing: 0.02em; }
+.todo-open { color: var(--accent, #4a9eff); font-size: 11px; opacity: 0.85; }
 .todo-count { color: var(--muted); font-variant-numeric: tabular-nums; }
 .todo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
 .todo-item { display: flex; align-items: flex-start; gap: 8px; line-height: 1.45; }
@@ -3466,7 +3535,7 @@ function diffBodyHtml(diff) {
   return html;
 }
 
-function renderTodos(todos) {
+function renderTodos(todos, planPath) {
   if (!Array.isArray(todos) || todos.length === 0) {
     if (todoCardEl) { todoCardEl.style.display = "none"; }
     return;
@@ -3492,11 +3561,22 @@ function renderTodos(todos) {
       + '<span class="todo-text">' + escapeHtml((t && t.content) || "") + '</span>'
       + '</li>';
   }
+  const openHint = planPath ? '<span class="todo-open">Open plan</span>' : '';
   const header = '<div class="todo-head">'
     + '<span class="todo-title">Tasks</span>'
+    + '<span class="todo-right">' + openHint
     + '<span class="todo-count">' + done + '/' + todos.length + '</span>'
+    + '</span>'
     + '</div>';
   todoCardEl.innerHTML = header + '<ul class="todo-list">' + rows + '</ul>';
+  if (planPath) {
+    todoCardEl.classList.add("todo-clickable");
+    todoCardEl.title = "Open plan file";
+    todoCardEl.onclick = () => vscode.postMessage({ type: "openTodoFile", path: planPath });
+  } else {
+    todoCardEl.classList.remove("todo-clickable");
+    todoCardEl.onclick = null;
+  }
   // Keep the checklist pinned to the bottom as it grows.
   messagesEl.appendChild(todoCardEl);
 }
@@ -3999,7 +4079,7 @@ window.addEventListener("message", (event) => {
 
     case "agentTodoUpdate": {
       agentTextEl = null;
-      renderTodos(msg.todos);
+      renderTodos(msg.todos, msg.planPath);
       break;
     }
     case "fileEdit": {

@@ -4,6 +4,15 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.26]
+
+- **Plan checklists are now openable files.** In Plan mode the task checklist is
+  mirrored to a Markdown file under `.getaibd/plans/` (git-ignored) — click the
+  checklist card in the chat to open the plan in the editor. Only the latest plan
+  file is kept; older ones are pruned automatically so it stays tiny. Agent mode is
+  unchanged: its checklist stays inline and writes nothing to disk. Memory continues
+  to live in global storage.
+
 ## [0.4.25]
 
 - **Live task checklist.** For larger tasks the agent now maintains a real,
