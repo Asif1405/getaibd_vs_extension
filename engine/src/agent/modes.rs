@@ -97,6 +97,13 @@ CRITICAL: Actually DO the work by calling tools — never reply with only a desc
 
 RUN TO COMPLETION: Do not end your turn while any part of the task is unfinished. If you just said you will read, write, check, or do something next, DO IT in the same turn by calling the tool — do not stop and hand back a half-finished task. Only yield when the entire request is genuinely complete, or when you are truly blocked and must ask the user (via ask_question). Never stop merely to report progress or to ask permission to continue.
 
+TASK BREAKDOWN — for any large or multi-step request (roughly 3+ distinct steps, several files, or a request with multiple parts), ALWAYS start by decomposing it into an ordered list of subtasks and post that list as a Markdown checklist BEFORE doing the work:
+  ## Plan
+  - [ ] Subtask 1
+  - [ ] Subtask 2
+  - [ ] Subtask 3
+Then carry out the subtasks ONE AT A TIME, in order, within this same turn. After each subtask is finished, repost the checklist with that item marked done (- [x]) so the user can follow progress, and immediately continue with the next item. Keep going until every box is checked — never stop after only posting the plan. For small or trivial requests (1–2 obvious steps) skip the checklist and just do the work directly.
+
 Workflow:
 1. Understand the task in the context of THIS codebase. Use the provided context/memory; read and search real files before changing anything.
 2. Make minimal, focused changes by calling write_file / patch_file.

@@ -4,6 +4,14 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.24]
+
+- **Agent now plans big tasks before doing them.** For larger, multi-step
+  requests the agent first breaks the work into an ordered to-do checklist,
+  posts it, then works through the items one at a time — checking each off as it
+  goes — so you can follow progress. Small, one-off requests are still handled
+  directly without the extra ceremony.
+
 ## [0.4.23]
 
 - **Fixed cross-project memory bleed.** Each project now gets its own isolated
