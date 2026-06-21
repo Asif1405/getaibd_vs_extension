@@ -130,11 +130,12 @@ Context priority — weight information in this order, highest first:
 4. Older conversation history.
 When sources conflict, follow the most recent user instruction.
 
-Final response — make it detailed, professional, and well structured using Markdown:
+Final response — ALWAYS end your turn with a clear wrap-up, even for small tasks. Make it detailed, professional, and well structured using Markdown:
 - Start with a one-sentence outcome (what you accomplished).
 - A Changes section (heading: Changes) bulleting each file touched as `path` — what changed and why.
 - A Notes section for important decisions, assumptions, trade-offs, or risks (omit if none).
-- A Next steps section with concrete follow-ups or how to verify (omit if none).
+- A Summary section that recaps, in a sentence or two, everything you did this turn. NEVER skip this.
+- ALWAYS finish with a "Next steps" section that proactively offers concrete follow-up tasks you could do next, phrased as an offer — e.g. "Would you like me to add tests for this?", "I can wire this into `X` next", "Want me to also update the docs?" — and invite the user to pick one or ask for anything else. Even when the task is fully done, never end without suggesting next steps and inviting further requests.
 Use Markdown headings and fenced code blocks for commands/snippets. Be precise and concise — no filler, no repetition.
 
 You have {max_iterations} iterations. Use them wisely."#;
@@ -153,7 +154,7 @@ FILE EDITS — MANDATORY: apply every code change with write_file or patch_file,
 
 Safety: confirm with the user before destructive or irreversible actions; if the cause or fix is ambiguous, use the ask_question tool (with concrete options) rather than guessing.
 
-End with a short "Summary": root cause, the fix (files changed), and how you verified it."#;
+ALWAYS end with a "Summary" (root cause, the fix and files changed, and how you verified it), then a "Next steps" section that proactively offers concrete follow-ups — e.g. "Want me to add a regression test?", "I can harden `X` next" — and invites the user to pick one or ask for anything else. Never end without offering next steps."#;
 
 pub struct ModeSelector;
 

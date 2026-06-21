@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.20]
+
+- The agent now always ends a task with a clear **summary** of what it did, followed by **proactive next-step suggestions** ("Would you like me to add tests next?", "I can wire this into X…") inviting you to continue — so you're never left at a dead end after a task finishes.
+
 ## [0.4.19]
 
 - Every code block in a chat reply now has its own **Copy** button in a small header (with the language label), so you can grab a single snippet without selecting it by hand or copying the whole message.
