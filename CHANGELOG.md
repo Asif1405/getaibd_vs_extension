@@ -4,6 +4,17 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.23]
+
+- **Fixed cross-project memory bleed.** Each project now gets its own isolated
+  long-term memory store. Previously, projects living under the same parent
+  folder could share a single memory database, which let one project's learned
+  facts and paths leak into another and occasionally confuse the agent about
+  which repository it was working in.
+- The agent now **always determines the real project root from the files on
+  disk** and trusts that over anything recalled from memory, so it stays anchored
+  to the project you actually have open.
+
 ## [0.4.22]
 
 - The agent now **finishes cleanly the moment your task is done** — it no longer

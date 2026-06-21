@@ -192,7 +192,11 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
   if (memoryEnabled) {
     const memDir = path.join(context.globalStoragePath, "memory");
     fs.mkdirSync(memDir, { recursive: true });
-    const key = Buffer.from(projectRoot).toString("hex").slice(0, 40);
+    // Key the per-project memory DB by a hash of the FULL path. The previous
+    // `hex(path).slice(0, 40)` only kept the first 20 characters of the path, so
+    // every project under the same parent dir (e.g. ~/Desktop/*) collided into a
+    // single shared DB — leaking one project's learned facts into another.
+    const key = createHash("sha1").update(projectRoot).digest("hex").slice(0, 16);
     env.MCP_MEMORY_DB_PATH = path.join(memDir, `${key}.db`);
   }
   const model = vscode.workspace
