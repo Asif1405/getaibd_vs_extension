@@ -6,6 +6,7 @@ pub mod edits;
 pub mod env_manager;
 pub mod git;
 pub mod terminal_gate;
+pub mod todo;
 pub mod workspace;
 
 use async_trait::async_trait;
@@ -86,6 +87,7 @@ impl ToolRegistry {
         )));
         registry.register(Arc::new(env_manager::ManageEnv::new(env_mgr)));
         registry.register(Arc::new(ask::AskQuestion::new()));
+        registry.register(Arc::new(todo::TodoWrite::new()));
 
         registry
     }

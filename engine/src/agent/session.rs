@@ -1,7 +1,17 @@
+use serde::Serialize;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::models::ToolMessage;
+
+/// One entry in the agent's structured to-do list for the current task.
+#[derive(Debug, Clone, Serialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    /// One of: pending, in_progress, completed, cancelled.
+    pub status: String,
+}
 
 pub struct Session {
     pub id: String,
@@ -14,6 +24,8 @@ pub struct Session {
     pub reasoning_effort: Option<String>,
     /// Host OS + shell the client runs in, so generated commands match it.
     pub environment: Option<String>,
+    /// Structured to-do list for the current task, maintained via `todo_write`.
+    pub todos: Vec<TodoItem>,
 }
 
 impl Session {
@@ -32,6 +44,7 @@ impl Session {
             system_prompt: None,
             reasoning_effort: None,
             environment: None,
+            todos: Vec::new(),
         }
     }
 

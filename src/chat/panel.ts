@@ -865,6 +865,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onFileEdit: (edit) => {
         this.handleFileEdit(edit);
       },
+      onTodoUpdate: (todos) => {
+        this.post({ type: "agentTodoUpdate", todos });
+      },
       onDone: (content) => {
         const clean = stripThinking(content);
         if (clean) {
@@ -954,6 +957,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       },
       onFileEdit: (edit) => {
         this.handleFileEdit(edit);
+      },
+      onTodoUpdate: (todos) => {
+        this.post({ type: "agentTodoUpdate", todos });
       },
       onDone: (content) => {
         const clean = stripThinking(content);
@@ -2050,6 +2056,22 @@ body {
 .edit-summary .es-keep:hover { opacity: 0.9; }
 .edit-summary .es-undo:hover { border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
 
+/* ── Todo checklist ── */
+.todo-card { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 6px 0; font-size: 12px; }
+.todo-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.todo-title { font-weight: 600; color: var(--fg); letter-spacing: 0.02em; }
+.todo-count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.todo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.todo-item { display: flex; align-items: flex-start; gap: 8px; line-height: 1.45; }
+.todo-mark { flex: 0 0 auto; width: 14px; text-align: center; color: var(--muted); }
+.todo-text { color: var(--fg); }
+.todo-completed .todo-mark { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+.todo-completed .todo-text { color: var(--muted); text-decoration: line-through; }
+.todo-in_progress .todo-mark { color: var(--btn-bg, #3794ff); }
+.todo-in_progress .todo-text { color: var(--fg); font-weight: 600; }
+.todo-cancelled .todo-mark { color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+.todo-cancelled .todo-text { color: var(--muted); text-decoration: line-through; }
+
 /* ── Thinking Blocks ── */
 .thinking-block {
   margin: 4px 0;
@@ -2744,6 +2766,7 @@ let settingsOpen = false;
 let editStats = {};
 let editCardEls = {};
 let editSummaryEl = null;
+let todoCardEl = null;
 let toolGroupEl = null;
 let toolGroupBodyEl = null;
 let toolGroupCount = 0;
@@ -3360,6 +3383,8 @@ function formatToolRow(name, args) {
     case "apply_patch":
     case "edit_file":
       return { hidden: true };
+    case "todo_write":
+      return { hidden: true };
     case "read_file":
       return { verb: "Read", arg: path };
     case "list_directory":
@@ -3439,6 +3464,41 @@ function diffBodyHtml(diff) {
     html += '<div class="fe-line gap">\u22EF diff truncated \u2014 open in editor</div>';
   }
   return html;
+}
+
+function renderTodos(todos) {
+  if (!Array.isArray(todos) || todos.length === 0) {
+    if (todoCardEl) { todoCardEl.style.display = "none"; }
+    return;
+  }
+  if (!todoCardEl) {
+    todoCardEl = document.createElement("div");
+    todoCardEl.className = "todo-card";
+    messagesEl.appendChild(todoCardEl);
+  }
+  todoCardEl.style.display = "";
+  const done = todos.filter((t) => t && t.status === "completed").length;
+  const icon = {
+    completed: "\u2714",
+    in_progress: "\u25D0",
+    cancelled: "\u2715",
+    pending: "\u25CB",
+  };
+  let rows = "";
+  for (const t of todos) {
+    const status = (t && t.status) || "pending";
+    rows += '<li class="todo-item todo-' + status + '">'
+      + '<span class="todo-mark">' + (icon[status] || "\u25CB") + '</span>'
+      + '<span class="todo-text">' + escapeHtml((t && t.content) || "") + '</span>'
+      + '</li>';
+  }
+  const header = '<div class="todo-head">'
+    + '<span class="todo-title">Tasks</span>'
+    + '<span class="todo-count">' + done + '/' + todos.length + '</span>'
+    + '</div>';
+  todoCardEl.innerHTML = header + '<ul class="todo-list">' + rows + '</ul>';
+  // Keep the checklist pinned to the bottom as it grows.
+  messagesEl.appendChild(todoCardEl);
 }
 
 function renderEditSummary() {
@@ -3883,6 +3943,7 @@ window.addEventListener("message", (event) => {
       editStats = {};
       editCardEls = {};
       editSummaryEl = null;
+      todoCardEl = null;
       toolGroupEl = null;
       toolGroupBodyEl = null;
       toolGroupCount = 0;
@@ -3936,6 +3997,11 @@ window.addEventListener("message", (event) => {
       break;
     }
 
+    case "agentTodoUpdate": {
+      agentTextEl = null;
+      renderTodos(msg.todos);
+      break;
+    }
     case "fileEdit": {
       agentTextEl = null;
       closeToolGroup();

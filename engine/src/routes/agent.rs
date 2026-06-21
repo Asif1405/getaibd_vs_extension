@@ -232,6 +232,7 @@ fn agent_event_to_sse(
         AgentEventKind::DiscardDraft => {
             Some(Event::default().event("discard_draft").data(""))
         }
+        AgentEventKind::TodoUpdate => Some(Event::default().event("todo_update").data(data)),
     }
 }
 

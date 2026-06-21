@@ -60,6 +60,9 @@ pub enum AgentEventKind {
     /// (e.g. the completion reviewer decided more work is needed). The client should
     /// drop the last streamed assistant draft so it is not shown as a duplicate.
     DiscardDraft,
+    /// The structured to-do list changed; payload is the full list as JSON. The
+    /// client renders it as a live checklist.
+    TodoUpdate,
 }
 
 pub struct AgentResult {
@@ -1067,6 +1070,63 @@ async fn reflect(session: &Session, provider: &Arc<dyn Provider>) -> Reflection 
     }
 }
 
+/// Applies a `todo_write` call against the session's structured to-do list and
+/// emits a `TodoUpdate` event so the client can render the live checklist.
+fn apply_todo_write(
+    call: &ToolCall,
+    session: &mut Session,
+    on_event: &mut impl FnMut(AgentEvent),
+) -> serde_json::Value {
+    let merge = call
+        .arguments
+        .get("merge")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let incoming: Vec<crate::agent::session::TodoItem> = call
+        .arguments
+        .get("todos")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(parse_todo_item).collect())
+        .unwrap_or_default();
+
+    if merge {
+        for inc in incoming {
+            if let Some(existing) = session.todos.iter_mut().find(|t| t.id == inc.id) {
+                existing.content = inc.content;
+                existing.status = inc.status;
+            } else {
+                session.todos.push(inc);
+            }
+        }
+    } else {
+        session.todos = incoming;
+    }
+
+    let todos_json = serde_json::to_value(&session.todos).unwrap_or(serde_json::Value::Null);
+    on_event(AgentEvent {
+        kind: AgentEventKind::TodoUpdate,
+        content: Some(serde_json::json!({ "todos": todos_json }).to_string()),
+    });
+
+    serde_json::json!({ "ok": true, "todos": todos_json })
+}
+
+/// Parses one to-do item, defaulting a missing/invalid status to "pending".
+fn parse_todo_item(value: &serde_json::Value) -> Option<crate::agent::session::TodoItem> {
+    let id = value.get("id").and_then(serde_json::Value::as_str)?;
+    let content = value.get("content").and_then(serde_json::Value::as_str)?;
+    let status = match value.get("status").and_then(serde_json::Value::as_str) {
+        Some(s @ ("pending" | "in_progress" | "completed" | "cancelled")) => s,
+        _ => "pending",
+    };
+    Some(crate::agent::session::TodoItem {
+        id: id.to_string(),
+        content: content.to_string(),
+        status: status.to_string(),
+    })
+}
+
 async fn execute_tool_calls(
     calls: &[ToolCall],
     registry: &ToolRegistry,
@@ -1094,7 +1154,9 @@ async fn execute_tool_calls(
                     let terminal_gate = options
                         .and_then(|o| o.terminal_gate.as_ref())
                         .filter(|_| call.name == "run_command");
-                    if let Some(gate) = ask_gate {
+                    if call.name == "todo_write" {
+                        apply_todo_write(call, session, on_event)
+                    } else if let Some(gate) = ask_gate {
                         delegate_ask(call, gate, on_event).await
                     } else if let Some(gate) = terminal_gate {
                         delegate_terminal(call, gate, on_event).await
