@@ -1,4 +1,7 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
+import * as crypto from "crypto";
 import {
   fetchProviders,
   fetchModels,
@@ -69,6 +72,97 @@ const MODE_KEY = "getaibd.lastMode";
 const ALWAYS_ALLOW_KEY = "getaibd.alwaysAllowTools";
 const MAX_RECONNECT = 3;
 
+/**
+ * A `Memento`-compatible store backed by a JSON file with **synchronous** writes.
+ *
+ * VS Code's `workspaceState`/`globalState` writes are async and only flushed
+ * lazily; when the extension host is torn down to install an update, a just-
+ * written value can be lost — which is why the most recent chat would vanish
+ * after an update. Writing through to disk synchronously makes each save durable
+ * the moment it happens, so nothing is lost across updates or reloads.
+ */
+class DiskStore implements vscode.Memento {
+  private data: Record<string, unknown> = {};
+
+  constructor(private readonly file: string) {
+    try {
+      this.data = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    } catch {
+      this.data = {};
+    }
+  }
+
+  keys(): readonly string[] {
+    return Object.keys(this.data);
+  }
+
+  get<T>(key: string): T | undefined;
+  get<T>(key: string, defaultValue: T): T;
+  get<T>(key: string, defaultValue?: T): T | undefined {
+    return (Object.prototype.hasOwnProperty.call(this.data, key)
+      ? this.data[key]
+      : defaultValue) as T | undefined;
+  }
+
+  update(key: string, value: unknown): Thenable<void> {
+    if (value === undefined) {
+      delete this.data[key];
+    } else {
+      this.data[key] = value;
+    }
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      // Atomic-ish write: temp file + rename so a crash mid-write can't corrupt
+      // the store (rename is atomic on the same filesystem).
+      const tmp = `${this.file}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(this.data));
+      fs.renameSync(tmp, this.file);
+    } catch {
+      /* best effort — persistence must never crash the chat */
+    }
+    return Promise.resolve();
+  }
+}
+
+/**
+ * Builds the per-workspace session store path under the extension's global
+ * storage (which survives extension updates), keyed by the open workspace so
+ * each project keeps its own conversations.
+ */
+function sessionStoreFile(context: vscode.ExtensionContext): string {
+  const wsId = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "__noworkspace__";
+  const hash = crypto.createHash("sha1").update(wsId).digest("hex").slice(0, 16);
+  return path.join(context.globalStorageUri.fsPath, "chat-sessions", `${hash}.json`);
+}
+
+/**
+ * One-time import of chat sessions/history from the legacy `workspaceState`
+ * store into the durable disk store, so existing conversations carry over.
+ */
+function migrateSessionsFromMemento(disk: DiskStore, legacy: vscode.Memento): void {
+  if (disk.keys().length > 0) {
+    return; // already migrated / has data
+  }
+  let copied = false;
+  for (const key of legacy.keys()) {
+    if (
+      key === SESSIONS_KEY ||
+      key === ACTIVE_SESSION_KEY ||
+      key.startsWith(SESSION_HISTORY_PREFIX)
+    ) {
+      const value = legacy.get(key);
+      if (value !== undefined) {
+        void disk.update(key, value);
+        copied = true;
+      }
+    }
+  }
+  if (!copied) {
+    // Mark as initialised so we don't re-scan legacy state on every launch.
+    void disk.update("getaibd.migrated", true);
+  }
+}
+
 export class ChatPanel implements vscode.WebviewViewProvider {
   static readonly viewType = "getaibd.chatView";
   private static instance: ChatPanel | undefined;
@@ -100,7 +194,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
-    this.sessionStore = context.workspaceState;
+    // Durable, synchronous on-disk store so the latest chat survives extension
+    // updates/reloads (workspaceState writes can be lost when the host is torn
+    // down before they flush). Existing conversations are migrated on first run.
+    const disk = new DiskStore(sessionStoreFile(context));
+    migrateSessionsFromMemento(disk, context.workspaceState);
+    this.sessionStore = disk;
     this.context = context;
     this.store = new ProviderStore(context.globalState, context.secrets);
     this.loadSessions();

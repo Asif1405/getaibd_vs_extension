@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.21]
+
+- Fixed: your **most recent chat could disappear after the extension auto-updated**. Chat sessions and history are now kept in a durable on-disk store that's written synchronously on every change, instead of relying on VS Code's lazily-flushed workspace state (which could lose the latest write when the extension host was torn down for an update). Conversations now survive updates and reloads, and existing chats are migrated over automatically.
+
 ## [0.4.20]
 
 - The agent now always ends a task with a clear **summary** of what it did, followed by **proactive next-step suggestions** ("Would you like me to add tests next?", "I can wire this into X…") inviting you to continue — so you're never left at a dead end after a task finishes.
