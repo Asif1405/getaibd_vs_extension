@@ -142,6 +142,8 @@ impl Orchestrator {
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: true,
+            // Plan mode is meant to produce a plan and yield, not loop to "completion".
+            auto_complete: false,
         };
         run_agent_with_memory(
             session,
@@ -177,6 +179,7 @@ impl Orchestrator {
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: true,
+            auto_complete: true,
         };
 
         run_agent_with_memory(
@@ -218,6 +221,7 @@ impl Orchestrator {
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: true,
+            auto_complete: true,
         };
 
         run_agent_with_memory(

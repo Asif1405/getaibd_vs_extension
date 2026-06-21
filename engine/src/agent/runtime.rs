@@ -81,6 +81,10 @@ pub struct AgentOptions {
     pub circuit_breaker: Option<Arc<CircuitBreaker>>,
     pub context_config: Option<ContextConfig>,
     pub enable_thinking: bool,
+    /// When true, a strict reviewer (same model) verifies the original task is actually
+    /// finished before the run ends, and forces the agent to keep working if it is not.
+    /// Only action modes (Agent/Debug) set this; Ask/Plan are meant to yield.
+    pub auto_complete: bool,
 }
 
 impl Default for AgentOptions {
@@ -93,6 +97,7 @@ impl Default for AgentOptions {
             circuit_breaker: None,
             context_config: None,
             enable_thinking: true,
+            auto_complete: false,
         }
     }
 }
@@ -125,7 +130,7 @@ pub async fn run_agent_with_memory(
 
     inject_context(session, task, memory).await;
     session.push_message(ToolMessage::user(task));
-    agent_loop(session, provider, registry, memory, options, on_event).await
+    agent_loop(session, task, provider, registry, memory, options, on_event).await
 }
 
 /// Build the environment descriptor (OS + shell) reported by the client, if any.
@@ -256,6 +261,7 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
 #[allow(clippy::too_many_lines)]
 async fn agent_loop(
     session: &mut Session,
+    task: &str,
     provider: &Arc<dyn Provider>,
     registry: &ToolRegistry,
     memory: Option<&MemoryContext<'_>>,
@@ -269,12 +275,65 @@ async fn agent_loop(
     let use_streaming = provider.supports_streaming_tools();
     let enable_thinking = options.is_none_or(|o| o.enable_thinking);
 
+    // Auto-complete (manager/critic) state. When enabled, a strict reviewer confirms the original
+    // task is actually finished before the run ends and forces the agent to keep going if not.
+    // Hard caps keep this from ever looping forever or burning the balance:
+    //   * MAX_FORCE_CONTINUE — absolute number of forced continuations.
+    //   * a no-progress guard — never force-continue unless new tools ran since the last push.
+    const MAX_FORCE_CONTINUE: u32 = 8;
+    const STEP_EXTENSION: u32 = 40;
+    let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
+    let mut force_continue = 0u32;
+    let mut tool_calls_total = 0usize;
+    let mut tool_calls_at_last_force = 0usize;
+    // Progress point at which the worker last self-assessed completion, so we ask it to
+    // double-check itself at most once per batch of work before escalating to the reviewer.
+    let mut self_checked_at: Option<usize> = None;
+
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
     }
 
     loop {
         if iterations >= session.max_iterations {
+            // Auto-complete: at the ceiling, let the reviewer decide if we're actually done. If
+            // not (and budget + progress remain), raise the ceiling and keep going instead of
+            // stopping. Otherwise fall through to the manual Continue brake below.
+            if auto_complete
+                && force_continue < MAX_FORCE_CONTINUE
+                && tool_calls_total > tool_calls_at_last_force
+            {
+                on_event(AgentEvent {
+                    kind: AgentEventKind::Reflecting,
+                    content: Some("Reviewing whether the task is fully complete…".into()),
+                });
+                let final_text = if last_text.trim().is_empty() {
+                    "(no summary yet)"
+                } else {
+                    last_text.as_str()
+                };
+                let verdict = verify_task_complete(session, task, final_text, provider).await;
+                if !verdict.done {
+                    force_continue += 1;
+                    tool_calls_at_last_force = tool_calls_total;
+                    nudge_count = 0;
+                    session.max_iterations += STEP_EXTENSION;
+                    let remaining = format_missing(&verdict.missing);
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::Reflecting,
+                        content: Some(format!(
+                            "Step limit reached but the task isn't done — continuing automatically \
+                             ({force_continue}/{MAX_FORCE_CONTINUE}).\n{remaining}"
+                        )),
+                    });
+                    session.push_message(ToolMessage::system(format!(
+                        "A completion reviewer checked your work against the ORIGINAL task and found \
+                         it is NOT yet complete. Outstanding items:\n{remaining}\n\nKeep working and \
+                         finish these by calling the appropriate tools. Do not stop until done."
+                    )));
+                    continue;
+                }
+            }
             on_event(AgentEvent {
                 kind: AgentEventKind::StepLimitReached,
                 content: Some(iterations.to_string()),
@@ -389,6 +448,71 @@ async fn agent_loop(
                 ));
                 continue;
             }
+
+            // Auto-complete, step 1: ask the WORKER itself to honestly re-check its work against
+            // the original task before we finish. This is cheap (a normal worker turn with tools)
+            // and the model often catches its own omissions. Done at most once per batch of work
+            // (guarded by self_checked_at) so it can't self-loop, and only after real tool work.
+            if auto_complete
+                && !looks_like_user_question(content_txt)
+                && tool_calls_total > 0
+                && self_checked_at != Some(tool_calls_total)
+            {
+                self_checked_at = Some(tool_calls_total);
+                on_event(AgentEvent {
+                    kind: AgentEventKind::Reflecting,
+                    content: Some("Double-checking the task is fully complete…".into()),
+                });
+                session.push_message(ToolMessage::system(
+                    "Before you stop: re-read the ORIGINAL task and honestly verify that EVERY part \
+                     is actually done — files written, commands run, edits applied and verified — not \
+                     merely described. If anything is missing or incomplete, keep working NOW by \
+                     calling the appropriate tools. Only if everything is genuinely complete, reply \
+                     with a short final summary and no tool calls.",
+                ));
+                continue;
+            }
+
+            // Auto-complete, step 2: the worker still says it's done. A strict reviewer (same model)
+            // independently checks the result against the ORIGINAL task. If work remains, force the
+            // agent to keep going. Bounded by MAX_FORCE_CONTINUE and a no-progress guard.
+            if auto_complete
+                && !looks_like_user_question(content_txt)
+                && force_continue < MAX_FORCE_CONTINUE
+                && tool_calls_total > tool_calls_at_last_force
+            {
+                on_event(AgentEvent {
+                    kind: AgentEventKind::Reflecting,
+                    content: Some("Reviewing whether the task is fully complete…".into()),
+                });
+                let final_text = if content_txt.trim().is_empty() {
+                    last_text.as_str()
+                } else {
+                    content_txt
+                };
+                let verdict = verify_task_complete(session, task, final_text, provider).await;
+                if !verdict.done {
+                    force_continue += 1;
+                    tool_calls_at_last_force = tool_calls_total;
+                    nudge_count = 0;
+                    let remaining = format_missing(&verdict.missing);
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::Reflecting,
+                        content: Some(format!(
+                            "Not finished yet — continuing automatically \
+                             ({force_continue}/{MAX_FORCE_CONTINUE}).\n{remaining}"
+                        )),
+                    });
+                    session.push_message(ToolMessage::system(format!(
+                        "A completion reviewer checked your work against the ORIGINAL task and found \
+                         it is NOT yet complete. Outstanding items:\n{remaining}\n\nResume now and \
+                         finish these by calling the appropriate tools (write_file, patch_file, \
+                         run_command, etc.). Do the work end to end, then verify with git_diff. Do \
+                         not stop or summarize until everything is genuinely done."
+                    )));
+                    continue;
+                }
+            }
             return finish_agent(session, response.content, memory, provider, iterations, on_event)
                 .await;
         }
@@ -407,6 +531,7 @@ async fn agent_loop(
         // The model is making progress (it called tools), so refill the nudge budget:
         // the limit is for consecutive empty replies, not the whole run.
         nudge_count = 0;
+        tool_calls_total += response.tool_calls.len();
         session.push_message(ToolMessage::assistant_tool_calls(
             response.tool_calls.clone(),
         ));
@@ -415,6 +540,120 @@ async fn agent_loop(
         if enable_thinking {
             session.push_message(ToolMessage::system(thinking::REFLECTION_PROMPT.to_string()));
         }
+    }
+}
+
+/// Verdict from the completion reviewer ("manager") about whether the original task is done.
+struct CompletionVerdict {
+    done: bool,
+    missing: Vec<String>,
+}
+
+/// Render the reviewer's outstanding items as a short bullet list for prompts/events.
+fn format_missing(missing: &[String]) -> String {
+    if missing.is_empty() {
+        "Some requested work is still incomplete.".to_string()
+    } else {
+        missing
+            .iter()
+            .map(|m| format!("- {m}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// A compact, truncated tail of the conversation so the reviewer sees recent activity
+/// without paying for the whole transcript.
+fn recent_activity_brief(messages: &[ToolMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .take(14)
+        .filter_map(|m| {
+            let c = m.content.as_deref().unwrap_or("").trim();
+            if c.is_empty() {
+                return None;
+            }
+            let cut = c.char_indices().nth(220).map_or(c.len(), |(i, _)| i);
+            Some(format!("[{}] {}", m.role, &c[..cut]))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse the reviewer's JSON verdict. Fails OPEN (treats as done) on any parse problem so a
+/// malformed reply can never trap the agent in a forced-continue loop.
+fn parse_verdict(s: &str) -> CompletionVerdict {
+    let (open, close) = match (s.find('{'), s.rfind('}')) {
+        (Some(a), Some(b)) if a < b => (a, b),
+        _ => {
+            return CompletionVerdict {
+                done: true,
+                missing: Vec::new(),
+            }
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(&s[open..=close]) {
+        Ok(v) => {
+            let done = v.get("done").and_then(|x| x.as_bool()).unwrap_or(true);
+            let missing = v
+                .get("missing")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|i| i.as_str())
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            CompletionVerdict { done, missing }
+        }
+        Err(_) => CompletionVerdict {
+            done: true,
+            missing: Vec::new(),
+        },
+    }
+}
+
+/// Ask the same model, acting as a strict completion reviewer ("manager"), whether the original
+/// task is fully done. Used to auto-continue instead of stopping at a half-finished task.
+async fn verify_task_complete(
+    session: &Session,
+    task: &str,
+    final_text: &str,
+    provider: &Arc<dyn Provider>,
+) -> CompletionVerdict {
+    let recent = recent_activity_brief(&session.messages);
+    let system = "You are a STRICT completion reviewer for an autonomous coding agent. Given the \
+        ORIGINAL TASK and the agent's final message plus recent activity, decide whether the task \
+        is FULLY and CONCRETELY complete. Reply with ONLY compact JSON: \
+        {\"done\": true|false, \"missing\": [\"specific unfinished item\"]}. Be strict: if any \
+        requested part was only described or planned but not actually carried out, or any requested \
+        file/change/answer is absent, set done=false and list concrete missing items. If the task \
+        was a question or explanation and a complete answer was already given, set done=true with an \
+        empty missing list. Never output anything except the JSON object.";
+    let user = format!(
+        "ORIGINAL TASK:\n{task}\n\nAGENT'S FINAL MESSAGE:\n{final_text}\n\nRECENT ACTIVITY:\n{recent}"
+    );
+    let request = ToolChatRequest {
+        model: session.model.clone(),
+        messages: vec![ToolMessage::system(system), ToolMessage::user(user)],
+        tools: Vec::new(),
+        temperature: Some(0.0),
+        max_tokens: Some(500),
+        reasoning_effort: None,
+    };
+    match chat_with_tools_retry_cb(provider, &request, None).await {
+        Ok(r) => parse_verdict(r.content.as_deref().unwrap_or("")),
+        // Fail open: a reviewer error must not block the agent from finishing.
+        Err(_) => CompletionVerdict {
+            done: true,
+            missing: Vec::new(),
+        },
     }
 }
 

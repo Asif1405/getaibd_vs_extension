@@ -151,6 +151,7 @@ async fn run_agent_task(
         circuit_breaker: Some(state.circuit_breaker.clone()),
         context_config: Some(state.context_config.clone()),
         enable_thinking: true,
+        auto_complete: true,
     };
 
     let approval_session = session_id_for_events.clone();

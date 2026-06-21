@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.18]
+
+- The agent now **auto-continues until the task is truly done** instead of stopping early and waiting for a Continue click. When it thinks it's finished, it first **self-checks** its work against your original request, and then a strict **reviewer** (same model) independently confirms completion — if anything is missing, the agent keeps working on its own. Safety rails keep this bounded: it only kicks in after real work, never interrupts plain answers or questions, caps forced continuations, and falls back to the manual Continue button if it ever hits that cap. (Agent and Debug modes; Plan/Ask still yield as before.)
+
 ## [0.4.17]
 
 - Long-running model calls are no longer cut off. The engine used to apply a 60s total timeout to each request, which killed any single step whose generation ran longer (heavy reasoning, large outputs). It now uses a connect timeout + an idle/read timeout that resets on every token, so an actively streaming response can take as long as it needs — only a genuinely stalled or dead connection fails.
