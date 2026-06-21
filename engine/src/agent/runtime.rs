@@ -314,7 +314,7 @@ async fn agent_loop(
             .await;
         }
 
-        const COMPRESS_THRESHOLD: usize = 30;
+        const COMPRESS_THRESHOLD: usize = 70;
         if session.messages.len() > COMPRESS_THRESHOLD {
             summarize_old_messages(session, provider).await;
             on_event(AgentEvent {
@@ -542,15 +542,38 @@ async fn collect_streaming_response(
     })
 }
 
-/// Replaces the older half of the conversation with a faithful LLM-generated
-/// summary, falling back to truncation if the model call fails.
+/// Leading messages that compression must never touch: the system prefix
+/// (system prompt, environment note, injected memory/context) plus the first
+/// user message (the original task). Without this, summarizing the front of the
+/// list makes the agent forget its instructions and its goal.
+fn pinned_head_len(messages: &[ToolMessage]) -> usize {
+    let mut i = 0;
+    while i < messages.len() && messages[i].role == "system" {
+        i += 1;
+    }
+    if i < messages.len() && messages[i].role == "user" {
+        i += 1;
+    }
+    i
+}
+
+/// Replaces the older MIDDLE of the conversation with a faithful LLM-generated
+/// summary, keeping the pinned head (system prompt + original task) and the most
+/// recent turns verbatim. Falls back to truncation if the model call fails.
 async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provider>) {
-    if session.messages.len() <= 4 {
+    let pinned = pinned_head_len(&session.messages);
+    let total = session.messages.len();
+    // Keep a generous, verbatim recent tail so in-flight work stays intact.
+    let keep_tail = (total / 2).max(10);
+    // Bail unless there's a meaningful middle to compress between head and tail.
+    if total <= pinned + keep_tail + 3 {
         return;
     }
-    let keep_count = session.messages.len() / 2;
-    let to_summarize = session.messages.len() - keep_count;
-    let old: Vec<ToolMessage> = session.messages.drain(..to_summarize).collect();
+    let summarize_end = total - keep_tail;
+    let old: Vec<ToolMessage> = session
+        .messages
+        .splice(pinned..summarize_end, std::iter::empty())
+        .collect();
 
     let transcript = old
         .iter()
@@ -609,9 +632,13 @@ async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provid
             .join("\n"),
     };
 
+    let insert_at = pinned_head_len(&session.messages);
     session.messages.insert(
-        0,
-        ToolMessage::system(format!("Previous conversation summary:\n{summary}")),
+        insert_at,
+        ToolMessage::system(format!(
+            "Summary of earlier steps (older detail compressed; the system instructions \
+             and original task above still apply):\n{summary}"
+        )),
     );
 }
 
