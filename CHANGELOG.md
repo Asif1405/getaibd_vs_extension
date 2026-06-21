@@ -4,6 +4,10 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.16]
+
+- Further reduced mid-task stops. The "you replied without calling a tool" nudge budget is now counted per *consecutive* narration and refills whenever the agent actually does work — previously a few narrations anywhere in a run would make it give up the moment it next paused. Bumped the budget and strengthened the agent's "run to completion, don't yield with work remaining" instruction.
+
 ## [0.4.15]
 
 - Fixed the agent **forgetting the task** on long runs. Context compression used to summarize the *front* of the conversation — which is where the system instructions and the original task live — so after a couple of "Conversation summarized" steps the agent lost track of what it was doing. Now the system prompt and original task are always pinned, only the older middle is summarized, the recent turns are kept verbatim, and compression kicks in far less often.

@@ -367,8 +367,9 @@ async fn agent_loop(
         if response.tool_calls.is_empty() {
             // In action modes the model often narrates ("I'll write the file now") without
             // emitting a tool call, so nothing actually happens. Nudge it to run the tools.
-            // Repeat a few times for weaker models, but never override a genuine question.
-            const MAX_NUDGES: u32 = 3;
+            // This counts CONSECUTIVE narrations (reset whenever it actually calls a tool),
+            // so a long, productive run is never cut off just because it paused to narrate.
+            const MAX_NUDGES: u32 = 6;
             let content_txt = response.content.as_deref().unwrap_or("");
             let described_only = !looks_like_user_question(content_txt)
                 && nudge_count < MAX_NUDGES
@@ -403,6 +404,9 @@ async fn agent_loop(
             }
         }
 
+        // The model is making progress (it called tools), so refill the nudge budget:
+        // the limit is for consecutive empty replies, not the whole run.
+        nudge_count = 0;
         session.push_message(ToolMessage::assistant_tool_calls(
             response.tool_calls.clone(),
         ));
