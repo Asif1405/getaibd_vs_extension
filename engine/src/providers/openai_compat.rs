@@ -311,6 +311,8 @@ impl Provider for OpenAiCompatProvider {
         #[derive(Deserialize)]
         struct ModelEntry {
             id: String,
+            #[serde(default)]
+            capabilities: Vec<String>,
         }
 
         let req = self.client.get(format!("{}/models", self.base_url));
@@ -329,6 +331,7 @@ impl Provider for OpenAiCompatProvider {
             .map(|m| ModelInfo {
                 name: m.id.clone(),
                 id: m.id,
+                capabilities: m.capabilities,
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));

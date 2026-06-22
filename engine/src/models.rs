@@ -45,6 +45,10 @@ pub struct Usage {
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
+    /// Provider-reported capabilities (e.g. "tools", "vision", "thinking").
+    /// Empty when the upstream `/models` endpoint does not report them.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

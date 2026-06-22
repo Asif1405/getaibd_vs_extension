@@ -42,6 +42,7 @@ export interface ProviderInfo {
 export interface ModelInfo {
   id: string;
   name: string;
+  capabilities?: string[];
 }
 
 export interface ChatMessage {

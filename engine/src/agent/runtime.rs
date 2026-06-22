@@ -288,8 +288,11 @@ async fn agent_loop(
     const STEP_EXTENSION: u32 = 40;
     let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
     let mut force_continue = 0u32;
-    let mut tool_calls_total = 0usize;
-    let mut tool_calls_at_last_force = 0usize;
+    // Counts only file-mutating tool calls (see `is_mutating_tool`). The force-continue
+    // guard compares these so the agent only keeps going when it actually changed
+    // something since the last review — never just because it re-read or re-checked.
+    let mut mutating_total = 0usize;
+    let mut mutating_at_last_force = 0usize;
 
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
@@ -302,7 +305,7 @@ async fn agent_loop(
             // stopping. Otherwise fall through to the manual Continue brake below.
             if auto_complete
                 && force_continue < MAX_FORCE_CONTINUE
-                && tool_calls_total > tool_calls_at_last_force
+                && mutating_total > mutating_at_last_force
             {
                 on_event(AgentEvent {
                     kind: AgentEventKind::Reflecting,
@@ -316,7 +319,7 @@ async fn agent_loop(
                 let verdict = verify_task_complete(session, task, final_text, provider).await;
                 if !verdict.done {
                     force_continue += 1;
-                    tool_calls_at_last_force = tool_calls_total;
+                    mutating_at_last_force = mutating_total;
                     nudge_count = 0;
                     session.max_iterations += STEP_EXTENSION;
                     let remaining = format_missing(&verdict.missing);
@@ -458,7 +461,7 @@ async fn agent_loop(
             if auto_complete
                 && !looks_like_user_question(content_txt)
                 && force_continue < MAX_FORCE_CONTINUE
-                && tool_calls_total > tool_calls_at_last_force
+                && mutating_total > mutating_at_last_force
             {
                 on_event(AgentEvent {
                     kind: AgentEventKind::Reflecting,
@@ -472,7 +475,7 @@ async fn agent_loop(
                 let verdict = verify_task_complete(session, task, final_text, provider).await;
                 if !verdict.done {
                     force_continue += 1;
-                    tool_calls_at_last_force = tool_calls_total;
+                    mutating_at_last_force = mutating_total;
                     nudge_count = 0;
                     // The summary we just streamed is being superseded by more work — tell the
                     // client to drop it so the user never sees a duplicate "done" message.
@@ -516,7 +519,11 @@ async fn agent_loop(
         // The model is making progress (it called tools), so refill the nudge budget:
         // the limit is for consecutive empty replies, not the whole run.
         nudge_count = 0;
-        tool_calls_total += response.tool_calls.len();
+        mutating_total += response
+            .tool_calls
+            .iter()
+            .filter(|tc| is_mutating_tool(&tc.name))
+            .count();
         session.push_message(ToolMessage::assistant_tool_calls(
             response.tool_calls.clone(),
         ));
@@ -526,6 +533,16 @@ async fn agent_loop(
             session.push_message(ToolMessage::system(thinking::REFLECTION_PROMPT.to_string()));
         }
     }
+}
+
+/// True for tools that actually change the workspace. Only these count as "new
+/// progress" for the auto-complete force-continue guard: a model that merely
+/// re-reads files, runs `git_status`, or re-runs a `--check` and then repeats its
+/// "I'm done" summary is NOT making progress, so it must not be able to keep the
+/// completion-reviewer loop alive (which otherwise re-summarises up to the hard
+/// cap and looks like the agent is stuck).
+fn is_mutating_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "patch_file" | "move_file" | "delete_file")
 }
 
 /// Verdict from the completion reviewer ("manager") about whether the original task is done.

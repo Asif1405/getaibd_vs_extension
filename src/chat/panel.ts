@@ -2429,6 +2429,8 @@ body {
 .tag-badge.open      { background: rgba(148,163,184,0.1);  color: #94a3b8; }
 .tag-badge.free      { background: rgba(34,197,94,0.18);   color: #22c55e; }
 
+.chat-only-badge { font-size: 10px; opacity: 0.75; cursor: help; line-height: 1; }
+
 .model-item.locked { opacity: 0.5; }
 .model-item.locked:hover { background: var(--list-hover); }
 .model-item-lock { font-size: 10px; opacity: 0.8; }
@@ -3019,7 +3021,7 @@ function renderModelList(filter) {
     modelList.appendChild(header);
 
     for (const m of curated) {
-      modelList.appendChild(makeModelItem(pid, m.id, m.name, m.ctx, m.tags || []));
+      modelList.appendChild(makeModelItem(pid, m.id, m.name, m.ctx, m.tags || [], m.capabilities || []));
       total++;
     }
 
@@ -3030,7 +3032,7 @@ function renderModelList(filter) {
         modelList.appendChild(div);
       }
       for (const m of apiModels) {
-        modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, []));
+        modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, [], m.capabilities || []));
         total++;
       }
     }
@@ -3044,7 +3046,7 @@ function renderModelList(filter) {
   }
 }
 
-function makeModelItem(providerId, modelId, displayName, ctx, tags) {
+function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities) {
   const isFreeModel = modelId === freeModelId;
   const locked = freeMode && !isFreeModel;
   const isSelected = modelId === currentModel && providerId === currentProvider;
@@ -3081,6 +3083,15 @@ function makeModelItem(providerId, modelId, displayName, ctx, tags) {
     tagBadge.className = "tag-badge " + tag;
     tagBadge.textContent = tag;
     badges.appendChild(tagBadge);
+  }
+
+  const caps = capabilities || [];
+  if (caps.length > 0 && !caps.includes("tools")) {
+    const chatOnly = document.createElement("span");
+    chatOnly.className = "chat-only-badge";
+    chatOnly.textContent = "💬";
+    chatOnly.title = "Chat only — this model can't use tools or run as an agent";
+    badges.appendChild(chatOnly);
   }
 
   if (locked) {

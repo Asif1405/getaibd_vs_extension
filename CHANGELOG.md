@@ -4,6 +4,20 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.30]
+
+- **Fixed the agent looping and stacking repeated summaries.** The progress guard
+  that decides whether to auto-continue counted *every* tool call — including
+  read-only verification calls like `read_file`/`git_status` — so a model that
+  kept re-reading and re-summarizing looked like it was "making progress" and the
+  loop never settled. The guard now only counts *mutating* tools (`write_file`,
+  `patch_file`, `move_file`, `delete_file`), so once the actual work is done the
+  agent stops cleanly instead of re-emitting the same summary.
+- **"Chat only" marker for models without tool support.** Models that can't call
+  tools (e.g. Perplexity Sonar) now show a small 💬 symbol with a "Chat only"
+  tooltip in the model picker, so it's clear they won't drive agent/tool flows.
+  Model capabilities are now passed through from the gateway to the picker.
+
 ## [0.4.29]
 
 - **Fixed Gemini agent tasks dying after a single tool call.** Gemini 3.x returns
