@@ -25,7 +25,7 @@ fn default_config_has_correct_server_settings() {
     let config = AppConfig::load(Some(file.path()));
     assert_eq!(config.server.host, "127.0.0.1");
     assert_eq!(config.server.port, 3333);
-    assert_eq!(config.server.request_timeout_secs, 60);
+    assert_eq!(config.server.request_timeout_secs, 300);
     assert!(config.server.public_url.is_none());
 }
 

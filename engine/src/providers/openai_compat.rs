@@ -126,6 +126,7 @@ struct CompatFunctionDef {
 
 #[derive(Serialize, Deserialize)]
 struct CompatToolCallResponse {
+    #[serde(default)]
     id: String,
     #[serde(default = "default_tool_type")]
     r#type: String,
@@ -144,7 +145,9 @@ fn norm_effort(effort: &Option<String>) -> Option<String> {
 
 #[derive(Serialize, Deserialize)]
 struct CompatToolCallFunction {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     arguments: String,
 }
 
@@ -180,7 +183,12 @@ struct CompatDelta {
 
 #[derive(Deserialize)]
 struct CompatStreamToolCall {
-    index: usize,
+    // Some OpenAI-compatible providers (notably Google's Gemini shim and a few
+    // Anthropic proxies) omit `index` when they emit a whole tool call in one
+    // delta. Treat it as optional and fall back to the array position so the
+    // tool call is never silently dropped on a strict-decode failure.
+    #[serde(default)]
+    index: Option<usize>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -205,6 +213,9 @@ struct CompatUsage {
 
 #[derive(Deserialize)]
 struct CompatStreamChunk {
+    // Default so a chunk that carries only `usage` (or any provider-specific
+    // metadata) parses cleanly instead of dropping the whole line.
+    #[serde(default)]
     choices: Vec<CompatChoice>,
 }
 
@@ -633,15 +644,18 @@ impl Provider for OpenAiCompatProvider {
                                     }
                                 }
                                 if let Some(tool_calls) = &delta.tool_calls {
-                                    for tc in tool_calls {
+                                    for (pos, tc) in tool_calls.iter().enumerate() {
+                                        let index = tc.index.unwrap_or(pos);
                                         if let Some(ref func) = tc.function {
                                             if let Some(ref name) = func.name {
-                                                let id = tc.id.clone().unwrap_or_else(|| format!("call_{}", tc.index));
-                                                active_tool_indices.insert(tc.index);
-                                                yield ToolStreamDelta::ToolCallStart {
-                                                    id,
-                                                    name: name.clone(),
-                                                };
+                                                if !name.is_empty() {
+                                                    let id = tc.id.clone().unwrap_or_else(|| format!("call_{index}"));
+                                                    active_tool_indices.insert(index);
+                                                    yield ToolStreamDelta::ToolCallStart {
+                                                        id,
+                                                        name: name.clone(),
+                                                    };
+                                                }
                                             }
                                             if let Some(ref args) = func.arguments {
                                                 if !args.is_empty() {

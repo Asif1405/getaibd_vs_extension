@@ -141,7 +141,7 @@ impl Orchestrator {
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
-            enable_thinking: true,
+            enable_thinking: super::thinking::model_uses_reasoning(&session.model),
             // Plan mode is meant to produce a plan and yield, not loop to "completion".
             auto_complete: false,
         };
@@ -178,7 +178,7 @@ impl Orchestrator {
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
-            enable_thinking: true,
+            enable_thinking: super::thinking::model_uses_reasoning(&session.model),
             auto_complete: true,
         };
 
@@ -220,7 +220,7 @@ impl Orchestrator {
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
-            enable_thinking: true,
+            enable_thinking: super::thinking::model_uses_reasoning(&session.model),
             auto_complete: true,
         };
 

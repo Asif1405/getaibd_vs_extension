@@ -19,6 +19,36 @@ Reflect on the tool results above. Inside <reflection>...</reflection> tags:
 - If more work is needed, output a new <plan> with updated steps.
 If the task is fully complete, provide your final answer without any tags.";
 
+/// Whether a model should run the explicit plan/reflect "thinking" scaffolding.
+///
+/// Reasoning models benefit from the `<plan>`/`<reflection>` protocol. Smaller,
+/// non-reasoning models (e.g. Haiku, flash/mini/fast variants) tend to spend the
+/// turn *narrating* a plan instead of emitting tool calls when handed this
+/// ceremony, so they do better acting directly. Fast/small markers take
+/// precedence; unknown models default to direct-acting for tool reliability.
+#[must_use]
+pub fn model_uses_reasoning(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    const DIRECT: &[&str] = &[
+        "mini", "haiku", "flash", "fast", "lite", "-v3", "-v4", "llama", "gpt-3.5", "gpt-4o",
+    ];
+    if DIRECT.iter().any(|marker| m.contains(marker)) {
+        return false;
+    }
+    const REASONING: &[&str] = &[
+        "-r1",
+        "reasoning",
+        "thinking",
+        "o4-",
+        "grok-4",
+        "opus",
+        "sonnet",
+        "gpt-5",
+        "gemini-3.1-pro",
+    ];
+    REASONING.iter().any(|marker| m.contains(marker))
+}
+
 /// Detected structured block from an LLM response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingBlock {

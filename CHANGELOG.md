@@ -4,6 +4,20 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.28]
+
+- **Fixed tool calls being silently dropped for some models.** The streamed
+  tool-call parser required an `index` field that Google's Gemini shim (and a few
+  Anthropic proxies) don't always send, so a valid tool call was thrown away and
+  the agent would just *narrate* ("I'll use list_directory…") and finish without
+  doing anything. Parsing is now resilient to missing `index`/`id`/`arguments`,
+  so tools run reliably across providers.
+- **Non-reasoning models now act directly instead of stalling.** Smaller, fast
+  models (e.g. Claude Haiku, and flash/mini/fast variants) were handed the same
+  heavyweight plan/reflect "thinking" scaffolding as reasoning models, which made
+  them spend their turn planning in prose rather than calling tools. They now
+  skip that ceremony and just do the work; reasoning models keep it.
+
 ## [0.4.27]
 
 - **Reverted the task-breakdown to-do list (0.4.24–0.4.26).** The mandatory

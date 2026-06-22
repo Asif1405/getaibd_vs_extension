@@ -150,7 +150,7 @@ async fn run_agent_task(
         tool_timeout_secs: 300,
         circuit_breaker: Some(state.circuit_breaker.clone()),
         context_config: Some(state.context_config.clone()),
-        enable_thinking: true,
+        enable_thinking: crate::agent::thinking::model_uses_reasoning(&session.model),
         auto_complete: true,
     };
 
