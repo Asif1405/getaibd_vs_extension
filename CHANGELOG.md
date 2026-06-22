@@ -4,6 +4,17 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.29]
+
+- **Fixed Gemini agent tasks dying after a single tool call.** Gemini 3.x returns
+  a `thought_signature` with every tool call, and Google's API *requires* that
+  signature to be sent back on the next request. We were dropping it, so the
+  follow-up call failed with `HTTP 400 — "Function call is missing a
+  thought_signature"`, and the agent stopped after one tool (e.g. it would list
+  the directory, then quit without creating any files). The signature is now
+  captured and echoed back, so Gemini chains tool calls and completes tasks
+  normally. Other providers are unaffected (they simply don't send the field).
+
 ## [0.4.28]
 
 - **Fixed tool calls being silently dropped for some models.** The streamed

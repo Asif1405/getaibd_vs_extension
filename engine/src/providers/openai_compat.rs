@@ -131,6 +131,10 @@ struct CompatToolCallResponse {
     #[serde(default = "default_tool_type")]
     r#type: String,
     function: CompatToolCallFunction,
+    // Provider passthrough (Gemini's `thought_signature` lives here). Parsed from
+    // the response AND serialized back on the next request so Google accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<serde_json::Value>,
 }
 
 fn default_tool_type() -> String {
@@ -193,6 +197,10 @@ struct CompatStreamToolCall {
     id: Option<String>,
     #[serde(default)]
     function: Option<CompatStreamFunction>,
+    // Gemini streams its `thought_signature` here, in the same delta as the
+    // function name. Capture it so it can be echoed back on the next request.
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -245,6 +253,7 @@ impl From<&ToolMessage> for CompatMessage {
                             arguments: serde_json::to_string(&tc.arguments)
                                 .unwrap_or_else(|_| "{}".to_string()),
                         },
+                        extra_content: tc.extra.clone(),
                     })
                     .collect()
             }),
@@ -524,6 +533,7 @@ impl Provider for OpenAiCompatProvider {
                         name: tc.function.name.clone(),
                         arguments: serde_json::from_str(&tc.function.arguments)
                             .unwrap_or(serde_json::Value::Null),
+                        extra: tc.extra_content.clone(),
                     })
                     .collect()
             })
@@ -654,6 +664,7 @@ impl Provider for OpenAiCompatProvider {
                                                     yield ToolStreamDelta::ToolCallStart {
                                                         id,
                                                         name: name.clone(),
+                                                        extra: tc.extra_content.clone(),
                                                     };
                                                 }
                                             }

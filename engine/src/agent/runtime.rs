@@ -715,6 +715,7 @@ async fn collect_streaming_response(
     let mut current_tool_id = String::new();
     let mut current_tool_name = String::new();
     let mut current_tool_args = String::new();
+    let mut current_tool_extra: Option<serde_json::Value> = None;
 
     while let Some(delta) = stream.next().await {
         match delta? {
@@ -725,7 +726,7 @@ async fn collect_streaming_response(
                     content: Some(token),
                 });
             }
-            ToolStreamDelta::ToolCallStart { id, name } => {
+            ToolStreamDelta::ToolCallStart { id, name, extra } => {
                 if !current_tool_id.is_empty() {
                     let args: serde_json::Value =
                         serde_json::from_str(&current_tool_args).unwrap_or_default();
@@ -733,11 +734,13 @@ async fn collect_streaming_response(
                         id: current_tool_id.clone(),
                         name: current_tool_name.clone(),
                         arguments: args,
+                        extra: current_tool_extra.take(),
                     });
                     current_tool_args.clear();
                 }
                 current_tool_id = id;
                 current_tool_name = name;
+                current_tool_extra = extra;
             }
             ToolStreamDelta::ToolCallArgDelta(args) => {
                 current_tool_args.push_str(&args);
@@ -750,6 +753,7 @@ async fn collect_streaming_response(
                         id: current_tool_id.clone(),
                         name: current_tool_name.clone(),
                         arguments: args,
+                        extra: current_tool_extra.take(),
                     });
                     current_tool_id.clear();
                     current_tool_name.clear();

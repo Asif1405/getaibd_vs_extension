@@ -96,6 +96,13 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Opaque provider passthrough attached to the tool call (the OpenAI
+    /// `extra_content` field). Gemini 3.x returns a `thought_signature` here
+    /// that Google REQUIRES to be echoed back verbatim on the next request —
+    /// omitting it makes the follow-up call fail with HTTP 400, stalling the
+    /// agent after a single tool call. Preserved here so we can send it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +206,11 @@ pub struct ToolChatResponse {
 #[derive(Debug, Clone)]
 pub enum ToolStreamDelta {
     Token(String),
-    ToolCallStart { id: String, name: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+        extra: Option<serde_json::Value>,
+    },
     ToolCallArgDelta(String),
     ToolCallEnd,
     Done,
