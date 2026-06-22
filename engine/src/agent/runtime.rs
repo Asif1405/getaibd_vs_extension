@@ -434,45 +434,19 @@ async fn agent_loop(
         }
 
         if response.tool_calls.is_empty() {
-            // In action modes the model often narrates ("I'll write the file now") without
-            // emitting a tool call, so nothing actually happens. Nudge it to run the tools.
-            // This counts CONSECUTIVE narrations (reset whenever it actually calls a tool),
-            // so a long, productive run is never cut off just because it paused to narrate.
-            const MAX_NUDGES: u32 = 6;
             let content_txt = response.content.as_deref().unwrap_or("");
-            let described_only = !looks_like_user_question(content_txt)
-                && nudge_count < MAX_NUDGES
-                && !tool_defs.is_empty()
-                && session.max_iterations > 1
-                && iterations < session.max_iterations;
-            if described_only {
-                nudge_count += 1;
-                session.push_message(ToolMessage::system(
-                    "You replied without calling any tool, so the task has NOT been performed yet \
-                     and no files have changed. Call the appropriate tools NOW (write_file, \
-                     patch_file, move_file, delete_file, run_command, etc.) to do the work end to \
-                     end, then verify with git_diff. Do not describe what you will do — do it. Only \
-                     ask the user a question if you are genuinely blocked, or the action is \
-                     ambiguous or destructive."
-                        .to_string(),
-                ));
-                continue;
-            }
 
-            // Auto-complete: the worker says it's done. A strict reviewer (same model)
-            // independently checks the result against the ORIGINAL task. If everything is
-            // genuinely complete the agent QUITS immediately with this summary (no extra
-            // re-summarization round). Only when real work is still missing do we force it to
-            // keep going. Bounded by MAX_FORCE_CONTINUE and a no-progress guard.
+            // Auto-complete: the worker stopped calling tools, so it is implicitly claiming the
+            // task is done. As soon as it has made real progress, a strict reviewer independently
+            // checks the result against the ORIGINAL task — BEFORE we burn turns nudging. If it is
+            // genuinely complete the agent QUITS immediately with this summary; only when real work
+            // is still missing do we force it to keep going. Bounded by MAX_FORCE_CONTINUE and the
+            // no-progress guard (mutating_total must have grown since the last forced continue).
             if auto_complete
                 && !looks_like_user_question(content_txt)
                 && force_continue < MAX_FORCE_CONTINUE
                 && mutating_total > mutating_at_last_force
             {
-                on_event(AgentEvent {
-                    kind: AgentEventKind::Reflecting,
-                    content: Some("Reviewing whether the task is fully complete…".into()),
-                });
                 let final_text = if content_txt.trim().is_empty() {
                     last_text.as_str()
                 } else {
@@ -483,8 +457,10 @@ async fn agent_loop(
                     force_continue += 1;
                     mutating_at_last_force = mutating_total;
                     nudge_count = 0;
-                    // The summary we just streamed is being superseded by more work — tell the
-                    // client to drop it so the user never sees a duplicate "done" message.
+                    // Drop the summary we just streamed FIRST, before any other event. The client
+                    // discards the last streamed draft by the handle it is still holding; emitting
+                    // a status event (e.g. Reflecting) first would detach that handle and leave the
+                    // superseded summary on screen as a duplicate.
                     on_event(AgentEvent {
                         kind: AgentEventKind::DiscardDraft,
                         content: None,
@@ -506,6 +482,39 @@ async fn agent_loop(
                     )));
                     continue;
                 }
+                return finish_agent(
+                    session,
+                    response.content,
+                    memory,
+                    provider,
+                    iterations,
+                    on_event,
+                )
+                .await;
+            }
+
+            // No reviewable progress yet. In action modes the model often narrates ("I'll write
+            // the file now") without emitting a tool call, so nothing actually happens. Nudge it to
+            // run the tools. This counts CONSECUTIVE narrations (reset whenever it actually calls a
+            // tool), so a long, productive run is never cut off just because it paused to narrate.
+            const MAX_NUDGES: u32 = 6;
+            let described_only = !looks_like_user_question(content_txt)
+                && nudge_count < MAX_NUDGES
+                && !tool_defs.is_empty()
+                && session.max_iterations > 1
+                && iterations < session.max_iterations;
+            if described_only {
+                nudge_count += 1;
+                session.push_message(ToolMessage::system(
+                    "You replied without calling any tool, so the task has NOT been performed yet \
+                     and no files have changed. Call the appropriate tools NOW (write_file, \
+                     patch_file, move_file, delete_file, run_command, etc.) to do the work end to \
+                     end, then verify with git_diff. Do not describe what you will do — do it. Only \
+                     ask the user a question if you are genuinely blocked, or the action is \
+                     ambiguous or destructive."
+                        .to_string(),
+                ));
+                continue;
             }
             return finish_agent(session, response.content, memory, provider, iterations, on_event)
                 .await;
@@ -637,13 +646,17 @@ async fn verify_task_complete(
 ) -> CompletionVerdict {
     let recent = recent_activity_brief(&session.messages);
     let system = "You are a STRICT completion reviewer for an autonomous coding agent. Given the \
-        ORIGINAL TASK and the agent's final message plus recent activity, decide whether the task \
-        is FULLY and CONCRETELY complete. Reply with ONLY compact JSON: \
-        {\"done\": true|false, \"missing\": [\"specific unfinished item\"]}. Be strict: if any \
-        requested part was only described or planned but not actually carried out, or any requested \
-        file/change/answer is absent, set done=false and list concrete missing items. If the task \
-        was a question or explanation and a complete answer was already given, set done=true with an \
-        empty missing list. Never output anything except the JSON object.";
+        ORIGINAL TASK and the agent's final message plus recent activity, decide whether the \
+        EXPLICIT requirements of the ORIGINAL TASK are FULLY and CONCRETELY complete. Reply with \
+        ONLY compact JSON: {\"done\": true|false, \"missing\": [\"specific unfinished item\"]}. \
+        Judge ONLY against what the original task actually asked for. If a requested part was only \
+        described or planned but not actually carried out, or a requested file/change/answer is \
+        absent, set done=false and list concrete missing items. IGNORE the agent's own \
+        suggestions, offers, ideas, or 'next steps' (e.g. 'I can also…', 'want me to…', \
+        'optionally…') — these are NOT requirements, so never list them as missing. If everything \
+        the task explicitly asked for was done — or it was a question/explanation that has already \
+        been fully answered — set done=true with an empty missing list. Never output anything \
+        except the JSON object.";
     let user = format!(
         "ORIGINAL TASK:\n{task}\n\nAGENT'S FINAL MESSAGE:\n{final_text}\n\nRECENT ACTIVITY:\n{recent}"
     );

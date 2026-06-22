@@ -4,6 +4,24 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.32]
+
+- **No more duplicate "done" summaries, and the agent stops sooner.** When the
+  completion reviewer decided more work was needed, the engine sent its
+  "reviewing…" status update *before* the "discard the draft" signal. The webview
+  had already let go of the streamed summary by then, so it couldn't remove it —
+  leaving the old summary stacked above the new one. The discard signal is now
+  sent first (with no status update in front of it), and the webview also keeps a
+  dedicated handle to the last streamed draft that survives status updates, so the
+  superseded summary is always removed cleanly.
+- **Faster, more decisive completion checks.** A genuinely finished, tool-free
+  summary used to be "nudged" up to six times before the reviewer even ran; the
+  reviewer now runs immediately once real work has been done. The reviewer was
+  also treating the agent's own offers ("Next steps: I can also…") as unfinished
+  requirements and re-opening completed tasks — it now judges only the original
+  task's explicit requirements and ignores the agent's suggestions, so finished
+  work isn't dragged back into more rounds.
+
 ## [0.4.31]
 
 - **Cheaper task-completion checks.** The agent runs a strict "is the task fully

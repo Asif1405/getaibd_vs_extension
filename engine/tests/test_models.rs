@@ -93,6 +93,7 @@ fn model_info_serializes() {
     let info = ModelInfo {
         id: "llama3".into(),
         name: "Llama 3".into(),
+        capabilities: vec![],
     };
     let json = serde_json::to_string(&info).unwrap();
     assert!(json.contains("llama3"));

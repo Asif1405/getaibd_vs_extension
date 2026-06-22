@@ -2659,10 +2659,6 @@ body {
       <span class="pill-label" id="modelPillLabel">Select model</span>
       <span class="ctl-arrow">&#9662;</span>
     </button>
-    <button class="ctl-pill" id="reasonPill" title="Reasoning effort" style="display:none;">
-      <span class="ctl-icon">&#129504;</span>
-      <span class="ctl-label" id="reasonPillLabel">Reasoning: Off</span>
-    </button>
     <span class="composer-spacer"></span>
     <button class="round-btn" id="attachBtn" title="Attach file">&#x1F4CE;</button>
     <button class="round-btn send-btn" id="sendBtn" title="Send">&#9654;</button>
@@ -2687,8 +2683,6 @@ const sendBtn = document.getElementById("sendBtn");
 const modelPill = document.getElementById("modelPill");
 const modelPillLabel = document.getElementById("modelPillLabel");
 const modelPillIcon = document.getElementById("modelPillIcon");
-const reasonPill = document.getElementById("reasonPill");
-const reasonPillLabel = document.getElementById("reasonPillLabel");
 const modePill = document.getElementById("modePill");
 const modePillLabel = document.getElementById("modePillLabel");
 const modePillIcon = document.getElementById("modePillIcon");
@@ -2738,6 +2732,11 @@ let streamEl = null;
 let streamContent = "";
 let agentTextEl = null;
 let agentTextContent = "";
+// The last streamed assistant bubble that could still be superseded by the
+// completion reviewer. Unlike agentTextEl, this survives status events
+// (planning/thinking/reflection) so agentDiscardDraft can always drop the
+// right bubble and never leaves a duplicate "done" summary on screen.
+let agentDraftEl = null;
 let thoughtEl = null;
 let thoughtBodyEl = null;
 let thoughtStart = 0;
@@ -3137,13 +3136,11 @@ function updateModelPill() {
     modelPillLabel.textContent = "Select model";
     modelPillIcon.textContent = "🤖";
   }
-  updateReasonPill();
 }
 
-const REASON_LEVELS = ["off", "low", "medium", "high"];
-// Default to maximum reasoning so thinking-capable models always think hard unless
-// the user explicitly dials it down via the pill.
-let currentReasoning = "high";
+// Thinking-capable models always reason at high effort. There's no user-facing
+// effort control (it was redundant), so this stays a fixed default.
+const currentReasoning = "high";
 
 function modelCaps(provider, modelId) {
   const api = (allModels[provider] || []).find(m => m.id === modelId);
@@ -3155,29 +3152,6 @@ function modelCaps(provider, modelId) {
 
 function currentModelSupportsThinking() {
   return modelCaps(currentProvider, currentModel).includes("thinking");
-}
-
-function updateReasonPill() {
-  if (!reasonPill) return;
-  const supported = currentModel && currentModelSupportsThinking();
-  reasonPill.style.display = supported ? "" : "none";
-  // For thinking-capable models, default to high; keep the preference (don't force
-  // off) when an unsupported model is selected so it returns to high on switch back.
-  if (supported && currentReasoning === "off") {currentReasoning = "high";}
-  const label = currentReasoning === "off"
-    ? "Reasoning: Off"
-    : "Reasoning: " + currentReasoning.charAt(0).toUpperCase() + currentReasoning.slice(1);
-  if (reasonPillLabel) reasonPillLabel.textContent = label;
-  reasonPill.classList.toggle("active", currentReasoning !== "off");
-}
-
-if (reasonPill) {
-  reasonPill.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const idx = REASON_LEVELS.indexOf(currentReasoning);
-    currentReasoning = REASON_LEVELS[(idx + 1) % REASON_LEVELS.length];
-    updateReasonPill();
-  });
 }
 
 /* ── Send ── */
@@ -3770,6 +3744,7 @@ window.addEventListener("message", (event) => {
       streamEl = null;
       streamContent = "";
       agentTextEl = null;
+      agentDraftEl = null;
       agentTextContent = "";
       break;
 
@@ -3887,6 +3862,7 @@ window.addEventListener("message", (event) => {
     case "agentStart":
       streaming = true;
       agentTextEl = null;
+      agentDraftEl = null;
       agentTextContent = "";
       thoughtEl = null;
       thoughtBodyEl = null;
@@ -4031,6 +4007,7 @@ window.addEventListener("message", (event) => {
       if (!agentTextEl) {
         agentTextEl = addMessage("assistant", "");
       }
+      agentDraftEl = agentTextEl;
       agentTextEl.innerHTML = '<span class="role-label">assistant</span><div class="md">' + mdToHtml(clean) + "</div>";
       enhanceCodeBlocks(agentTextEl);
       scrollToBottom();
@@ -4067,15 +4044,20 @@ window.addEventListener("message", (event) => {
       break;
     }
 
-    case "agentDiscardDraft":
+    case "agentDiscardDraft": {
       // A provisional "done" summary was superseded by more work — remove the
-      // bubble that was just streamed so the user never sees a duplicate.
-      if (agentTextEl) {
-        agentTextEl.remove();
+      // bubble that was just streamed so the user never sees a duplicate. Prefer
+      // the tracked draft handle, which survives any status event (planning/
+      // thinking/reflection) that may have detached agentTextEl in between.
+      const draft = agentDraftEl || agentTextEl;
+      if (draft) {
+        draft.remove();
       }
       agentTextEl = null;
+      agentDraftEl = null;
       agentTextContent = "";
       break;
+    }
 
     case "agentDone":
       finalizeThought();
@@ -4091,6 +4073,7 @@ window.addEventListener("message", (event) => {
         }
       }
       agentTextEl = null;
+      agentDraftEl = null;
       agentTextContent = "";
       break;
 
@@ -4103,6 +4086,7 @@ window.addEventListener("message", (event) => {
         if (clean.trim()) appendActionBtns(agentTextEl, clean);
       }
       agentTextEl = null;
+      agentDraftEl = null;
       agentTextContent = "";
       sendBtn.innerHTML = "&#9654;";
       sendBtn.classList.remove("stop");
