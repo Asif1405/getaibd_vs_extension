@@ -4,6 +4,15 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.31]
+
+- **Cheaper task-completion checks.** The agent runs a strict "is the task fully
+  done?" review before finishing (and before each forced continuation). That
+  review is a tiny JSON classification, so on GetAIBD it now runs on a fast,
+  inexpensive model (`gemini-3.5-flash`) instead of the (possibly expensive)
+  model you picked for the work itself — same behavior, lower cost. Bring-your-
+  own-key providers are unchanged and keep using your selected model.
+
 ## [0.4.30]
 
 - **Fixed the agent looping and stacking repeated summaries.** The progress guard

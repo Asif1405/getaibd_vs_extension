@@ -23,6 +23,12 @@ use crate::tools::ToolRegistry;
 use super::session::Session;
 use super::thinking;
 
+/// Model used for the strict task-completion review on the GetAIBD provider.
+/// The completion check is a small, stateless JSON classification, so it runs on
+/// a cheap fast model instead of the (possibly expensive) model the user picked.
+/// Other providers keep using the session model (see `verify_task_complete`).
+const GETAIBD_COMPLETION_MODEL: &str = "gemini-3.5-flash";
+
 pub struct AgentEvent {
     pub kind: AgentEventKind,
     pub content: Option<String>,
@@ -641,8 +647,16 @@ async fn verify_task_complete(
     let user = format!(
         "ORIGINAL TASK:\n{task}\n\nAGENT'S FINAL MESSAGE:\n{final_text}\n\nRECENT ACTIVITY:\n{recent}"
     );
+    // On GetAIBD, route this lightweight review to a cheap fast model. Other
+    // providers (BYOK) keep using the user's selected model, since a GetAIBD
+    // catalog id wouldn't be valid for them.
+    let review_model = if session.provider_id == "getaibd" {
+        GETAIBD_COMPLETION_MODEL.to_string()
+    } else {
+        session.model.clone()
+    };
     let request = ToolChatRequest {
-        model: session.model.clone(),
+        model: review_model,
         messages: vec![ToolMessage::system(system), ToolMessage::user(user)],
         tools: Vec::new(),
         temperature: Some(0.0),
