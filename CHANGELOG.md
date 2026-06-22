@@ -4,29 +4,14 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
-## [0.4.26]
+## [0.4.27]
 
-- **Plan checklists are now openable files.** In Plan mode the task checklist is
-  mirrored to a Markdown file under `.getaibd/plans/` (git-ignored) — click the
-  checklist card in the chat to open the plan in the editor. Only the latest plan
-  file is kept; older ones are pruned automatically so it stays tiny. Agent mode is
-  unchanged: its checklist stays inline and writes nothing to disk. Memory continues
-  to live in global storage.
-
-## [0.4.25]
-
-- **Live task checklist.** For larger tasks the agent now maintains a real,
-  structured to-do list (via a new `todo_write` tool) that renders as a checklist
-  in the chat — each item shows pending / in-progress / done state and updates as
-  the agent works through the task, instead of being plain text it has to retype.
-
-## [0.4.24]
-
-- **Agent now plans big tasks before doing them.** For larger, multi-step
-  requests the agent first breaks the work into an ordered to-do checklist,
-  posts it, then works through the items one at a time — checking each off as it
-  goes — so you can follow progress. Small, one-off requests are still handled
-  directly without the extra ceremony.
+- **Reverted the task-breakdown to-do list (0.4.24–0.4.26).** The mandatory
+  checklist workflow made several models (Gemini, Claude Haiku, GPT-5.4) burn
+  their steps/context on planning and, in some cases, claim a task was done
+  without actually writing the file. Removing it restores the previous, reliable
+  "just do the work to completion" behavior across all providers while we design a
+  lighter-weight approach.
 
 ## [0.4.23]
 

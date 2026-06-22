@@ -198,7 +198,6 @@ async fn run_orchestrated_task(
             AgentEventKind::AskRequired => "ask_required",
             AgentEventKind::StepLimitReached => "step_limit",
             AgentEventKind::DiscardDraft => "discard_draft",
-            AgentEventKind::TodoUpdate => "todo_update",
         };
 
         let data = match event.kind {

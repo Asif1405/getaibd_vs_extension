@@ -252,14 +252,6 @@ export interface AgentCallbacks {
   onStepLimit?: () => void;
   /** A provisional assistant draft was superseded; drop the last streamed assistant text. */
   onDiscardDraft?: () => void;
-  /** The structured to-do list changed; render the live checklist. */
-  onTodoUpdate?: (todos: TodoItem[]) => void;
-}
-
-export interface TodoItem {
-  id: string;
-  content: string;
-  status: "pending" | "in_progress" | "completed" | "cancelled";
 }
 
 export interface FileEdit {
@@ -484,14 +476,6 @@ function processAgentEvent(
       case "file_edit": {
         try {
           callbacks.onFileEdit?.(JSON.parse(data));
-        } catch {}
-        break;
-      }
-      case "todo_update": {
-        try {
-          const parsed = JSON.parse(data);
-          const todos = Array.isArray(parsed?.todos) ? parsed.todos : [];
-          callbacks.onTodoUpdate?.(todos as TodoItem[]);
         } catch {}
         break;
       }
