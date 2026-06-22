@@ -4,6 +4,40 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.34]
+
+A major agent-reliability pass. Verified end-to-end against every catalog model
+(same task to each through the real agent loop): 22/24 now complete the task in
+full — the two misses were a slow model hitting the test's own time cap and a
+transient upstream provider error, not the agent.
+
+- **Weak models now actually run tools instead of describing them.** When a model
+  replies with prose like "[update_plan(…)]" instead of a real tool call, the next
+  turn is sent with `tool_choice=required`, forcing it to act. This fixes models
+  (e.g. Llama 4 Maverick) that previously narrated file creation and produced
+  nothing.
+- **The completion reviewer now checks the real workspace, not the chat.** It is
+  given the actual `git` changes, so "I created USER_MANUAL.md" with no file on
+  disk is caught and the agent is sent back to finish — instead of quitting before
+  the files are written.
+- **No more premature stops; runs are governed by the context budget.** Instead of
+  a fixed step ceiling, the agent keeps working until the task is verified done or
+  it is genuinely stuck (no new progress across several reviews), summarizing at
+  85% of the model's real window to make room. Safety backstops prevent runaways.
+- **A persistent task plan.** The agent keeps a checklist via a new `update_plan`
+  tool that is pinned in context and never summarized away, so it doesn't lose its
+  place on long tasks.
+- **Per-model real context windows** are now read from the catalog instead of
+  guessed, so summarization triggers at the right time for every model.
+- **Provider outages surface as errors instead of silent "done."** A mid-stream
+  upstream error (e.g. credit exhaustion) used to look like an empty turn and make
+  the agent stop as if finished; it now reports the real error. Relatedly, when the
+  completion check itself can't run, the agent never declares success unless real
+  work actually happened.
+- **Fixed strict-provider tool rejections** (e.g. Groq) by accepting and coercing
+  boolean arguments sent as strings.
+- The completion-review model is now overridable via `GETAIBD_COMPLETION_MODEL`.
+
 ## [0.4.33]
 
 - **Fixed the agent failing unpredictably (e.g. "no file was created") on many

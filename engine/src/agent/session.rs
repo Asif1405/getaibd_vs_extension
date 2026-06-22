@@ -14,6 +14,10 @@ pub struct Session {
     pub reasoning_effort: Option<String>,
     /// Host OS + shell the client runs in, so generated commands match it.
     pub environment: Option<String>,
+    /// Structured task ledger (goal + checklist) the agent maintains via the
+    /// `update_plan` tool. Re-injected verbatim every turn and never summarized
+    /// away, so long runs keep their plan and place even after compression.
+    pub task_ledger: Option<String>,
 }
 
 impl Session {
@@ -32,6 +36,7 @@ impl Session {
             system_prompt: None,
             reasoning_effort: None,
             environment: None,
+            task_ledger: None,
         }
     }
 

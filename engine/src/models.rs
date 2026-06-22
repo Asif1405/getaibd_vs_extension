@@ -197,6 +197,11 @@ pub struct ToolChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// OpenAI-compatible tool_choice ("auto" | "required" | "none"). `None` lets
+    /// the provider default (auto). Used to FORCE a tool call when a weak model
+    /// keeps narrating instead of acting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

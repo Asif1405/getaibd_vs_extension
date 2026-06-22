@@ -5,6 +5,7 @@ pub mod command;
 pub mod edits;
 pub mod env_manager;
 pub mod git;
+pub mod plan;
 pub mod terminal_gate;
 pub mod workspace;
 
@@ -86,6 +87,7 @@ impl ToolRegistry {
         )));
         registry.register(Arc::new(env_manager::ManageEnv::new(env_mgr)));
         registry.register(Arc::new(ask::AskQuestion::new()));
+        registry.register(Arc::new(plan::UpdatePlan::new()));
 
         registry
     }

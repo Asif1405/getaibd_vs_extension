@@ -1,6 +1,50 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use serde::Deserialize;
 
-use crate::models::{Message, ToolMessage};
+use crate::models::{Message, ToolDefinition, ToolMessage};
+
+/// Process-wide cache of model id -> real context window (tokens), populated from
+/// the gateway `/models` catalog when the model list is fetched. Lets the agent
+/// use each model's TRUE window instead of guessing from a name table.
+fn window_cache() -> &'static Mutex<HashMap<String, usize>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a model's catalog-reported context window. Ignores 0 (unknown).
+pub fn record_model_window(model: &str, window: usize) {
+    if window == 0 || model.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = window_cache().lock() {
+        cache.insert(model.to_string(), window);
+    }
+}
+
+/// Peek the cached catalog window for a model without falling back to the name
+/// table. `None` means the catalog hasn't been fetched (or didn't report one).
+pub fn cached_window(model: &str) -> Option<usize> {
+    window_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(model).copied())
+        .filter(|&w| w > 0)
+}
+
+/// The context window to use for a model: the catalog value reported by the
+/// gateway when known, otherwise a best-effort estimate from the model name.
+pub fn context_window_for(model: &str) -> usize {
+    if let Ok(cache) = window_cache().lock() {
+        if let Some(&w) = cache.get(model) {
+            if w > 0 {
+                return w;
+            }
+        }
+    }
+    model_context_limit(model)
+}
 
 /// Approximate token count from text. Most LLM tokenizers average ~4 chars per token.
 fn estimate_tokens(text: &str) -> usize {
@@ -229,6 +273,20 @@ fn tool_message_tokens(msg: &ToolMessage) -> usize {
 /// the running context has grown enough to warrant summarizing older turns.
 pub fn count_tool_message_tokens(messages: &[ToolMessage]) -> usize {
     messages.iter().map(tool_message_tokens).sum()
+}
+
+/// Approximate tokens consumed by the tool schemas sent on every turn. They are
+/// part of the prompt but live outside the message list, so the budget check must
+/// add them in or it under-counts and summarizes too late.
+pub fn count_tool_definition_tokens(defs: &[ToolDefinition]) -> usize {
+    defs.iter()
+        .map(|d| {
+            estimate_tokens(&d.name)
+                + estimate_tokens(&d.description)
+                + d.input_schema.to_string().len() / 4
+                + 8 // wrapper overhead per tool
+        })
+        .sum()
 }
 
 #[cfg(test)]

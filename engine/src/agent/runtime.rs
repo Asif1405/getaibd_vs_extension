@@ -23,11 +23,22 @@ use crate::tools::ToolRegistry;
 use super::session::Session;
 use super::thinking;
 
-/// Model used for the strict task-completion review on the GetAIBD provider.
+/// Default model for the strict task-completion review on the GetAIBD provider.
 /// The completion check is a small, stateless JSON classification, so it runs on
 /// a cheap fast model instead of the (possibly expensive) model the user picked.
 /// Other providers keep using the session model (see `verify_task_complete`).
-const GETAIBD_COMPLETION_MODEL: &str = "gemini-3.5-flash";
+/// Overridable at runtime via `GETAIBD_COMPLETION_MODEL` so ops can repoint it
+/// without a rebuild (e.g. if a provider runs out of upstream credits).
+const DEFAULT_COMPLETION_MODEL: &str = "gemini-3.5-flash";
+
+/// The completion-reviewer model: env override if set, else the funded default.
+fn completion_model() -> String {
+    std::env::var("GETAIBD_COMPLETION_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_COMPLETION_MODEL.to_string())
+}
 
 pub struct AgentEvent {
     pub kind: AgentEventKind,
@@ -136,6 +147,12 @@ pub async fn run_agent_with_memory(
             "{}: does not support tool calling",
             provider.id()
         )));
+    }
+
+    // Warm the catalog context-window cache once if this model's real window
+    // isn't known yet, so summarization uses the true limit instead of a guess.
+    if crate::context::cached_window(&session.model).is_none() {
+        let _ = provider.list_models().await;
     }
 
     inject_context(session, task, memory).await;
@@ -282,26 +299,54 @@ async fn agent_loop(
     let mut iterations = 0;
     let mut last_text = String::new();
     let mut nudge_count = 0u32;
+    // When a weak model replies with prose instead of a tool call, we set this so
+    // the NEXT request sends tool_choice="required", forcing it to actually act.
+    // Reset as soon as it emits a real tool call.
+    let mut force_tool_call = false;
     let use_streaming = provider.supports_streaming_tools();
     let enable_thinking = options.is_none_or(|o| o.enable_thinking);
 
     // Auto-complete (manager/critic) state. When enabled, a strict reviewer confirms the original
     // task is actually finished before the run ends and forces the agent to keep going if not.
     // Hard caps keep this from ever looping forever or burning the balance:
+    // The run is normally governed by task completion + the 85% context budget +
+    // stall detection — NOT a fixed step count. These backstops only ever stop a
+    // pathological model that never settles:
     //   * MAX_FORCE_CONTINUE — absolute number of forced continuations.
-    //   * a no-progress guard — never force-continue unless new tools ran since the last push.
-    const MAX_FORCE_CONTINUE: u32 = 8;
+    //   * ABSOLUTE_MAX_ITERATIONS — hard wall on total model turns.
+    //   * MAX_STALL_ROUNDS — stop when genuinely stuck (no progress, same gaps).
+    const MAX_FORCE_CONTINUE: u32 = 40;
+    const ABSOLUTE_MAX_ITERATIONS: u32 = 200;
+    const MAX_STALL_ROUNDS: u32 = 3;
     const STEP_EXTENSION: u32 = 40;
     let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
     let mut force_continue = 0u32;
-    // Counts only file-mutating tool calls (see `is_mutating_tool`). The force-continue
-    // guard compares these so the agent only keeps going when it actually changed
-    // something since the last review — never just because it re-read or re-checked.
+    // Counts only file-mutating tool calls (see `is_mutating_tool`). Progress is
+    // "did real work happen since the last review" — used by the stall detector so
+    // re-reading or re-checking the same files never counts as headway.
     let mut mutating_total = 0usize;
     let mut mutating_at_last_force = 0usize;
+    // Stall detection: consecutive reviewer rounds with no new progress AND an
+    // unchanged outstanding-items list mean we're genuinely stuck — stop cleanly
+    // instead of forcing forever.
+    let mut stall_rounds = 0u32;
+    let mut last_missing: Vec<String> = Vec::new();
 
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
+    }
+
+    // Seed a structured plan up front for any task that can use tools. The model
+    // lays out its own checklist via update_plan; we then keep it pinned in context
+    // and use it (plus the diff-aware reviewer) to drive the run to real completion.
+    if auto_complete && session.task_ledger.is_none() {
+        session.push_message(ToolMessage::system(
+            "FIRST, for any task that needs more than one step, call the update_plan tool with a \
+             short checklist: a one-line goal followed by concrete steps each marked [ ]. As you \
+             finish each step, call update_plan again to mark it [x]. Do not stop until every step \
+             is [x] and the original task is genuinely done. For a trivial one-step task you may \
+             skip planning and just do it.",
+        ));
     }
 
     loop {
@@ -311,7 +356,7 @@ async fn agent_loop(
             // stopping. Otherwise fall through to the manual Continue brake below.
             if auto_complete
                 && force_continue < MAX_FORCE_CONTINUE
-                && mutating_total > mutating_at_last_force
+                && iterations < ABSOLUTE_MAX_ITERATIONS
             {
                 on_event(AgentEvent {
                     kind: AgentEventKind::Reflecting,
@@ -322,26 +367,46 @@ async fn agent_loop(
                 } else {
                     last_text.as_str()
                 };
-                let verdict = verify_task_complete(session, task, final_text, provider).await;
-                if !verdict.done {
-                    force_continue += 1;
-                    mutating_at_last_force = mutating_total;
-                    nudge_count = 0;
-                    session.max_iterations += STEP_EXTENSION;
-                    let remaining = format_missing(&verdict.missing);
-                    on_event(AgentEvent {
-                        kind: AgentEventKind::Reflecting,
-                        content: Some(format!(
-                            "Step limit reached but the task isn't done — continuing automatically \
-                             ({force_continue}/{MAX_FORCE_CONTINUE}).\n{remaining}"
-                        )),
-                    });
-                    session.push_message(ToolMessage::system(format!(
-                        "A completion reviewer checked your work against the ORIGINAL task and found \
-                         it is NOT yet complete. Outstanding items:\n{remaining}\n\nKeep working and \
-                         finish these by calling the appropriate tools. Do not stop until done."
-                    )));
-                    continue;
+                let workspace = workspace_changes_brief(registry).await;
+                let verdict =
+                    verify_task_complete(session, task, final_text, &workspace, provider).await;
+                let done = if verdict.verified {
+                    verdict.done
+                } else {
+                    mutating_total > 0
+                };
+                if !done {
+                    let progressed = mutating_total > mutating_at_last_force;
+                    let stalled = is_stalled(
+                        progressed,
+                        &verdict.missing,
+                        &mut last_missing,
+                        &mut stall_rounds,
+                        MAX_STALL_ROUNDS,
+                    );
+                    if !stalled {
+                        force_continue += 1;
+                        mutating_at_last_force = mutating_total;
+                        nudge_count = 0;
+                        force_tool_call = true;
+                        session.max_iterations += STEP_EXTENSION;
+                        let remaining = format_missing(&verdict.missing);
+                        on_event(AgentEvent {
+                            kind: AgentEventKind::Reflecting,
+                            content: Some(format!(
+                                "Step limit reached but the task isn't done — continuing \
+                                 automatically ({force_continue}/{MAX_FORCE_CONTINUE}).\n{remaining}"
+                            )),
+                        });
+                        session.push_message(ToolMessage::system(format!(
+                            "A completion reviewer checked your work against the ORIGINAL task and \
+                             found it is NOT yet complete. Outstanding items:\n{remaining}\n\nKeep \
+                             working and finish these by calling the appropriate tools. Do not stop \
+                             until done."
+                        )));
+                        continue;
+                    }
+                    // Genuinely stuck — fall through to the wrap-up summary stop.
                 }
             }
             on_event(AgentEvent {
@@ -360,6 +425,7 @@ async fn agent_loop(
                 temperature: None,
                 max_tokens: None,
                 reasoning_effort: None,
+                tool_choice: None,
             };
             let summary = match chat_with_tools_retry_cb(provider, &wrap, None).await {
                 Ok(r) => r.content.filter(|c| !c.trim().is_empty()),
@@ -389,24 +455,55 @@ async fn agent_loop(
         // token estimate and, once the conversation crosses 85% of the model's
         // context window, summarize the older middle while keeping the system
         // prompt, the original task, and the most recent turns verbatim.
-        let ctx_limit = crate::context::model_context_limit(&session.model);
-        let used_tokens = crate::context::count_tool_message_tokens(&session.messages);
+        let ctx_limit = crate::context::context_window_for(&session.model);
+        let tool_tokens = crate::context::count_tool_definition_tokens(&tool_defs);
         #[allow(clippy::cast_precision_loss)]
         let summarize_threshold = (ctx_limit as f32 * 0.85) as usize;
-        if used_tokens > summarize_threshold && summarize_old_messages(session, provider).await {
+        // Summarize-and-refeed: never trim. Keep compressing the older middle until
+        // we're back under 85% of the model's real window, or a pass can no longer
+        // compress anything (guarantees termination even if the recent tail alone
+        // is large).
+        let mut compressed = false;
+        loop {
+            let used = crate::context::count_tool_message_tokens(&session.messages) + tool_tokens;
+            if used <= summarize_threshold {
+                break;
+            }
+            if !summarize_old_messages(session, provider).await {
+                break;
+            }
+            compressed = true;
+        }
+        if compressed {
             on_event(AgentEvent {
                 kind: AgentEventKind::ContextCompressed,
                 content: Some("Summarized earlier turns to stay within the context window".into()),
             });
         }
 
+        // Re-inject the task ledger as the most-recent system note every turn so the
+        // model always sees its current plan/place. It lives outside session.messages,
+        // so it is never summarized away and always reflects the latest update_plan.
+        let mut req_messages = session.messages.clone();
+        if let Some(ledger) = session.task_ledger.as_deref() {
+            if !ledger.trim().is_empty() {
+                req_messages.push(ToolMessage::system(format!(
+                    "CURRENT PLAN (your task ledger — keep it updated with the update_plan tool; \
+                     mark steps [x] as you finish them and do not stop until every step is [x]):\n{ledger}"
+                )));
+            }
+        }
+
         let request = ToolChatRequest {
             model: session.model.clone(),
-            messages: session.messages.clone(),
+            messages: req_messages,
             tools: tool_defs.clone(),
             temperature: None,
             max_tokens: None,
             reasoning_effort: session.reasoning_effort.clone(),
+            // Force a tool call after a narration so weak models stop describing
+            // work and actually do it; auto otherwise.
+            tool_choice: force_tool_call.then(|| "required".to_string()),
         };
 
         let response = if use_streaming {
@@ -433,26 +530,67 @@ async fn agent_loop(
             let content_txt = response.content.as_deref().unwrap_or("");
 
             // Auto-complete: the worker stopped calling tools, so it is implicitly claiming the
-            // task is done. As soon as it has made real progress, a strict reviewer independently
-            // checks the result against the ORIGINAL task — BEFORE we burn turns nudging. If it is
-            // genuinely complete the agent QUITS immediately with this summary; only when real work
-            // is still missing do we force it to keep going. Bounded by MAX_FORCE_CONTINUE and the
-            // no-progress guard (mutating_total must have grown since the last forced continue).
+            // task is done. A strict, diff-aware reviewer independently checks the result against
+            // the ORIGINAL task AND the real workspace changes. If genuinely complete the agent
+            // QUITS immediately with this summary; otherwise we force it to keep going (and to
+            // emit a real tool call). We run the reviewer even before any mutation so a model that
+            // merely NARRATES a file (never calling write_file) is caught and forced to actually
+            // write it. The stall detector below guarantees this can never loop forever.
             if auto_complete
                 && !looks_like_user_question(content_txt)
                 && force_continue < MAX_FORCE_CONTINUE
-                && mutating_total > mutating_at_last_force
             {
                 let final_text = if content_txt.trim().is_empty() {
                     last_text.as_str()
                 } else {
                     content_txt
                 };
-                let verdict = verify_task_complete(session, task, final_text, provider).await;
-                if !verdict.done {
+                let workspace = workspace_changes_brief(registry).await;
+                let verdict =
+                    verify_task_complete(session, task, final_text, &workspace, provider).await;
+                // When the reviewer couldn't run, accept completion only if real work
+                // actually happened — never quit a task with nothing done.
+                let done = if verdict.verified {
+                    verdict.done
+                } else {
+                    mutating_total > 0
+                };
+                if !done {
+                    let progressed = mutating_total > mutating_at_last_force;
+                    let stalled = is_stalled(
+                        progressed,
+                        &verdict.missing,
+                        &mut last_missing,
+                        &mut stall_rounds,
+                        MAX_STALL_ROUNDS,
+                    );
+                    if stalled {
+                        // Genuinely stuck: stop cleanly and tell the user what's blocking rather
+                        // than spinning. Drop the streamed draft first (see ordering note below).
+                        on_event(AgentEvent {
+                            kind: AgentEventKind::DiscardDraft,
+                            content: None,
+                        });
+                        let blocked = format_missing(&verdict.missing);
+                        let msg = format!(
+                            "{}\n\nI couldn't fully finish — these items still look incomplete after \
+                             several attempts:\n{blocked}",
+                            final_text.trim()
+                        );
+                        return finish_agent(
+                            session,
+                            Some(msg),
+                            memory,
+                            provider,
+                            iterations,
+                            on_event,
+                        )
+                        .await;
+                    }
                     force_continue += 1;
                     mutating_at_last_force = mutating_total;
                     nudge_count = 0;
+                    force_tool_call = true;
                     // Drop the summary we just streamed FIRST, before any other event. The client
                     // discards the last streamed draft by the handle it is still holding; emitting
                     // a status event (e.g. Reflecting) first would detach that handle and leave the
@@ -470,11 +608,12 @@ async fn agent_loop(
                         )),
                     });
                     session.push_message(ToolMessage::system(format!(
-                        "A completion reviewer checked your work against the ORIGINAL task and found \
-                         it is NOT yet complete. Outstanding items:\n{remaining}\n\nResume now and \
-                         finish these by calling the appropriate tools (write_file, patch_file, \
-                         run_command, etc.). Do the work end to end, then verify with git_diff. Do \
-                         not stop or summarize until everything is genuinely done."
+                        "A completion reviewer checked your work against the ORIGINAL task and the \
+                         actual workspace and found it is NOT yet complete. Outstanding \
+                         items:\n{remaining}\n\nResume now and finish these by calling the \
+                         appropriate tools (write_file, patch_file, run_command, etc.). Do the work \
+                         end to end, then verify with git_diff. Do not stop or summarize until \
+                         everything is genuinely done."
                     )));
                     continue;
                 }
@@ -501,6 +640,9 @@ async fn agent_loop(
                 && iterations < session.max_iterations;
             if described_only {
                 nudge_count += 1;
+                // Force the next turn to emit a tool call — prose nudges alone don't
+                // move weak models that keep narrating instead of acting.
+                force_tool_call = true;
                 session.push_message(ToolMessage::system(
                     "You replied without calling any tool, so the task has NOT been performed yet \
                      and no files have changed. Call the appropriate tools NOW (write_file, \
@@ -527,9 +669,11 @@ async fn agent_loop(
             }
         }
 
-        // The model is making progress (it called tools), so refill the nudge budget:
-        // the limit is for consecutive empty replies, not the whole run.
+        // The model is making progress (it called tools), so refill the nudge budget
+        // and stop forcing tool calls: the limit is for consecutive empty replies,
+        // not the whole run.
         nudge_count = 0;
+        force_tool_call = false;
         mutating_total += response
             .tool_calls
             .iter()
@@ -560,6 +704,63 @@ fn is_mutating_tool(name: &str) -> bool {
 struct CompletionVerdict {
     done: bool,
     missing: Vec<String>,
+    /// False when the reviewer call itself failed (provider down), so the caller
+    /// must NOT treat the verdict as authoritative — never quit a task with no work
+    /// done just because the completion check was unavailable.
+    verified: bool,
+}
+
+/// A concise snapshot of the REAL workspace changes (modified + created files),
+/// so the completion reviewer can tell whether files the agent *claims* it wrote
+/// actually exist — instead of trusting the chat text. Prefers `git status`
+/// (lists modified + untracked/created files), falling back to the session's
+/// tracked edits via `git_diff` for non-git workspaces.
+async fn workspace_changes_brief(registry: &ToolRegistry) -> String {
+    if let Some(tool) = registry.get("git_status") {
+        if let Ok(v) = tool.execute(serde_json::json!({})).await {
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("").trim();
+            if !status.is_empty() {
+                return truncate_brief(status, 1500);
+            }
+        }
+    }
+    if let Some(tool) = registry.get("git_diff") {
+        if let Ok(v) = tool.execute(serde_json::json!({})).await {
+            let diff = v.get("diff").and_then(|s| s.as_str()).unwrap_or("").trim();
+            if !diff.is_empty() {
+                return truncate_brief(diff, 1500);
+            }
+        }
+    }
+    "(no file changes detected in the workspace this session)".to_string()
+}
+
+/// Truncate a brief to a character budget on a char boundary, with a marker.
+fn truncate_brief(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}\n…(truncated)", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// Update stall tracking from a "not done" verdict. Returns true when the run is
+/// genuinely stuck: no new progress AND the same outstanding items repeated for
+/// `max_stall` consecutive reviews. This is what lets the agent run as long as
+/// it's productive while still terminating on a model that can't make headway.
+fn is_stalled(
+    progressed: bool,
+    missing: &[String],
+    last_missing: &mut Vec<String>,
+    stall_rounds: &mut u32,
+    max_stall: u32,
+) -> bool {
+    if !progressed && missing == last_missing.as_slice() {
+        *stall_rounds += 1;
+    } else {
+        *stall_rounds = 0;
+    }
+    *last_missing = missing.to_vec();
+    *stall_rounds >= max_stall
 }
 
 /// Render the reviewer's outstanding items as a short bullet list for prompts/events.
@@ -606,6 +807,7 @@ fn parse_verdict(s: &str) -> CompletionVerdict {
             return CompletionVerdict {
                 done: true,
                 missing: Vec::new(),
+                verified: true,
             }
         }
     };
@@ -623,11 +825,16 @@ fn parse_verdict(s: &str) -> CompletionVerdict {
                         .collect()
                 })
                 .unwrap_or_default();
-            CompletionVerdict { done, missing }
+            CompletionVerdict {
+                done,
+                missing,
+                verified: true,
+            }
         }
         Err(_) => CompletionVerdict {
             done: true,
             missing: Vec::new(),
+            verified: true,
         },
     }
 }
@@ -638,29 +845,34 @@ async fn verify_task_complete(
     session: &Session,
     task: &str,
     final_text: &str,
+    workspace: &str,
     provider: &Arc<dyn Provider>,
 ) -> CompletionVerdict {
     let recent = recent_activity_brief(&session.messages);
     let system = "You are a STRICT completion reviewer for an autonomous coding agent. Given the \
-        ORIGINAL TASK and the agent's final message plus recent activity, decide whether the \
-        EXPLICIT requirements of the ORIGINAL TASK are FULLY and CONCRETELY complete. Reply with \
-        ONLY compact JSON: {\"done\": true|false, \"missing\": [\"specific unfinished item\"]}. \
-        Judge ONLY against what the original task actually asked for. If a requested part was only \
-        described or planned but not actually carried out, or a requested file/change/answer is \
-        absent, set done=false and list concrete missing items. IGNORE the agent's own \
-        suggestions, offers, ideas, or 'next steps' (e.g. 'I can also…', 'want me to…', \
-        'optionally…') — these are NOT requirements, so never list them as missing. If everything \
-        the task explicitly asked for was done — or it was a question/explanation that has already \
-        been fully answered — set done=true with an empty missing list. Never output anything \
-        except the JSON object.";
+        ORIGINAL TASK, the agent's final message, recent activity, and the ACTUAL WORKSPACE \
+        CHANGES (real files modified/created this session), decide whether the EXPLICIT \
+        requirements of the ORIGINAL TASK are FULLY and CONCRETELY complete. Reply with ONLY \
+        compact JSON: {\"done\": true|false, \"missing\": [\"specific unfinished item\"]}. Judge \
+        ONLY against what the original task actually asked for. CRUCIALLY: trust the WORKSPACE \
+        CHANGES over the agent's claims — if the agent says it created or edited a file but that \
+        file does NOT appear in the workspace changes, the work was NOT done, so set done=false \
+        and list it (e.g. 'USER_MANUAL.md was described but never written'). If a requested part \
+        was only described or planned but not actually carried out, set done=false. IGNORE the \
+        agent's own suggestions, offers, ideas, or 'next steps' (e.g. 'I can also…', 'want me \
+        to…', 'optionally…') — these are NOT requirements, so never list them as missing. If \
+        everything the task explicitly asked for was actually done — or it was a \
+        question/explanation that has already been fully answered (no files required) — set \
+        done=true with an empty missing list. Never output anything except the JSON object.";
     let user = format!(
-        "ORIGINAL TASK:\n{task}\n\nAGENT'S FINAL MESSAGE:\n{final_text}\n\nRECENT ACTIVITY:\n{recent}"
+        "ORIGINAL TASK:\n{task}\n\nAGENT'S FINAL MESSAGE:\n{final_text}\n\nWORKSPACE CHANGES \
+         (actual files changed this session):\n{workspace}\n\nRECENT ACTIVITY:\n{recent}"
     );
     // On GetAIBD, route this lightweight review to a cheap fast model. Other
     // providers (BYOK) keep using the user's selected model, since a GetAIBD
     // catalog id wouldn't be valid for them.
     let review_model = if session.provider_id == "getaibd" {
-        GETAIBD_COMPLETION_MODEL.to_string()
+        completion_model()
     } else {
         session.model.clone()
     };
@@ -671,13 +883,18 @@ async fn verify_task_complete(
         temperature: Some(0.0),
         max_tokens: Some(500),
         reasoning_effort: None,
+        tool_choice: None,
     };
     match chat_with_tools_retry_cb(provider, &request, None).await {
         Ok(r) => parse_verdict(r.content.as_deref().unwrap_or("")),
-        // Fail open: a reviewer error must not block the agent from finishing.
+        // The reviewer call itself failed (e.g. completion model is down). Mark the
+        // verdict unverified so the caller decides safely: accept completion only if
+        // real work was actually done, otherwise keep going (bounded by stall
+        // detection) rather than quitting a task with nothing accomplished.
         Err(_) => CompletionVerdict {
-            done: true,
-            missing: Vec::new(),
+            done: false,
+            missing: vec!["completion check unavailable — verify work was finished".to_string()],
+            verified: false,
         },
     }
 }
@@ -1177,6 +1394,21 @@ async fn execute_tool_calls(
             }
             None => serde_json::json!({ "error": format!("Unknown tool: {}", call.name) }),
         };
+
+        // The plan/ledger tool is special: persist its content on the session so
+        // we can re-inject it verbatim every turn and shield it from summarization.
+        if call.name == "update_plan" {
+            if let Some(plan) = call.arguments.get("plan").and_then(|v| v.as_str()) {
+                let plan = plan.trim();
+                if !plan.is_empty() {
+                    session.task_ledger = Some(plan.to_string());
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::Planning,
+                        content: Some(plan.to_string()),
+                    });
+                }
+            }
+        }
 
         let mut result = result;
         if let Some(edit) = result.as_object_mut().and_then(|o| o.remove("_edit")) {

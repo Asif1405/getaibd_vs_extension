@@ -155,7 +155,10 @@ impl Tool for WriteFile {
             "properties": {
                 "path": { "type": "string", "description": "File path relative to project root" },
                 "content": { "type": "string", "description": "Content to write" },
-                "create_dirs": { "type": "boolean", "description": "Create parent directories if missing" }
+                // Accept boolean OR string: some providers (e.g. Groq) strictly validate the
+                // model's tool-call output against this schema and reject a stringy "true",
+                // which would otherwise fail the whole turn. We coerce it in execute().
+                "create_dirs": { "type": ["boolean", "string"], "description": "Create parent directories if missing (true/false)" }
             },
             "required": ["path", "content"]
         })
@@ -172,7 +175,14 @@ impl Tool for WriteFile {
         let content = input["content"]
             .as_str()
             .ok_or_else(|| AppError::InvalidRequest("content is required".into()))?;
-        let create_dirs = input["create_dirs"].as_bool().unwrap_or(false);
+        let create_dirs = match &input["create_dirs"] {
+            Value::Bool(b) => *b,
+            Value::String(s) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            ),
+            _ => false,
+        };
 
         let path = resolve_path(&self.root, rel)?;
 

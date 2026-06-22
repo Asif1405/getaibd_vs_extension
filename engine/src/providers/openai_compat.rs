@@ -90,6 +90,8 @@ struct CompatToolRequest {
     messages: Vec<CompatMessage>,
     tools: Vec<CompatToolDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -103,6 +105,8 @@ struct CompatToolStreamRequest {
     messages: Vec<CompatMessage>,
     tools: Vec<CompatToolDef>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,6 +317,9 @@ impl Provider for OpenAiCompatProvider {
             id: String,
             #[serde(default)]
             capabilities: Vec<String>,
+            /// Real context window (tokens) from the catalog; 0/absent when unknown.
+            #[serde(default)]
+            context_window: usize,
         }
 
         let req = self.client.get(format!("{}/models", self.base_url));
@@ -328,10 +335,15 @@ impl Provider for OpenAiCompatProvider {
         let mut models: Vec<ModelInfo> = resp
             .data
             .into_iter()
-            .map(|m| ModelInfo {
-                name: m.id.clone(),
-                id: m.id,
-                capabilities: m.capabilities,
+            .map(|m| {
+                // Cache the catalog's real context window so the agent loop can use
+                // it instead of guessing from the model name.
+                crate::context::record_model_window(&m.id, m.context_window);
+                ModelInfo {
+                    name: m.id.clone(),
+                    id: m.id,
+                    capabilities: m.capabilities,
+                }
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -500,10 +512,16 @@ impl Provider for OpenAiCompatProvider {
             })
             .collect();
 
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            request.tool_choice.clone()
+        };
         let body = CompatToolRequest {
             model: model.to_string(),
             messages: request.messages.iter().map(CompatMessage::from).collect(),
             tools,
+            tool_choice,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             reasoning_effort: norm_effort(&request.reasoning_effort),
@@ -592,11 +610,17 @@ impl Provider for OpenAiCompatProvider {
                 })
                 .collect();
 
+            let tool_choice = if tools.is_empty() {
+                None
+            } else {
+                request.tool_choice.clone()
+            };
             let body = CompatToolStreamRequest {
                 model: model.to_string(),
                 messages: request.messages.iter().map(CompatMessage::from).collect(),
                 tools,
                 stream: true,
+                tool_choice,
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
                 reasoning_effort: norm_effort(&request.reasoning_effort),
@@ -646,6 +670,25 @@ impl Provider for OpenAiCompatProvider {
                         }
                         yield ToolStreamDelta::Done;
                         return;
+                    }
+
+                    // Surface mid-stream provider errors (e.g. upstream 429/credit
+                    // exhaustion) instead of silently ending with an empty turn — an
+                    // empty turn looks to the agent like "the model said nothing" and
+                    // makes it quit as if the task were done.
+                    if data.contains("\"error\"") {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                            if v.get("choices").is_none() {
+                                if let Some(err) = v.get("error") {
+                                    let msg = err
+                                        .get("message")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| err.to_string());
+                                    Err(AppError::ProviderError(format!("{pid}: {msg}")))?;
+                                }
+                            }
+                        }
                     }
 
                     if let Ok(chunk) = serde_json::from_str::<CompatStreamChunk>(data) {
