@@ -11,29 +11,51 @@ fn message_tokens(msg: &Message) -> usize {
     estimate_tokens(&msg.content) + 4 // role overhead
 }
 
-/// Known context window sizes per model prefix.
-fn model_context_limit(model: &str) -> usize {
+/// Approximate context window (in tokens) for a model, used to decide when to
+/// summarize the conversation. Under-estimating is harmful: it makes the agent
+/// summarize (or, previously, drop) its own context too early, so it can lose its
+/// place and fail unpredictably. Every model the platform serves has at least a
+/// 128k window, so unknown models default to 128k rather than a tiny 8k.
+pub fn model_context_limit(model: &str) -> usize {
     let m = model.to_lowercase();
-    if m.contains("gpt-4o") || m.contains("gpt-4-turbo") {
+    // Order matters: match the most specific identifiers first.
+    if m.contains("gpt-3.5") {
+        16_385
+    } else if m.contains("gpt-4o")
+        || m.contains("gpt-4-turbo")
+        || m.contains("gpt-4.1")
+        || m.contains("gpt-5")
+        || m.contains("o1")
+        || m.contains("o3")
+        || m.contains("o4-mini")
+    {
         128_000
     } else if m.contains("gpt-4") {
         8_192
-    } else if m.contains("gpt-3.5") {
-        16_385
-    } else if m.contains("claude-3") || m.contains("claude-sonnet") || m.contains("claude-opus") {
+    } else if m.contains("claude") {
+        // Claude 3.x and 4.x all expose at least a 200k window.
         200_000
-    } else if m.contains("gemini-2") || m.contains("gemini-1.5-pro") {
-        1_000_000
     } else if m.contains("gemini") {
-        32_000
+        // Gemini 1.5/2/2.5/3.x are all >=1M.
+        1_000_000
     } else if m.contains("grok") {
         131_072
-    } else if m.contains("deepseek") {
-        64_000
-    } else if m.contains("llama-3.1-405b") || m.contains("llama-3.1-70b") {
+    } else if m.contains("llama-4") {
+        // Llama 4 Scout/Maverick expose very large windows (>=320k).
+        320_000
+    } else if m.contains("deepseek")
+        || m.contains("kimi")
+        || m.contains("moonshot")
+        || m.contains("qwen")
+        || m.contains("glm")
+        || m.contains("mistral")
+        || m.contains("mixtral")
+        || m.contains("magistral")
+        || m.contains("llama")
+    {
         128_000
     } else {
-        8_192
+        128_000
     }
 }
 
@@ -69,7 +91,12 @@ impl Default for ContextConfig {
         Self {
             enabled: true,
             max_tokens: None,
-            strategy: TrimStrategy::default(),
+            // Summarize rather than silently dropping old turns: a coding agent's
+            // earlier tool results (files it read, edits it made) are load-bearing
+            // context, and hard-dropping them mid-task makes it lose its place and
+            // fail unpredictably. Trimming should only ever kick in near the real
+            // window, and even then it must preserve a trace of what happened.
+            strategy: TrimStrategy::Summarize,
             reserve_for_completion: default_reserve_ratio(),
         }
     }
@@ -198,115 +225,10 @@ fn tool_message_tokens(msg: &ToolMessage) -> usize {
     (content_len + tool_calls_len) / 4 + 4
 }
 
-/// Trim `ToolMessage` list (used by the agent loop).
-/// Preserves system messages and the most recent messages that fit.
-pub fn trim_to_context_tool_messages(
-    messages: &[ToolMessage],
-    model: &str,
-    config: &ContextConfig,
-) -> (Vec<ToolMessage>, bool) {
-    if !config.enabled || messages.is_empty() {
-        return (messages.to_vec(), false);
-    }
-
-    let ctx_limit = config.max_tokens.unwrap_or_else(|| model_context_limit(model));
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-    let budget = (ctx_limit as f32 * (1.0 - config.reserve_for_completion)) as usize;
-
-    let total: usize = messages.iter().map(tool_message_tokens).sum();
-    if total <= budget {
-        return (messages.to_vec(), false);
-    }
-
-    let mut system_msgs: Vec<&ToolMessage> = Vec::new();
-    let mut non_system: Vec<&ToolMessage> = Vec::new();
-
-    for msg in messages {
-        if msg.role == "system" {
-            system_msgs.push(msg);
-        } else {
-            non_system.push(msg);
-        }
-    }
-
-    let system_cost: usize = system_msgs.iter().map(|m| tool_message_tokens(m)).sum();
-    let remaining_budget = budget.saturating_sub(system_cost);
-
-    let mut kept: Vec<&ToolMessage> = Vec::new();
-    let mut used = 0;
-    for msg in non_system.iter().rev() {
-        let cost = tool_message_tokens(msg);
-        if used + cost > remaining_budget && !kept.is_empty() {
-            break;
-        }
-        used += cost;
-        kept.push(msg);
-    }
-    kept.reverse();
-
-    // Never start the kept window with an orphaned tool result whose preceding
-    // assistant tool_call message was trimmed away — that corrupts the request.
-    while kept.first().is_some_and(|m| m.role == "tool") {
-        kept.remove(0);
-    }
-
-    let trimmed = non_system.len() != kept.len();
-
-    let mut result: Vec<ToolMessage> = system_msgs.into_iter().cloned().collect();
-    if trimmed {
-        let dropped_msgs: Vec<&ToolMessage> = non_system[..non_system.len() - kept.len()].to_vec();
-        let dropped = dropped_msgs.len();
-
-        match config.strategy {
-            TrimStrategy::Summarize => {
-                let summary = summarize_tool_messages(&dropped_msgs);
-                result.push(ToolMessage::system(format!(
-                    "[{dropped} earlier message(s) summarized]\n{summary}"
-                )));
-            }
-            TrimStrategy::DropOldest => {
-                result.push(ToolMessage::system(format!(
-                    "[{dropped} earlier message(s) trimmed to fit context window]"
-                )));
-            }
-        }
-    }
-    result.extend(kept.into_iter().cloned());
-
-    (result, trimmed)
-}
-
-fn summarize_tool_messages(msgs: &[&ToolMessage]) -> String {
-    let mut lines = Vec::new();
-    for msg in msgs {
-        let content = msg.content.as_deref().unwrap_or("");
-        if content.is_empty() && msg.tool_calls.as_ref().is_none_or(|c| c.is_empty()) {
-            continue;
-        }
-        let role_label = match msg.role.as_str() {
-            "assistant" => "Assistant",
-            "user" => "User",
-            "tool" => "Tool result",
-            _ => &msg.role,
-        };
-        if let Some(calls) = &msg.tool_calls {
-            for call in calls {
-                lines.push(format!("- {role_label} called tool `{}`", call.name));
-            }
-        } else if !content.is_empty() {
-            let truncated = if content.len() > 150 {
-                format!("{}...", &content[..150])
-            } else {
-                content.to_string()
-            };
-            lines.push(format!("- {role_label}: {truncated}"));
-        }
-    }
-    if lines.is_empty() {
-        "No meaningful content in dropped messages.".to_string()
-    } else {
-        lines.join("\n")
-    }
+/// Approximate total token usage of an agent conversation. Used to decide when
+/// the running context has grown enough to warrant summarizing older turns.
+pub fn count_tool_message_tokens(messages: &[ToolMessage]) -> usize {
+    messages.iter().map(tool_message_tokens).sum()
 }
 
 #[cfg(test)]
@@ -318,6 +240,29 @@ mod tests {
             role: role.into(),
             content: content.into(),
         }
+    }
+
+    #[test]
+    fn modern_models_get_large_windows() {
+        // Regression: these used to fall through to an 8k default, which made the
+        // agent trim its own tool results every turn and never finish (no files).
+        for model in [
+            "kimi-k2-thinking",
+            "llama-4-maverick",
+            "llama-4-scout",
+            "gpt-5.4-pro",
+            "qwen-3-max",
+            "deepseek-v4",
+            "glm-4.6",
+            "some-future-model",
+        ] {
+            assert!(
+                model_context_limit(model) >= 128_000,
+                "{model} should have a >=128k window, got {}",
+                model_context_limit(model)
+            );
+        }
+        assert_eq!(model_context_limit("gpt-3.5-turbo"), 16_385);
     }
 
     #[test]
@@ -382,50 +327,13 @@ mod tests {
         assert!(result[1].content.contains("User:"));
     }
 
-    fn tool_msg(role: &str, content: &str) -> ToolMessage {
-        ToolMessage {
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        }
-    }
-
     #[test]
-    fn tool_message_trim_preserves_system() {
-        let mut msgs = vec![tool_msg("system", "system prompt")];
-        for _ in 0..500 {
-            msgs.push(tool_msg("user", &"long user message".repeat(20)));
-            msgs.push(tool_msg("assistant", "response"));
-        }
-        let cfg = ContextConfig {
-            enabled: true,
-            max_tokens: Some(1000),
-            strategy: TrimStrategy::DropOldest,
-            reserve_for_completion: 0.25,
-        };
-        let (result, trimmed) = trim_to_context_tool_messages(&msgs, "gpt-4o", &cfg);
-        assert!(trimmed);
-        assert!(result.len() < msgs.len());
-        assert_eq!(result[0].role, "system");
-    }
-
-    #[test]
-    fn tool_message_summarize_strategy() {
-        let mut msgs = vec![tool_msg("system", "system prompt")];
-        for _ in 0..500 {
-            msgs.push(tool_msg("user", "tell me something"));
-            msgs.push(tool_msg("assistant", "here you go"));
-        }
-        let cfg = ContextConfig {
-            enabled: true,
-            max_tokens: Some(1000),
-            strategy: TrimStrategy::Summarize,
-            reserve_for_completion: 0.25,
-        };
-        let (result, trimmed) = trim_to_context_tool_messages(&msgs, "gpt-4o", &cfg);
-        assert!(trimmed);
-        assert!(result[1].content.as_deref().unwrap_or("").contains("summarized"));
+    fn counts_tokens_for_tool_messages() {
+        let msgs = vec![
+            ToolMessage::system("system prompt"),
+            ToolMessage::user(&"x".repeat(400)),
+        ];
+        // ~400 chars / 4 ≈ 100 tokens for the user msg, plus overhead.
+        assert!(count_tool_message_tokens(&msgs) >= 100);
     }
 }

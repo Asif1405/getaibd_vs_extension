@@ -4,6 +4,25 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.33]
+
+- **Fixed the agent failing unpredictably (e.g. "no file was created") on many
+  models.** The engine estimated the context window per model, but unknown model
+  families (Kimi, Llama 4 Maverick/Scout, GPT‑5, Qwen, GLM, …) fell through to a
+  tiny 8k default. With such a small budget the agent trimmed — and *dropped* —
+  its own tool results and the original task almost immediately, so it lost its
+  place, looped, and finished without doing the work. This is why it "sometimes
+  worked": models the table happened to know (Gemini 1M, Claude 200k) were fine,
+  the rest were not. Windows are now correct (128k–1M) and unknown models default
+  to 128k.
+- **New context architecture: summarize, never drop.** Instead of hard-trimming
+  old turns once a token budget is hit, the agent now keeps a running token count
+  and, only when the conversation crosses 85% of the model's real window,
+  summarizes the older middle into a compact note — always preserving the system
+  prompt, the original task, and the most recent turns verbatim. A coding agent's
+  earlier steps are load-bearing context, so they're folded into a summary rather
+  than silently deleted.
+
 ## [0.4.32]
 
 - **No more duplicate "done" summaries, and the agent stops sooner.** When the

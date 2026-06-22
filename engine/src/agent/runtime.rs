@@ -10,7 +10,7 @@ use crate::memory::indexer::MemoryIndexer;
 use crate::memory::persistent::PersistentMemory;
 use crate::memory::store::MemoryStore;
 use crate::memory::{format_context, retrieve_context};
-use crate::context::{trim_to_context_tool_messages, ContextConfig};
+use crate::context::ContextConfig;
 use crate::models::{
     ChatRequest, Message, ToolCall, ToolChatRequest, ToolChatResponse, ToolMessage,
     ToolStreamDelta,
@@ -383,25 +383,21 @@ async fn agent_loop(
             .await;
         }
 
-        const COMPRESS_THRESHOLD: usize = 70;
-        if session.messages.len() > COMPRESS_THRESHOLD {
-            summarize_old_messages(session, provider).await;
+        // Context management: we NEVER hard-drop turns (a coding agent's earlier
+        // tool results and the original task are load-bearing — dropping them makes
+        // it lose its place and fail unpredictably). Instead we track a running
+        // token estimate and, once the conversation crosses 85% of the model's
+        // context window, summarize the older middle while keeping the system
+        // prompt, the original task, and the most recent turns verbatim.
+        let ctx_limit = crate::context::model_context_limit(&session.model);
+        let used_tokens = crate::context::count_tool_message_tokens(&session.messages);
+        #[allow(clippy::cast_precision_loss)]
+        let summarize_threshold = (ctx_limit as f32 * 0.85) as usize;
+        if used_tokens > summarize_threshold && summarize_old_messages(session, provider).await {
             on_event(AgentEvent {
                 kind: AgentEventKind::ContextCompressed,
-                content: Some("Conversation summarized to keep context focused".into()),
+                content: Some("Summarized earlier turns to stay within the context window".into()),
             });
-        }
-
-        if let Some(ctx_cfg) = options.and_then(|o| o.context_config.as_ref()) {
-            let (trimmed, was_trimmed) =
-                trim_to_context_tool_messages(&session.messages, &session.model, ctx_cfg);
-            if was_trimmed {
-                session.messages = trimmed;
-                on_event(AgentEvent {
-                    kind: AgentEventKind::ContextCompressed,
-                    content: Some("Context trimmed to fit model window".into()),
-                });
-            }
         }
 
         let request = ToolChatRequest {
@@ -836,16 +832,29 @@ fn pinned_head_len(messages: &[ToolMessage]) -> usize {
 /// Replaces the older MIDDLE of the conversation with a faithful LLM-generated
 /// summary, keeping the pinned head (system prompt + original task) and the most
 /// recent turns verbatim. Falls back to truncation if the model call fails.
-async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provider>) {
+/// Summarize the older middle of the conversation, keeping the pinned head
+/// (system prompt + original task) and a verbatim recent tail. Returns true if it
+/// actually summarized. Never drops a turn without folding it into the summary.
+async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provider>) -> bool {
     let pinned = pinned_head_len(&session.messages);
     let total = session.messages.len();
     // Keep a generous, verbatim recent tail so in-flight work stays intact.
     let keep_tail = (total / 2).max(10);
     // Bail unless there's a meaningful middle to compress between head and tail.
     if total <= pinned + keep_tail + 3 {
-        return;
+        return false;
     }
-    let summarize_end = total - keep_tail;
+    let mut summarize_end = total - keep_tail;
+    // Never let the kept tail begin with a `tool` message whose matching
+    // assistant tool_call is in the summarized middle — that orphan would make the
+    // next provider request invalid. Absorb such leading tool results into the
+    // summary by extending the boundary forward.
+    while summarize_end < total && session.messages[summarize_end].role == "tool" {
+        summarize_end += 1;
+    }
+    if summarize_end <= pinned {
+        return false;
+    }
     let old: Vec<ToolMessage> = session
         .messages
         .splice(pinned..summarize_end, std::iter::empty())
@@ -865,7 +874,7 @@ async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provid
         .join("\n");
 
     if transcript.trim().is_empty() {
-        return;
+        return false;
     }
 
     let req = ChatRequest {
@@ -916,6 +925,7 @@ async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provid
              and original task above still apply):\n{summary}"
         )),
     );
+    true
 }
 
 async fn finish_agent(
