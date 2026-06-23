@@ -334,9 +334,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   /** Re-reads the stored credential and tells the webview whether it is free-tier. */
   async refreshAuthMode() {
     const key = await getApiKey(this.context.secrets);
+    const free = isFreeToken(key);
+    let hasPlan = !free;
+    if (key && !free) {
+      const status = await fetchAccountStatus(key);
+      hasPlan = !!status?.hasPlan;
+    }
     this.post({
       type: "authMode",
-      free: isFreeToken(key),
+      free,
+      hasPlan,
       freeModelId: FREE_MODEL_ID,
       freeModelLabel: FREE_MODEL_LABEL,
     });
@@ -535,6 +542,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "needApiKey":
         await this.promptPaymentRequired();
         break;
+      case "needPlan":
+        await this.promptPlanRequired();
+        break;
       case "refreshModels":
         await this.refreshModels();
         break;
@@ -626,6 +636,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   /** Detects payment-required errors; top up for paid keys, add key for free tier. */
   private maybeHandlePaymentError(error: string): boolean {
+    if (/\b403\b|subscribe to a package|developer api/i.test(error)) {
+      void this.promptPlanRequired(error);
+      return true;
+    }
     if (!/\b402\b|Free limit|requires your own|exceed|top up|Credits running low|running low/i.test(error)) {
       return false;
     }
@@ -642,6 +656,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const status = await fetchAccountStatus(key);
     if (!status || status.free) {
       return true;
+    }
+    if (status.hasPlan === false) {
+      void this.promptPlanRequired();
+      return false;
     }
     const floor = status.creditFloor ?? CREDIT_FLOOR;
     const balance = status.creditsBalance ?? 0;
@@ -663,6 +681,21 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       void vscode.env.openExternal(vscode.Uri.parse(BILLING_URL));
     } else if (choice === "Refresh Balance") {
       void vscode.commands.executeCommand("getaibd.refreshBalance");
+    }
+  }
+
+  /** Paid key without a package — subscribe before using models in the extension. */
+  private async promptPlanRequired(detail?: string) {
+    const summary =
+      detail && detail.length < 220
+        ? detail.replace(/^Agent error: Provider error: getaibd:\s*/i, "")
+        : "Subscribe to a GetAIBD package to use models in the extension.";
+    const choice = await vscode.window.showWarningMessage(summary, "View Packages", "Refresh");
+    if (choice === "View Packages") {
+      void vscode.env.openExternal(vscode.Uri.parse(BILLING_URL));
+    } else if (choice === "Refresh") {
+      void vscode.commands.executeCommand("getaibd.refreshBalance");
+      await this.refreshAuthMode();
     }
   }
 
@@ -2897,6 +2930,7 @@ let builtinProviders = []; // [{id, label}]
 let activeProviderTab = "all";  // "all" or a provider id
 
 let freeMode = false;
+let needsPlan = false;
 let freeModelId = "qwen-flash";
 let freeModelLabel = "Auto";
 
@@ -3184,7 +3218,7 @@ function renderModelList(filter) {
 
 function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities) {
   const isFreeModel = modelId === freeModelId;
-  const locked = freeMode && !isFreeModel;
+  const locked = needsPlan || (freeMode && !isFreeModel);
   const isSelected = modelId === currentModel && providerId === currentProvider;
   const item = document.createElement("div");
   item.className = "model-item" + (isSelected ? " selected" : "") + (locked ? " locked" : "");
@@ -3243,7 +3277,7 @@ function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities
 
   item.addEventListener("click", () => {
     if (locked) {
-      vscode.postMessage({ type: "needApiKey" });
+      vscode.postMessage({ type: needsPlan ? "needPlan" : "needApiKey" });
       closeModelDropdown();
       return;
     }
@@ -3863,6 +3897,7 @@ window.addEventListener("message", (event) => {
 
     case "authMode":
       freeMode = !!msg.free;
+      needsPlan = !freeMode && msg.hasPlan === false;
       if (msg.freeModelId) freeModelId = msg.freeModelId;
       if (msg.freeModelLabel) freeModelLabel = msg.freeModelLabel;
       if (freeMode) {

@@ -5,6 +5,7 @@ export interface AccountStatus {
   free: boolean;
   creditsBalance: number | null;
   creditFloor?: number;
+  hasPlan?: boolean;
   daysLeft?: number;
   daysLimit?: number;
 }
@@ -22,6 +23,7 @@ export async function fetchAccountStatus(apiKey: string): Promise<AccountStatus 
       free?: boolean;
       credits_balance?: number;
       credit_floor?: number;
+      has_plan?: boolean;
       days_left?: number;
       days_limit?: number;
     };
@@ -29,6 +31,7 @@ export async function fetchAccountStatus(apiKey: string): Promise<AccountStatus 
       free: !!data.free,
       creditsBalance: typeof data.credits_balance === "number" ? data.credits_balance : null,
       creditFloor: typeof data.credit_floor === "number" ? data.credit_floor : undefined,
+      hasPlan: typeof data.has_plan === "boolean" ? data.has_plan : undefined,
       daysLeft: data.days_left,
       daysLimit: data.days_limit,
     };

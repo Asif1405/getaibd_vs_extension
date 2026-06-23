@@ -6,6 +6,9 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [0.4.37]
 
+- **Developer API requires a subscribed package** — paid API keys without a plan see
+  models locked in the picker and get a subscribe prompt; balance endpoint returns
+  `has_plan`.
 - **Credit balance refreshes after every GetAIBD agent/chat turn** so the status bar
   stays accurate instead of showing a stale balance mid-session.
 - **402 errors now prompt "Top Up Credits"** when you already have a paid API key
