@@ -43,6 +43,9 @@ pub struct OrchestratedRequest {
     /// Reasoning effort hint (low/medium/high) for thinking-capable models.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Server-side tool-output compression (GetAIBD platform only).
+    #[serde(default)]
+    pub compress: bool,
     /// Host OS reported by the client (e.g. "Windows", "macOS", "Linux").
     #[serde(default)]
     pub os: Option<String>,
@@ -146,6 +149,7 @@ async fn run_orchestrated_task(
         crate::agent::runtime::format_environment(req.os.as_deref(), req.shell.as_deref());
     let mut session = Session::new(&req.provider, &req.model, state.project_root.clone())
         .with_reasoning_effort(req.reasoning_effort.clone())
+        .with_compress(req.compress)
         .with_environment(environment);
 
     for h in &req.history {

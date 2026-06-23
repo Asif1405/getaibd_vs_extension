@@ -12,6 +12,8 @@ pub struct Session {
     pub max_iterations: u32,
     pub system_prompt: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Server-side tool-output compression on the GetAIBD platform API.
+    pub compress: bool,
     /// Host OS + shell the client runs in, so generated commands match it.
     pub environment: Option<String>,
     /// Structured task ledger (goal + checklist) the agent maintains via the
@@ -35,6 +37,7 @@ impl Session {
             max_iterations: 25,
             system_prompt: None,
             reasoning_effort: None,
+            compress: false,
             environment: None,
             task_ledger: None,
         }
@@ -55,6 +58,12 @@ impl Session {
     #[must_use]
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    #[must_use]
+    pub fn with_compress(mut self, compress: bool) -> Self {
+        self.compress = compress;
         self
     }
 

@@ -202,6 +202,9 @@ pub struct ToolChatRequest {
     /// keeps narrating instead of acting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    /// When true, ask GetAIBD to compress tool outputs server-side (Headroom).
+    #[serde(default)]
+    pub compress: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

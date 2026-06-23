@@ -500,6 +500,7 @@ export function streamOrchestrated(
     requireApproval?: boolean;
     clientTerminal?: boolean;
     reasoningEffort?: string;
+    compress?: boolean;
   },
 ): AbortController {
   const controller = new AbortController();
@@ -522,6 +523,7 @@ export function streamOrchestrated(
       };
       if (options?.apiKey) {body.api_key = options.apiKey;}
       if (options?.reasoningEffort) {body.reasoning_effort = options.reasoningEffort;}
+      if (options?.compress) {body.compress = true;}
 
       const resp = await fetch(`${getServerUrl()}/agent/orchestrated`, {
         method: "POST",

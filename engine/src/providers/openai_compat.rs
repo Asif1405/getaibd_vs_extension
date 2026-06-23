@@ -69,6 +69,15 @@ impl OpenAiCompatProvider {
         }
         req
     }
+
+    /// Headroom compression is only supported on the GetAIBD platform API.
+    fn compat_compress(&self, request: &ToolChatRequest) -> Option<bool> {
+        if request.compress && self.provider_id == "getaibd" {
+            Some(true)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -97,6 +106,8 @@ struct CompatToolRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compress: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +124,8 @@ struct CompatToolStreamRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compress: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -525,6 +538,7 @@ impl Provider for OpenAiCompatProvider {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             reasoning_effort: norm_effort(&request.reasoning_effort),
+            compress: self.compat_compress(request),
         };
 
         let req = self
@@ -589,6 +603,7 @@ impl Provider for OpenAiCompatProvider {
         let base_url = self.base_url.clone();
         let default_model = self.default_model.clone();
         let pid = self.provider_id;
+        let compress = self.compat_compress(&request);
 
         Box::pin(async_stream::try_stream! {
             let model = if request.model.is_empty() {
@@ -624,6 +639,7 @@ impl Provider for OpenAiCompatProvider {
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
                 reasoning_effort: norm_effort(&request.reasoning_effort),
+                compress,
             };
 
             let mut req = client

@@ -69,6 +69,7 @@ const SESSION_HISTORY_PREFIX = "getaibd.history.";
 const PROVIDER_KEY = "getaibd.lastProvider";
 const MODEL_KEY = "getaibd.lastModel";
 const MODE_KEY = "getaibd.lastMode";
+const COMPRESS_KEY = "getaibd.compress";
 const ALWAYS_ALLOW_KEY = "getaibd.alwaysAllowTools";
 const MAX_RECONNECT = 3;
 
@@ -452,8 +453,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
             msg.text as string,
             msg.mode as string,
             (msg.reasoningEffort as string | undefined) ?? undefined,
+            !!msg.compress,
           );
         }
+        break;
+      case "compressChanged":
+        await this.globalState.update(COMPRESS_KEY, !!msg.compress);
         break;
       case "openDiff":
         if (msg.path) {await this.openDiff(msg.path as string);}
@@ -668,12 +673,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     let defaultMode = config.get<string>("chat.defaultMode", "agent");
     if (defaultMode === "chat") {defaultMode = "agent";}
     const lastMode = this.globalState.get<string>(MODE_KEY) || defaultMode;
+    const compress = this.globalState.get<boolean>(COMPRESS_KEY) ?? false;
 
     this.post({
       type: "restoreSelections",
       provider: lastProvider,
       model: lastModel,
       mode: lastMode,
+      compress,
     });
   }
 
@@ -896,6 +903,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     text: string,
     mode: string,
     reasoningEffort?: string,
+    compress = false,
   ) {
     if (!(await this.checkSecrets(text))) {return;}
     this.stepLimitHit = false;
@@ -973,7 +981,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.abortController = undefined;
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort });
+    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress });
   }
 
   private handleFileEdit(edit: FileEdit) {
@@ -2205,6 +2213,31 @@ body {
   padding: 2px 2px 0;
   box-sizing: border-box;
 }
+.ctl-pill.model .pill-label { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.cost-mode-switch {
+  display: inline-flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.cost-mode-option {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.cost-mode-option + .cost-mode-option { border-left: 1px solid var(--border); }
+.cost-mode-option:hover { color: var(--text); background: var(--surface-2, rgba(255,255,255,0.06)); }
+.cost-mode-option.active { background: var(--accent); color: #fff; }
+
 .composer-row { display: flex; align-items: center; gap: 6px; }
 .composer-spacer { flex: 1; }
 
@@ -2659,6 +2692,10 @@ body {
       <span class="pill-label" id="modelPillLabel">Select model</span>
       <span class="ctl-arrow">&#9662;</span>
     </button>
+    <div class="cost-mode-switch" id="costModeSwitch" style="display:none" title="Reduced cost compresses tool context to save credits. This might degrade response.">
+      <button type="button" class="cost-mode-option active" id="costNormalBtn">Normal</button>
+      <button type="button" class="cost-mode-option" id="costReducedBtn">Reduced cost</button>
+    </div>
     <span class="composer-spacer"></span>
     <button class="round-btn" id="attachBtn" title="Attach file">&#x1F4CE;</button>
     <button class="round-btn send-btn" id="sendBtn" title="Send">&#9654;</button>
@@ -2699,9 +2736,30 @@ const sessionsBtn = document.getElementById("sessionsBtn");
 const sessionsPanel = document.getElementById("sessionsPanel");
 const attachBtn = document.getElementById("attachBtn");
 const upgradeBtn = document.getElementById("upgradeBtn");
+const costModeSwitch = document.getElementById("costModeSwitch");
+const costNormalBtn = document.getElementById("costNormalBtn");
+const costReducedBtn = document.getElementById("costReducedBtn");
+let compressEnabled = false;
 if (upgradeBtn) {
   upgradeBtn.addEventListener("click", () => vscode.postMessage({ type: "needApiKey" }));
 }
+
+function updateCostModeUi() {
+  const show = currentProvider === "getaibd" && !freeMode;
+  if (costModeSwitch) { costModeSwitch.style.display = show ? "inline-flex" : "none"; }
+  if (costNormalBtn) { costNormalBtn.classList.toggle("active", !compressEnabled); }
+  if (costReducedBtn) { costReducedBtn.classList.toggle("active", compressEnabled); }
+}
+
+function setCompress(enabled) {
+  if (compressEnabled === enabled) { return; }
+  compressEnabled = enabled;
+  updateCostModeUi();
+  vscode.postMessage({ type: "compressChanged", compress: compressEnabled });
+}
+
+if (costNormalBtn) { costNormalBtn.addEventListener("click", () => setCompress(false)); }
+if (costReducedBtn) { costReducedBtn.addEventListener("click", () => setCompress(true)); }
 
 if (settingsPanel) {
   settingsPanel.addEventListener("click", (e) => {
@@ -3136,6 +3194,7 @@ function updateModelPill() {
     modelPillLabel.textContent = "Select model";
     modelPillIcon.textContent = "🤖";
   }
+  updateCostModeUi();
 }
 
 // Thinking-capable models always reason at high effort. There's no user-facing
@@ -3203,6 +3262,7 @@ function send() {
     text,
     mode: currentMode,
     reasoningEffort: reasoning === "off" ? null : reasoning,
+    compress: compressEnabled && currentProvider === "getaibd",
   });
 }
 
@@ -3217,6 +3277,7 @@ function continueRun() {
     text: "Continue from where you left off and finish the task.",
     mode: currentMode,
     reasoningEffort: reasoning === "off" ? null : reasoning,
+    compress: compressEnabled && currentProvider === "getaibd",
   });
 }
 
@@ -3715,6 +3776,10 @@ window.addEventListener("message", (event) => {
       if (msg.mode) {
         switchMode(msg.mode);
       }
+      if (msg.compress !== undefined) {
+        compressEnabled = !!msg.compress;
+        updateCostModeUi();
+      }
       break;
 
     case "authMode":
@@ -3727,6 +3792,7 @@ window.addEventListener("message", (event) => {
       }
       if (upgradeBtn) upgradeBtn.style.display = freeMode ? "inline-block" : "none";
       updateModelPill();
+      updateCostModeUi();
       if (modelDropdown.classList.contains("open")) {
         renderProviderTabs();
         renderModelList(modelSearch ? modelSearch.value.toLowerCase() : "");

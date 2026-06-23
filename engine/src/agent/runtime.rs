@@ -426,6 +426,7 @@ async fn agent_loop(
                 max_tokens: None,
                 reasoning_effort: None,
                 tool_choice: None,
+                compress: false,
             };
             let summary = match chat_with_tools_retry_cb(provider, &wrap, None).await {
                 Ok(r) => r.content.filter(|c| !c.trim().is_empty()),
@@ -504,6 +505,7 @@ async fn agent_loop(
             // Force a tool call after a narration so weak models stop describing
             // work and actually do it; auto otherwise.
             tool_choice: force_tool_call.then(|| "required".to_string()),
+            compress: session.compress,
         };
 
         let response = if use_streaming {
@@ -884,6 +886,7 @@ async fn verify_task_complete(
         max_tokens: Some(500),
         reasoning_effort: None,
         tool_choice: None,
+        compress: false,
     };
     match chat_with_tools_retry_cb(provider, &request, None).await {
         Ok(r) => parse_verdict(r.content.as_deref().unwrap_or("")),

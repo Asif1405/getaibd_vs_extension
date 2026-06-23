@@ -4,6 +4,13 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.35]
+
+- **Reduced cost mode for GetAIBD agent runs.** A Normal | Reduced cost switch in the
+  chat composer (GetAIBD provider only) sends `compress: true` on tool-loop API calls so
+  the platform can apply server-side Headroom compression on tool outputs and save credits.
+  Preference is persisted across sessions. Default is Normal.
+
 ## [0.4.34]
 
 A major agent-reliability pass. Verified end-to-end against every catalog model
