@@ -4,6 +4,11 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.36]
+
+- **Move the Normal | Reduced cost toggle to the chat header** (beside Settings) so the
+  composer row stays compact. Labels shortened to Normal / Reduced with tooltips unchanged.
+
 ## [0.4.35]
 
 - **Reduced cost mode for GetAIBD agent runs.** A Normal | Reduced cost switch in the

@@ -2220,9 +2220,16 @@ body {
   align-items: stretch;
   flex-shrink: 0;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 6px;
   overflow: hidden;
-  background: var(--surface);
+  background: var(--surface, var(--bg));
+}
+.header .cost-mode-switch {
+  margin-right: 2px;
+}
+.header .cost-mode-option {
+  font-size: 10px;
+  padding: 4px 6px;
 }
 .cost-mode-option {
   border: 0;
@@ -2648,6 +2655,10 @@ body {
   <span class="brand" id="brand">GetAIBD</span>
   <span class="header-spacer"></span>
   <button class="upgrade-btn" id="upgradeBtn" title="Add your API key to unlock all models" style="display:none">&#x1F511; Add API Key</button>
+  <div class="cost-mode-switch" id="costModeSwitch" style="display:none" title="Reduced cost compresses tool context to save credits. This might degrade response.">
+    <button type="button" class="cost-mode-option active" id="costNormalBtn">Normal</button>
+    <button type="button" class="cost-mode-option" id="costReducedBtn" title="Reduced cost — compress tool context to save credits">Reduced</button>
+  </div>
   <button class="icon-btn" id="settingsBtn" title="Settings">&#x2699;</button>
 </div>
 <div id="sessionsPanel" class="sessions-panel" style="display:none"></div>
@@ -2692,10 +2703,6 @@ body {
       <span class="pill-label" id="modelPillLabel">Select model</span>
       <span class="ctl-arrow">&#9662;</span>
     </button>
-    <div class="cost-mode-switch" id="costModeSwitch" style="display:none" title="Reduced cost compresses tool context to save credits. This might degrade response.">
-      <button type="button" class="cost-mode-option active" id="costNormalBtn">Normal</button>
-      <button type="button" class="cost-mode-option" id="costReducedBtn">Reduced cost</button>
-    </div>
     <span class="composer-spacer"></span>
     <button class="round-btn" id="attachBtn" title="Attach file">&#x1F4CE;</button>
     <button class="round-btn send-btn" id="sendBtn" title="Send">&#9654;</button>
