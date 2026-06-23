@@ -8,6 +8,10 @@ export const FREE_TOKEN_PREFIX = "aiobf_";
 export const FREE_MODEL_ID = "qwen-flash";
 export const FREE_MODEL_LABEL = "Auto";
 
+/** Paid usage stops at or below this balance (matches platform `API_CREDIT_FLOOR`). */
+export const CREDIT_FLOOR = 10;
+export const BILLING_URL = "https://getaibd.com/billing";
+
 /** Whether a stored credential is an anonymous free-tier device token. */
 export function isFreeToken(key: string | undefined | null): boolean {
   return !!key && key.startsWith(FREE_TOKEN_PREFIX);

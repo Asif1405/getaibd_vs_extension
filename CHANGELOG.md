@@ -4,6 +4,15 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.37]
+
+- **Credit balance refreshes after every GetAIBD agent/chat turn** so the status bar
+  stays accurate instead of showing a stale balance mid-session.
+- **402 errors now prompt "Top Up Credits"** when you already have a paid API key
+  (instead of wrongly asking for a new key). Free-tier users still get the add-key flow.
+- **Low-balance warning** in the status bar when credits fall to the platform floor (≤10).
+- **Engine surfaces the full gateway error body** on 402/403 (e.g. balance vs free-tier).
+
 ## [0.4.36]
 
 - **Move the Normal | Reduced cost toggle to the chat header** (beside Settings) so the

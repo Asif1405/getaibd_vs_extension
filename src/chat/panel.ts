@@ -5,6 +5,7 @@ import * as crypto from "crypto";
 import {
   fetchProviders,
   fetchModels,
+  fetchAccountStatus,
   streamChat,
   streamAgent,
   streamOrchestrated,
@@ -29,6 +30,8 @@ import {
   isFreeToken,
   FREE_MODEL_ID,
   FREE_MODEL_LABEL,
+  CREDIT_FLOOR,
+  BILLING_URL,
 } from "../util/config";
 import { ProviderStore, BUILTIN_PROVIDERS, CURATED_MODELS, PROVIDER_META } from "../settings/providerStore";
 
@@ -389,6 +392,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.currentStreamContent = "";
         this.post({ type: "streamEnd" });
         this.abortController = undefined;
+        this.refreshCreditsBalance(provider);
       },
       onError: (error) => {
         const isNetworkError = !error.startsWith("HTTP ");
@@ -408,6 +412,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.currentStreamContent = "";
         this.post({ type: "streamError", error });
         this.abortController = undefined;
+        this.refreshCreditsBalance(provider);
         this.maybeHandlePaymentError(error);
       },
     }, apiKey);
@@ -528,7 +533,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         if (msg.content) {await this.previewPatch(msg.content as string);}
         break;
       case "needApiKey":
-        await this.promptUpgrade();
+        await this.promptPaymentRequired();
         break;
       case "refreshModels":
         await this.refreshModels();
@@ -611,29 +616,89 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     await this.loadModels("getaibd");
   }
 
-  /** Detects free-limit / payment-required stream errors and prompts to add a key. */
+  /** Refresh the status-bar credit counter after a billable GetAIBD call. */
+  private refreshCreditsBalance(provider?: string): void {
+    if (provider && provider !== "getaibd") {
+      return;
+    }
+    void vscode.commands.executeCommand("getaibd.refreshBalance");
+  }
+
+  /** Detects payment-required errors; top up for paid keys, add key for free tier. */
   private maybeHandlePaymentError(error: string): boolean {
-    if (!/\b402\b|Free limit|requires your own/i.test(error)) {
+    if (!/\b402\b|Free limit|requires your own|exceed|top up|Credits running low|running low/i.test(error)) {
       return false;
     }
-    void this.promptUpgrade(error);
+    void this.promptPaymentRequired(error);
     return true;
   }
 
-  /** Free tier only includes the "Auto" model; nudge the user to add a key. */
-  private async promptUpgrade(detail?: string) {
-    const base = detail && /Free limit/i.test(detail)
-      ? "You've used all your free days this month."
-      : 'That model needs your own GetAIBD API key. The free tier only includes the "Auto" model.';
-    const choice = await vscode.window.showInformationMessage(
-      base,
-      "Set API Key",
-      "Get a Key",
+  /** Blocks paid GetAIBD usage when credits are at or below the platform floor. */
+  private async ensureCreditsAllowance(): Promise<boolean> {
+    const key = await getApiKey(this.context.secrets);
+    if (!key || isFreeToken(key)) {
+      return true;
+    }
+    const status = await fetchAccountStatus(key);
+    if (!status || status.free) {
+      return true;
+    }
+    const floor = status.creditFloor ?? CREDIT_FLOOR;
+    const balance = status.creditsBalance ?? 0;
+    if (balance <= floor) {
+      void this.promptLowCredits(balance, floor);
+      return false;
+    }
+    return true;
+  }
+
+  private async promptLowCredits(balance: number, floor: number): Promise<void> {
+    const choice = await vscode.window.showWarningMessage(
+      `GetAIBD credits are too low (${balance.toLocaleString()} remaining). ` +
+        `Top up to keep using the agent (minimum ${floor} credits).`,
+      "Top Up Credits",
+      "Refresh Balance",
     );
+    if (choice === "Top Up Credits") {
+      void vscode.env.openExternal(vscode.Uri.parse(BILLING_URL));
+    } else if (choice === "Refresh Balance") {
+      void vscode.commands.executeCommand("getaibd.refreshBalance");
+    }
+  }
+
+  /** Free tier → add a key; paid key with low credits → top up. */
+  private async promptPaymentRequired(detail?: string) {
+    const key = await getApiKey(this.context.secrets);
+    const isPaid = !!key && !isFreeToken(key);
+    const text = (detail ?? "").toLowerCase();
+    const isCreditIssue =
+      isPaid &&
+      (/exceed|balance|running low|top up|credit/i.test(text) ||
+        !/free tier|free limit|add a getaibd api key|needs your own api key/i.test(text));
+
+    if (isCreditIssue) {
+      const summary =
+        detail && detail.length < 220
+          ? detail.replace(/^Agent error: Provider error: getaibd:\s*/i, "")
+          : "Your GetAIBD credits are too low for this request. Top up to continue.";
+      const choice = await vscode.window.showWarningMessage(summary, "Top Up Credits", "Refresh Balance");
+      if (choice === "Top Up Credits") {
+        void vscode.env.openExternal(vscode.Uri.parse(BILLING_URL));
+      } else if (choice === "Refresh Balance") {
+        void vscode.commands.executeCommand("getaibd.refreshBalance");
+      }
+      return;
+    }
+
+    const base =
+      detail && /Free limit/i.test(detail)
+        ? "You've used all your free days this month."
+        : 'That model needs your own GetAIBD API key. The free tier only includes the "Auto" model.';
+    const choice = await vscode.window.showInformationMessage(base, "Set API Key", "Get a Key");
     if (choice === "Set API Key") {
       await vscode.commands.executeCommand("getaibd.setApiKey");
     } else if (choice === "Get a Key") {
-      await vscode.env.openExternal(vscode.Uri.parse("https://getaibd.com"));
+      void vscode.env.openExternal(vscode.Uri.parse("https://getaibd.com"));
     }
   }
 
@@ -813,6 +878,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendUserMessage(provider: string, model: string, text: string) {
     if (!(await this.checkSecrets(text))) {return;}
+    if (provider === "getaibd" && !(await this.ensureCreditsAllowance())) {return;}
     this.history.push({ kind: "message", role: "user", content: text });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: text });
@@ -826,6 +892,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendAgentTask(provider: string, model: string, task: string) {
     if (!(await this.checkSecrets(task))) {return;}
+    if (provider === "getaibd" && !(await this.ensureCreditsAllowance())) {return;}
     this.history.push({ kind: "message", role: "user", content: task });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: task });
@@ -888,10 +955,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onComplete: (iterations) => {
         this.post({ type: "agentComplete", iterations });
         this.abortController = undefined;
+        this.refreshCreditsBalance(provider);
       },
       onError: (error) => {
         this.post({ type: "agentError", error });
         this.abortController = undefined;
+        this.refreshCreditsBalance(provider);
         this.maybeHandlePaymentError(error);
       },
     }, { requireApproval: true, apiKey });
@@ -906,6 +975,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     compress = false,
   ) {
     if (!(await this.checkSecrets(text))) {return;}
+    if (provider === "getaibd" && !(await this.ensureCreditsAllowance())) {return;}
     this.stepLimitHit = false;
     const priorHistory = [...this.buildFileContext(), ...this.conversationMessages()];
     const turnId = newId();
@@ -975,10 +1045,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.post({ type: "agentComplete", iterations, stepLimit: this.stepLimitHit });
         this.stepLimitHit = false;
         this.abortController = undefined;
+        this.refreshCreditsBalance(provider);
       },
       onError: (error) => {
         this.post({ type: "agentError", error });
         this.abortController = undefined;
+        this.refreshCreditsBalance(provider);
         this.maybeHandlePaymentError(error);
       },
     }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress });

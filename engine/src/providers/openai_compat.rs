@@ -12,6 +12,22 @@ use crate::models::{
 };
 use crate::providers::Provider;
 
+fn compat_http_error(provider_id: &str, status: reqwest::StatusCode, body: &str) -> AppError {
+    let detail = if body.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        let trimmed: String = body.chars().take(400).collect();
+        format!("HTTP {status}: {trimmed}")
+    };
+    AppError::ProviderError(format!("{provider_id}: {detail}"))
+}
+
+async fn read_http_error(provider_id: &str, resp: reqwest::Response) -> AppError {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    compat_http_error(provider_id, status, &body)
+}
+
 pub struct OpenAiCompatProvider {
     client: Client,
     base_url: String,
@@ -383,11 +399,15 @@ impl Provider for OpenAiCompatProvider {
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .json(&body);
-        let resp: CompatResponse = self
+        let resp = self
             .add_auth(req)
             .send()
             .await
-            .map_err(|e| self.map_error(&e))?
+            .map_err(|e| self.map_error(&e))?;
+        if !resp.status().is_success() {
+            return Err(read_http_error(self.provider_id, resp).await);
+        }
+        let resp: CompatResponse = resp
             .json()
             .await
             .map_err(|e| AppError::ProviderError(format!("{}: {e}", self.provider_id)))?;
@@ -454,10 +474,7 @@ impl Provider for OpenAiCompatProvider {
                 }
             })?;
 
-            if !resp.status().is_success() {
-                Err(AppError::ProviderError(format!("{pid}: HTTP {}", resp.status())))?;
-            }
-
+            if resp.status().is_success() {
             let mut stream = resp.bytes_stream();
             use futures::StreamExt;
             let mut buffer = String::new();
@@ -491,6 +508,9 @@ impl Provider for OpenAiCompatProvider {
                         }
                     }
                 }
+            }
+            } else {
+                Err(read_http_error(pid, resp).await)?;
             }
         })
     }
@@ -545,11 +565,15 @@ impl Provider for OpenAiCompatProvider {
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .json(&body);
-        let resp: CompatResponse = self
+        let resp = self
             .add_auth(req)
             .send()
             .await
-            .map_err(|e| self.map_error(&e))?
+            .map_err(|e| self.map_error(&e))?;
+        if !resp.status().is_success() {
+            return Err(read_http_error(self.provider_id, resp).await);
+        }
+        let resp: CompatResponse = resp
             .json()
             .await
             .map_err(|e| AppError::ProviderError(format!("{}: {e}", self.provider_id)))?;
@@ -659,10 +683,7 @@ impl Provider for OpenAiCompatProvider {
                 }
             })?;
 
-            if !resp.status().is_success() {
-                Err(AppError::ProviderError(format!("{pid}: HTTP {}", resp.status())))?;
-            }
-
+            if resp.status().is_success() {
             let mut stream = resp.bytes_stream();
             use futures::StreamExt;
             let mut buffer = String::new();
@@ -745,6 +766,9 @@ impl Provider for OpenAiCompatProvider {
             }
 
             yield ToolStreamDelta::Done;
+            } else {
+                Err(read_http_error(pid, resp).await)?;
+            }
         })
     }
 }

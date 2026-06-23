@@ -6,7 +6,7 @@ import { generateTests } from "./commands/generateTests";
 import { InlineCompletionProvider } from "./commands/inline";
 import { activateDiagnostics } from "./safetype/diagnostics";
 import { ensureEngine, restartEngine, stopEngine } from "./engine/manager";
-import { getApiKey, setApiKey, isFreeToken } from "./util/config";
+import { getApiKey, setApiKey, isFreeToken, CREDIT_FLOOR } from "./util/config";
 import { fetchAccountStatus } from "./client";
 import { createFreeSession } from "./free";
 
@@ -67,8 +67,16 @@ export function activate(context: vscode.ExtensionContext) {
       balanceItem.text = `$(rocket) Free: ${status.daysLeft ?? "?"}/${status.daysLimit ?? 3} days`;
       balanceItem.tooltip = "GetAIBD free tier — usage days left this month (click to refresh)";
     } else {
-      balanceItem.text = `$(database) ${(status.creditsBalance ?? 0).toLocaleString()} credits`;
-      balanceItem.tooltip = "GetAIBD credit balance (click to refresh)";
+      const bal = status.creditsBalance ?? 0;
+      const floor = status.creditFloor ?? CREDIT_FLOOR;
+      balanceItem.text =
+        bal <= floor
+          ? `$(warning) ${bal.toLocaleString()} credits (low)`
+          : `$(database) ${bal.toLocaleString()} credits`;
+      balanceItem.tooltip =
+        bal <= floor
+          ? `Credits at or below ${floor} — top up to continue (click to refresh)`
+          : "GetAIBD credit balance (click to refresh)";
     }
     balanceItem.show();
   };

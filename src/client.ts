@@ -4,6 +4,7 @@ import { describeEnvironment } from "./util/environment";
 export interface AccountStatus {
   free: boolean;
   creditsBalance: number | null;
+  creditFloor?: number;
   daysLeft?: number;
   daysLimit?: number;
 }
@@ -20,12 +21,14 @@ export async function fetchAccountStatus(apiKey: string): Promise<AccountStatus 
     const data = (await resp.json()) as {
       free?: boolean;
       credits_balance?: number;
+      credit_floor?: number;
       days_left?: number;
       days_limit?: number;
     };
     return {
       free: !!data.free,
       creditsBalance: typeof data.credits_balance === "number" ? data.credits_balance : null,
+      creditFloor: typeof data.credit_floor === "number" ? data.credit_floor : undefined,
       daysLeft: data.days_left,
       daysLimit: data.days_limit,
     };
