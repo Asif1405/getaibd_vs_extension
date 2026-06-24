@@ -45,7 +45,7 @@ balance.
 | `getaibd.model` | `qwen-flash` | Default model id |
 | `getaibd.memory` | `true` | Enable project memory for more relevant context |
 | `getaibd.fileContext.enabled` | `false` | Attach open file in **Ask** chat only (agent uses `read_file` to save tokens) |
-| `getaibd.agent.useMemory` | `false` | Local RAG hints in agent runs (extra tokens) |
+| `getaibd.agent.useMemory` | `false` | Local RAG in agent runs — or use header **RAG On** (saved per install) |
 | `getaibd.chat.compressDefault` | `true` | Start in Reduced cost mode on GetAIBD |
 | `getaibd.chat.reasoningDefault` | `medium` | Reasoning effort for thinking models (`off` cheapest, `high` most capable) |
 | `getaibd.agent.autoMode` | `auto` | `auto`/`ask`/`plan`/`agent`/`debug` |

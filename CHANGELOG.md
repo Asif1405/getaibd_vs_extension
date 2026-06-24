@@ -4,6 +4,11 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.39]
+
+- **RAG toggle in chat header** — `RAG Off` / `RAG On` beside Normal/Reduced cost; preference
+  is saved and enables local codebase memory (`use_memory`) on agent runs.
+
 ## [0.4.38]
 
 - **Agent mode sends less context by default** — no automatic open-file injection (agent uses
