@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "AI coding agent for VS Code — chat with your codebase, make multi-file edits, and run agentic tasks.",
-  "version": "0.4.37",
+  "version": "0.4.38",
   "homepage": "https://getaibd.com",
   "bugs": {
     "url": "https://getaibd.com"
@@ -188,8 +188,24 @@
         },
         "getaibd.fileContext.enabled": {
           "type": "boolean",
+          "default": false,
+          "description": "Attach the open file to simple (Ask) chat messages only. Agent mode uses read_file instead to save tokens."
+        },
+        "getaibd.agent.useMemory": {
+          "type": "boolean",
+          "default": false,
+          "description": "Inject local RAG memory into agent runs. Off by default — costs extra tokens; enable if you want codebase hints without tool reads."
+        },
+        "getaibd.chat.compressDefault": {
+          "type": "boolean",
           "default": true,
-          "description": "Automatically attach the open file's content to chat messages."
+          "description": "Start in Reduced cost mode (GetAIBD server compresses large tool outputs)."
+        },
+        "getaibd.chat.reasoningDefault": {
+          "type": "string",
+          "enum": ["off", "low", "medium", "high"],
+          "default": "medium",
+          "description": "Default reasoning effort for thinking-capable models. Lower = fewer reasoning tokens and lower cost."
         },
         "getaibd.inlineCompletions.enabled": {
           "type": "boolean",

@@ -172,7 +172,7 @@ export class ProviderStore {
       providers,
       customProviders: customs,
       serverUrl: config.get<string>("serverUrl", "http://127.0.0.1:39377"),
-      fileContextEnabled: config.get<boolean>("fileContext.enabled", true),
+      fileContextEnabled: config.get<boolean>("fileContext.enabled", false),
       inlineCompletionsEnabled: config.get<boolean>("inlineCompletions.enabled", false),
       autoOpenEdits: config.get<boolean>("editReview.autoOpen", true),
       inlineProvider: config.get<string>("inlineCompletions.provider", "getaibd"),

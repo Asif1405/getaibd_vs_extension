@@ -507,6 +507,8 @@ export function streamOrchestrated(
     clientTerminal?: boolean;
     reasoningEffort?: string;
     compress?: boolean;
+    /** Local RAG index injection (off by default — agent uses read_file instead). */
+    useMemory?: boolean;
   },
 ): AbortController {
   const controller = new AbortController();
@@ -520,7 +522,7 @@ export function streamOrchestrated(
         input,
         mode: mode === "auto" ? null : mode,
         auto_mode: mode === "auto",
-        use_memory: true,
+        use_memory: options?.useMemory ?? false,
         history: options?.history ?? [],
         require_approval: options?.requireApproval ?? false,
         client_terminal: options?.clientTerminal ?? false,

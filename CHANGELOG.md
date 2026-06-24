@@ -4,6 +4,20 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.38]
+
+- **Agent mode sends less context by default** — no automatic open-file injection (agent uses
+  `read_file` instead), no replay of manual attachments, and local RAG memory off unless
+  you enable `getaibd.agent.useMemory`.
+- **@mentions in agent** only when you type `@file` in the prompt (explicit opt-in).
+- **Tighter caps** — file snippets 4k chars (was 8k), chat history budget 24k chars (was 60k).
+- **Reduced cost mode on by default** for GetAIBD (`getaibd.chat.compressDefault`).
+- **Open-file attachment off by default** (`getaibd.fileContext.enabled`); enable for Ask/simple chat.
+- **Duplicate user message fix** — current turn no longer sent twice in agent history.
+- **Reasoning effort control** — Off / Low / Med / High chips in the composer for thinking
+  models (default **Med**, was hardcoded High). Lower effort = fewer billed reasoning tokens.
+- **Context estimate badge** — shows approximate client payload size while the agent runs.
+
 ## [0.4.37]
 
 - **Developer API requires a subscribed package** — paid API keys without a plan see

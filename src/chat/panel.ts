@@ -34,6 +34,13 @@ import {
   BILLING_URL,
 } from "../util/config";
 import { ProviderStore, BUILTIN_PROVIDERS, CURATED_MODELS, PROVIDER_META } from "../settings/providerStore";
+import {
+  contextFingerprint,
+  estimatePayload,
+  formatContextEstimate,
+  truncateFileContent,
+  HISTORY_CHAR_BUDGET,
+} from "../util/contextBudget";
 
 interface WebviewMessage {
   type: string;
@@ -73,6 +80,7 @@ const PROVIDER_KEY = "getaibd.lastProvider";
 const MODEL_KEY = "getaibd.lastModel";
 const MODE_KEY = "getaibd.lastMode";
 const COMPRESS_KEY = "getaibd.compress";
+const REASONING_KEY = "getaibd.reasoningEffort";
 const ALWAYS_ALLOW_KEY = "getaibd.alwaysAllowTools";
 const MAX_RECONNECT = 3;
 
@@ -195,6 +203,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private stepLimitHit = false;
   private agentTerminal = new AgentTerminal(vscode.workspace.workspaceFolders?.[0]?.uri);
   private activeTerminalReq: { requestId: string; sessionId: string | undefined } | undefined;
+  /** Skip re-sending unchanged open-file context on consecutive agent turns. */
+  private lastOpenFileFingerprint: string | null = null;
+  /** Manual context blocks already included in a prior turn this session. */
+  private injectedContextFingerprints = new Set<string>();
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -472,6 +484,11 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "compressChanged":
         await this.globalState.update(COMPRESS_KEY, !!msg.compress);
         break;
+      case "reasoningChanged": {
+        const effort = String(msg.reasoningEffort || "medium");
+        await this.globalState.update(REASONING_KEY, effort);
+        break;
+      }
       case "openDiff":
         if (msg.path) {await this.openDiff(msg.path as string);}
         break;
@@ -771,7 +788,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     let defaultMode = config.get<string>("chat.defaultMode", "agent");
     if (defaultMode === "chat") {defaultMode = "agent";}
     const lastMode = this.globalState.get<string>(MODE_KEY) || defaultMode;
-    const compress = this.globalState.get<boolean>(COMPRESS_KEY) ?? false;
+    const compress =
+      this.globalState.get<boolean>(COMPRESS_KEY) ??
+      config.get<boolean>("chat.compressDefault", true);
+    const reasoning =
+      this.globalState.get<string>(REASONING_KEY) ??
+      config.get<string>("chat.reasoningDefault", "medium");
 
     this.post({
       type: "restoreSelections",
@@ -779,6 +801,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       model: lastModel,
       mode: lastMode,
       compress,
+      reasoningEffort: reasoning,
     });
   }
 
@@ -873,7 +896,42 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }
   }
 
-  private async resolveAtMentions(text: string): Promise<ChatMessage[]> {
+  private resetContextInjectionState() {
+    this.lastOpenFileFingerprint = null;
+    this.injectedContextFingerprints.clear();
+  }
+
+  private postContextEstimate(messages: ChatMessage[], input: string) {
+    const est = estimatePayload(messages, input);
+    this.post({
+      type: "contextEstimate",
+      chars: est.chars,
+      tokensApprox: est.tokensApprox,
+      fileAttachments: est.fileAttachments,
+      historyTurns: est.historyTurns,
+      label: formatContextEstimate(est),
+    });
+  }
+
+  /** Attached context blocks from the UI (sent once per unique attachment per session). */
+  private manualContextMessages(): ChatMessage[] {
+    const out: ChatMessage[] = [];
+    for (const e of this.history) {
+      if (e.kind !== "context" || !e.content) {continue;}
+      const label = e.label || "attachment";
+      const fp = contextFingerprint(`ctx:${label}`, e.content);
+      if (this.injectedContextFingerprints.has(fp)) {continue;}
+      this.injectedContextFingerprints.add(fp);
+      const snippet = truncateFileContent(e.content);
+      out.push({
+        role: "user",
+        content: `[Context: ${label}]\n\`\`\`\n${snippet}\n\`\`\``,
+      });
+    }
+    return out;
+  }
+
+  private async resolveAtMentions(text: string, skipPaths?: Set<string>): Promise<ChatMessage[]> {
     const mentionRe = /@([^\s]+)/g;
     const messages: ChatMessage[] = [];
     let m: RegExpExecArray | null;
@@ -881,32 +939,79 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     while ((m = mentionRe.exec(text)) !== null) {
       const ref = m[1];
       if (resolved.has(ref)) {continue;}
+      if (skipPaths?.has(ref) || skipPaths?.has(`@${ref}`)) {continue;}
       resolved.add(ref);
       const files = await vscode.workspace.findFiles(ref, null, 1);
       if (files.length > 0) {
         const doc = await vscode.workspace.openTextDocument(files[0]);
-        messages.push({ role: "user", content: `[File: ${ref}]\n\`\`\`\n${doc.getText()}\n\`\`\`` });
+        const full = doc.getText();
+        const snippet = truncateFileContent(full);
+        messages.push({ role: "user", content: `[File: ${ref}]\n\`\`\`\n${snippet}\n\`\`\`` });
         this.post({
           type: "addContext",
           label: `@${ref}`,
-          code: doc.getText().slice(0, 500) + (doc.getText().length > 500 ? "\n..." : ""),
+          code: full.slice(0, 500) + (full.length > 500 ? "\n..." : ""),
         });
       }
     }
     return messages;
   }
 
-  private buildFileContext(): ChatMessage[] {
+  private buildFileContext(skipPaths?: Set<string>): ChatMessage[] {
     const messages: ChatMessage[] = [];
     const config = vscode.workspace.getConfiguration("getaibd");
     if (!config.get<boolean>("fileContext.enabled", true)) {return messages;}
     const editor = vscode.window.activeTextEditor;
-    if (editor) {
-      const name = vscode.workspace.asRelativePath(editor.document.uri);
-      const content = editor.document.getText();
-      messages.push({ role: "user", content: `[Currently open file: ${name}]\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\`` });
-    }
+    if (!editor) {return messages;}
+    const name = vscode.workspace.asRelativePath(editor.document.uri);
+    if (skipPaths?.has(name)) {return messages;}
+    const content = editor.document.getText();
+    const fp = contextFingerprint(`open:${name}`, content);
+    if (fp === this.lastOpenFileFingerprint) {return messages;}
+    this.lastOpenFileFingerprint = fp;
+    const snippet = truncateFileContent(content);
+    messages.push({
+      role: "user",
+      content: `[Currently open file: ${name}]\n\`\`\`\n${snippet}\n\`\`\``,
+    });
     return messages;
+  }
+
+  /** Agent path: @mentions only when the user typed them — no open file or attachment replay. */
+  private async buildAgentContext(userText: string): Promise<ChatMessage[]> {
+    if (!/@\S+/.test(userText)) {
+      return [];
+    }
+    return this.resolveAtMentions(userText);
+  }
+
+  /** Simple chat: optional open file + attachments + @mentions. */
+  private async buildExplicitContext(userText: string): Promise<ChatMessage[]> {
+    const skip = new Set<string>();
+    const manual = this.manualContextMessages();
+    for (const m of manual) {
+      const match = /^\[Context: ([^\]]+)\]/.exec(m.content);
+      if (match) {skip.add(match[1]);}
+    }
+    const fileCtx = this.buildFileContext(skip);
+    for (const m of fileCtx) {
+      const match = /^\[Currently open file: ([^\]]+)\]/.exec(m.content);
+      if (match) {skip.add(match[1]);}
+    }
+    const mentionCtx = await this.resolveAtMentions(userText, skip);
+    return [...manual, ...fileCtx, ...mentionCtx];
+  }
+
+  /** Prior turns for the agent; drops the current user line (sent separately as `input`). */
+  private buildPriorHistory(userText: string, explicitCtx: ChatMessage[]): ChatMessage[] {
+    const turns = this.conversationMessages();
+    const trimmed =
+      turns.length > 0 &&
+      turns[turns.length - 1].role === "user" &&
+      turns[turns.length - 1].content === userText
+        ? turns.slice(0, -1)
+        : turns;
+    return [...explicitCtx, ...trimmed];
   }
 
   private async sendUserMessage(provider: string, model: string, text: string) {
@@ -917,9 +1022,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.post({ type: "addMessage", role: "user", content: text });
 
     const apiKey = await this.store.getApiKey(provider);
-    const fileCtx = this.buildFileContext();
-    const mentionCtx = await this.resolveAtMentions(text);
-    const messages: ChatMessage[] = [...fileCtx, ...mentionCtx, { role: "user", content: text }];
+    const explicitCtx = await this.buildExplicitContext(text);
+    const messages: ChatMessage[] = [...explicitCtx, { role: "user", content: text }];
+    this.postContextEstimate(explicitCtx, text);
     this.streamToPanel(provider, model, messages, apiKey);
   }
 
@@ -1010,16 +1115,21 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     if (!(await this.checkSecrets(text))) {return;}
     if (provider === "getaibd" && !(await this.ensureCreditsAllowance())) {return;}
     this.stepLimitHit = false;
-    const priorHistory = [...this.buildFileContext(), ...this.conversationMessages()];
     const turnId = newId();
     this.currentTurnId = turnId;
     this.history.push({ kind: "checkpoint", content: text, turnId, baselines: [] });
     this.history.push({ kind: "message", role: "user", content: text, turnId });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: text, turnId, canRestore: true });
+    const explicitCtx = await this.buildAgentContext(text);
+    const priorHistory = this.buildPriorHistory(text, explicitCtx);
+    this.postContextEstimate(priorHistory, text);
     this.post({ type: "agentStart" });
 
     const apiKey = await this.store.getApiKey(provider);
+    const agentUseMemory = vscode.workspace
+      .getConfiguration("getaibd")
+      .get<boolean>("agent.useMemory", false);
     this.abortController = streamOrchestrated(provider, model, text, mode, {
       onModeSelected: (selectedMode) => {
         this.post({ type: "modeDetected", mode: selectedMode });
@@ -1086,7 +1196,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.refreshCreditsBalance(provider);
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress });
+    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress, useMemory: agentUseMemory });
   }
 
   private handleFileEdit(edit: FileEdit) {
@@ -1501,7 +1611,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       if (e.role !== "user" && e.role !== "assistant") {continue;}
       all.push({ role: e.role, content: e.content });
     }
-    const BUDGET = 60_000;
+    const BUDGET = HISTORY_CHAR_BUDGET;
     const out: ChatMessage[] = [];
     let used = 0;
     for (let i = all.length - 1; i >= 0; i--) {
@@ -1565,6 +1675,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.activeSessionId = session.id;
     this.history = [];
     this.currentTurnId = undefined;
+    this.resetContextInjectionState();
     this.editContents.clear();
     this.fileEdits.clear();
     this.editReview.clearAll();
@@ -1583,6 +1694,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.currentTurnId = undefined;
     this.activeSessionId = id;
     this.history = this.sessionStore.get<HistoryEntry[]>(SESSION_HISTORY_PREFIX + id, []);
+    this.resetContextInjectionState();
     this.saveSessions();
     this.sendSessions();
     this.post({ type: "clearMessages" });
@@ -2046,6 +2158,7 @@ body {
 .spinner { display: none; padding: 8px 14px; color: var(--muted); font-size: 12px; align-items: center; gap: 8px; }
 .spinner.visible { display: flex; }
 .spinner::before { content: ''; width: 14px; height: 14px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+.ctx-estimate { margin-left: auto; font-size: 11px; color: var(--muted); opacity: 0.85; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── Boot overlay (shown until the engine + providers are ready) ── */
@@ -2351,6 +2464,25 @@ body {
 .cost-mode-option.active { background: var(--accent); color: #fff; }
 
 .composer-row { display: flex; align-items: center; gap: 6px; }
+.reasoning-row { flex-wrap: wrap; gap: 4px; padding-bottom: 2px; }
+.reasoning-label { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.reasoning-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.reasoning-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1.4;
+}
+.reasoning-chip:hover { color: var(--fg); border-color: var(--fg); }
+.reasoning-chip.active {
+  border-color: #c084fc;
+  color: #c084fc;
+  background: rgba(192, 132, 252, 0.12);
+}
 .composer-spacer { flex: 1; }
 
 .ctl-pill {
@@ -2770,7 +2902,7 @@ body {
 
 <div class="messages" id="messages"></div>
 <div class="reconnect-banner" id="reconnectBanner"></div>
-<div class="spinner" id="spinner">Generating...</div>
+<div class="spinner" id="spinner"><span id="spinnerLabel">Generating...</span><span class="ctx-estimate" id="ctxEstimate" style="display:none"></span></div>
 
 <div class="settings-panel" id="settingsPanel"></div>
 
@@ -2812,6 +2944,10 @@ body {
     <button class="round-btn" id="attachBtn" title="Attach file">&#x1F4CE;</button>
     <button class="round-btn send-btn" id="sendBtn" title="Send">&#9654;</button>
   </div>
+  <div class="composer-row reasoning-row" id="reasoningRow" style="display:none" role="group" aria-label="Reasoning effort">
+    <span class="reasoning-label">Reasoning</span>
+    <div class="reasoning-chips" id="reasoningChips"></div>
+  </div>
 </div>
 
 <script nonce="${nonce}">
@@ -2826,6 +2962,15 @@ const messagesEl = document.getElementById("messages");
 const bootOverlay = document.getElementById("bootOverlay");
 const bootText = document.getElementById("bootText");
 const spinnerEl = document.getElementById("spinner");
+const spinnerLabelEl = document.getElementById("spinnerLabel");
+const ctxEstimateEl = document.getElementById("ctxEstimate");
+
+function clearCtxEstimate() {
+  if (ctxEstimateEl) {
+    ctxEstimateEl.textContent = "";
+    ctxEstimateEl.style.display = "none";
+  }
+}
 const reconnectBanner = document.getElementById("reconnectBanner");
 const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("sendBtn");
@@ -2851,7 +2996,7 @@ const upgradeBtn = document.getElementById("upgradeBtn");
 const costModeSwitch = document.getElementById("costModeSwitch");
 const costNormalBtn = document.getElementById("costNormalBtn");
 const costReducedBtn = document.getElementById("costReducedBtn");
-let compressEnabled = false;
+let compressEnabled = true;
 if (upgradeBtn) {
   upgradeBtn.addEventListener("click", () => vscode.postMessage({ type: "needApiKey" }));
 }
@@ -3308,11 +3453,16 @@ function updateModelPill() {
     modelPillIcon.textContent = "🤖";
   }
   updateCostModeUi();
+  updateReasoningUi();
 }
 
-// Thinking-capable models always reason at high effort. There's no user-facing
-// effort control (it was redundant), so this stays a fixed default.
-const currentReasoning = "high";
+const REASONING_LEVELS = [
+  { key: "off", label: "Off", title: "No extended reasoning — lowest cost" },
+  { key: "low", label: "Low", title: "Light reasoning — cheaper" },
+  { key: "medium", label: "Med", title: "Balanced reasoning (default)" },
+  { key: "high", label: "High", title: "Deep reasoning — uses more credits" },
+];
+let currentReasoning = "medium";
 
 function modelCaps(provider, modelId) {
   const api = (allModels[provider] || []).find(m => m.id === modelId);
@@ -3325,6 +3475,40 @@ function modelCaps(provider, modelId) {
 function currentModelSupportsThinking() {
   return modelCaps(currentProvider, currentModel).includes("thinking");
 }
+
+const reasoningRow = document.getElementById("reasoningRow");
+const reasoningChips = document.getElementById("reasoningChips");
+
+function buildReasoningChips() {
+  if (!reasoningChips) { return; }
+  reasoningChips.innerHTML = "";
+  for (const r of REASONING_LEVELS) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "reasoning-chip";
+    btn.dataset.key = r.key;
+    btn.textContent = r.label;
+    btn.title = r.title;
+    btn.addEventListener("click", () => {
+      currentReasoning = r.key;
+      updateReasoningUi();
+      vscode.postMessage({ type: "reasoningChanged", reasoningEffort: r.key });
+    });
+    reasoningChips.appendChild(btn);
+  }
+}
+
+function updateReasoningUi() {
+  if (!reasoningRow) { return; }
+  const show = currentModelSupportsThinking();
+  reasoningRow.style.display = show ? "flex" : "none";
+  if (!show || !reasoningChips) { return; }
+  reasoningChips.querySelectorAll(".reasoning-chip").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.key === currentReasoning);
+  });
+}
+
+buildReasoningChips();
 
 /* ── Send ── */
 sendBtn.addEventListener("click", () => {
@@ -3893,6 +4077,10 @@ window.addEventListener("message", (event) => {
         compressEnabled = !!msg.compress;
         updateCostModeUi();
       }
+      if (msg.reasoningEffort) {
+        currentReasoning = msg.reasoningEffort;
+      }
+      updateReasoningUi();
       break;
 
     case "authMode":
@@ -4007,6 +4195,7 @@ window.addEventListener("message", (event) => {
       sendBtn.innerHTML = "&#9654;";
       sendBtn.classList.remove("stop");
       spinnerEl.classList.remove("visible");
+      clearCtxEstimate();
       reconnectBanner.classList.remove("visible");
       break;
 
@@ -4017,6 +4206,7 @@ window.addEventListener("message", (event) => {
       sendBtn.innerHTML = "&#9654;";
       sendBtn.classList.remove("stop");
       spinnerEl.classList.remove("visible");
+      clearCtxEstimate();
       reconnectBanner.classList.remove("visible");
       const errDiv = document.createElement("div");
       errDiv.className = "error-msg";
@@ -4056,8 +4246,19 @@ window.addEventListener("message", (event) => {
       pendingToolRows = [];
       sendBtn.innerHTML = "&#9632;";
       sendBtn.classList.add("stop");
-      spinnerEl.textContent = "Agent working...";
+      spinnerLabelEl.textContent = "Agent working...";
       spinnerEl.classList.add("visible");
+      break;
+
+    case "contextEstimate":
+      if (ctxEstimateEl) {
+        const label = msg.label || "";
+        ctxEstimateEl.textContent = label;
+        ctxEstimateEl.style.display = label ? "inline" : "none";
+        ctxEstimateEl.title =
+          "Approximate client context in this request (history + attached files). " +
+          "The engine adds RAG memory and tool output separately.";
+      }
       break;
 
     case "agentToolCall": {
@@ -4271,6 +4472,7 @@ window.addEventListener("message", (event) => {
       sendBtn.innerHTML = "&#9654;";
       sendBtn.classList.remove("stop");
       spinnerEl.classList.remove("visible");
+      clearCtxEstimate();
       {
         const cd = document.createElement("div");
         cd.className = "agent-status";
@@ -4300,6 +4502,7 @@ window.addEventListener("message", (event) => {
       sendBtn.innerHTML = "&#9654;";
       sendBtn.classList.remove("stop");
       spinnerEl.classList.remove("visible");
+      clearCtxEstimate();
       {
         const ae = document.createElement("div");
         ae.className = "error-msg";
