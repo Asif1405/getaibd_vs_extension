@@ -4,6 +4,19 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.40]
+
+- **Free "Auto" model works at zero credits** — paid keys no longer block the free
+  model when balance is at the floor; only paid models require topping up.
+- **Settings: Get Integration API Key** opens the site integrations page.
+- **Top-up prompts include** `https://getaibd.com/dashboard`.
+- **Stop shows a spinner only while cancelling** — red stop square while a task runs;
+  clicking stop swaps to a loader until the run ends (send arrow returns after).
+- **Chat typography** — larger body text, clearer markdown headings/lists/blockquotes,
+  bordered code blocks, and a more visible user-message background.
+- **Message queue** — stack follow-up prompts while a run is active; reorder (drag or
+  arrows), remove, or force-send any queued item to interrupt the current task.
+
 ## [0.4.39]
 
 - **RAG toggle in chat header** — `RAG Off` / `RAG On` beside Normal/Reduced cost; preference

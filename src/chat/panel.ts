@@ -32,6 +32,7 @@ import {
   FREE_MODEL_LABEL,
   CREDIT_FLOOR,
   BILLING_URL,
+  INTEGRATION_URL,
 } from "../util/config";
 import { ProviderStore, BUILTIN_PROVIDERS, CURATED_MODELS, PROVIDER_META } from "../settings/providerStore";
 import {
@@ -566,6 +567,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "needPlan":
         await this.promptPlanRequired();
         break;
+      case "openIntegrationKey":
+        void vscode.env.openExternal(vscode.Uri.parse(INTEGRATION_URL));
+        break;
       case "refreshModels":
         await this.refreshModels();
         break;
@@ -668,10 +672,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     return true;
   }
 
-  /** Blocks paid GetAIBD usage when credits are at or below the platform floor. */
-  private async ensureCreditsAllowance(): Promise<boolean> {
+  /** Blocks paid GetAIBD usage when credits are at or below the platform floor (free model always allowed). */
+  private async ensureCreditsAllowance(model?: string): Promise<boolean> {
     const key = await getApiKey(this.context.secrets);
     if (!key || isFreeToken(key)) {
+      return true;
+    }
+    if (model === FREE_MODEL_ID) {
       return true;
     }
     const status = await fetchAccountStatus(key);
@@ -694,7 +701,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private async promptLowCredits(balance: number, floor: number): Promise<void> {
     const choice = await vscode.window.showWarningMessage(
       `GetAIBD credits are too low (${balance.toLocaleString()} remaining). ` +
-        `Top up to keep using the agent (minimum ${floor} credits).`,
+        `Top up to keep using paid models (minimum ${floor} credits). ` +
+        `The free "${FREE_MODEL_LABEL}" model still works at zero balance. ` +
+        `Top up at ${BILLING_URL}`,
       "Top Up Credits",
       "Refresh Balance",
     );
@@ -733,8 +742,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     if (isCreditIssue) {
       const summary =
         detail && detail.length < 220
-          ? detail.replace(/^Agent error: Provider error: getaibd:\s*/i, "")
-          : "Your GetAIBD credits are too low for this request. Top up to continue.";
+          ? `${detail.replace(/^Agent error: Provider error: getaibd:\s*/i, "")} Top up at ${BILLING_URL}`
+          : `Your GetAIBD credits are too low for this request. Top up at ${BILLING_URL}`;
       const choice = await vscode.window.showWarningMessage(summary, "Top Up Credits", "Refresh Balance");
       if (choice === "Top Up Credits") {
         void vscode.env.openExternal(vscode.Uri.parse(BILLING_URL));
@@ -1024,7 +1033,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendUserMessage(provider: string, model: string, text: string) {
     if (!(await this.checkSecrets(text))) {return;}
-    if (provider === "getaibd" && !(await this.ensureCreditsAllowance())) {return;}
+    if (provider === "getaibd" && !(await this.ensureCreditsAllowance(model))) {return;}
     this.history.push({ kind: "message", role: "user", content: text });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: text });
@@ -1038,7 +1047,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   private async sendAgentTask(provider: string, model: string, task: string) {
     if (!(await this.checkSecrets(task))) {return;}
-    if (provider === "getaibd" && !(await this.ensureCreditsAllowance())) {return;}
+    if (provider === "getaibd" && !(await this.ensureCreditsAllowance(model))) {return;}
     this.history.push({ kind: "message", role: "user", content: task });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: task });
@@ -1121,7 +1130,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     compress = false,
   ) {
     if (!(await this.checkSecrets(text))) {return;}
-    if (provider === "getaibd" && !(await this.ensureCreditsAllowance())) {return;}
+    if (provider === "getaibd" && !(await this.ensureCreditsAllowance(model))) {return;}
     this.stepLimitHit = false;
     const turnId = newId();
     this.currentTurnId = turnId;
@@ -1874,8 +1883,10 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
   --btn-fg: var(--vscode-button-foreground);
   --btn-hover: var(--vscode-button-hoverBackground);
   --border: var(--vscode-panel-border, #2d2d2d);
-  --user-bg: var(--vscode-textBlockQuote-background, #2a2a2a);
-  --code-bg: var(--vscode-textCodeBlock-background, #1e1e1e);
+  --user-bg: var(--vscode-list-inactiveSelectionBackground, #2d2d30);
+  --user-border: var(--vscode-widget-border, #454545);
+  --code-bg: var(--vscode-textCodeBlock-background, #1a1a1a);
+  --code-border: var(--vscode-panel-border, #3c3c3c);
   --error-fg: var(--vscode-errorForeground, #f44747);
   --muted: var(--vscode-descriptionForeground, #888);
   --warn-bg: var(--vscode-inputValidation-warningBackground, #4d3a00);
@@ -1892,7 +1903,8 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--vscode-font-family, system-ui, -apple-system, sans-serif);
-  font-size: 13px;
+  font-size: 14px;
+  line-height: 1.55;
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -1996,141 +2008,161 @@ body {
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 14px;
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
 }
 
 .message {
   padding: 4px 2px;
-  border-radius: 8px;
-  line-height: 1.5;
+  border-radius: 10px;
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
   position: relative;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .message.user {
   background: var(--user-bg);
+  border: 1px solid var(--user-border);
   align-self: flex-end;
   max-width: 88%;
-  padding: 7px 12px;
-  border-bottom-right-radius: 2px;
-  margin-top: 6px;
+  padding: 10px 14px;
+  border-bottom-right-radius: 4px;
+  margin-top: 4px;
+  color: var(--fg);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
 }
 
 .message.assistant {
   align-self: stretch;
   max-width: 100%;
-  padding: 2px 56px 2px 2px;
+  padding: 4px 56px 6px 4px;
 }
 
 .message .role-label {
   display: none;
 }
 
-.md { white-space: normal; }
+.md { white-space: normal; line-height: 1.65; }
 .md > *:first-child { margin-top: 0; }
 .md > *:last-child { margin-bottom: 0; }
-.md p { margin: 0 0 8px; }
+.md p { margin: 0 0 10px; }
+.md strong { font-weight: 600; color: var(--fg); }
+.md em { font-style: italic; }
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
-  margin: 14px 0 6px;
-  line-height: 1.3;
+  margin: 16px 0 8px;
+  line-height: 1.35;
   font-weight: 600;
+  color: var(--fg);
 }
-.md h1 { font-size: 1.4em; }
-.md h2 { font-size: 1.25em; }
-.md h3 { font-size: 1.1em; }
-.md h4, .md h5, .md h6 { font-size: 1em; }
-.md ul, .md ol { margin: 0 0 8px; padding-left: 22px; }
-.md li { margin: 2px 0; }
-.md li > p { margin: 0; }
+.md h1 { font-size: 1.45em; }
+.md h2 { font-size: 1.3em; }
+.md h3 { font-size: 1.15em; }
+.md h4, .md h5, .md h6 { font-size: 1.05em; }
+.md ul, .md ol { margin: 0 0 10px; padding-left: 24px; }
+.md li { margin: 4px 0; line-height: 1.6; }
+.md li > p { margin: 0 0 4px; }
 .md blockquote {
-  margin: 0 0 8px;
-  padding: 2px 10px;
-  border-left: 3px solid var(--border);
-  color: var(--muted);
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--focus);
+  background: var(--list-hover);
+  border-radius: 0 8px 8px 0;
+  color: var(--fg);
 }
-.md a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+.md a { color: var(--vscode-textLink-foreground); text-decoration: none; font-weight: 500; }
 .md a:hover { text-decoration: underline; }
-.md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
 .md pre {
   background: var(--code-bg);
-  padding: 10px 12px;
-  border-radius: 6px;
+  border: 1px solid var(--code-border);
+  padding: 12px 14px;
+  border-radius: 8px;
   overflow-x: auto;
-  margin: 0 0 8px;
+  margin: 0 0 10px;
+  line-height: 1.55;
 }
-.md pre code { background: none; padding: 0; font-size: 12px; }
+.md pre code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.55;
+}
 .md code {
   background: var(--code-bg);
-  padding: 1px 5px;
-  border-radius: 3px;
+  border: 1px solid var(--code-border);
+  padding: 2px 6px;
+  border-radius: 4px;
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 12px;
+  font-size: 13px;
 }
 .md table {
   border-collapse: collapse;
-  margin: 0 0 8px;
+  margin: 0 0 10px;
   width: auto;
-  font-size: 12px;
+  font-size: 13px;
 }
 .md th, .md td {
   border: 1px solid var(--border);
-  padding: 4px 10px;
+  padding: 6px 12px;
   text-align: left;
 }
 .md th { background: var(--list-hover); font-weight: 600; }
-.md img { max-width: 100%; border-radius: 6px; }
+.md img { max-width: 100%; border-radius: 8px; }
 
 /* Per-block copy header injected around fenced code blocks. */
 .code-block {
-  margin: 0 0 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  margin: 0 0 10px;
+  border: 1px solid var(--code-border);
+  border-radius: 8px;
   overflow: hidden;
+  background: var(--code-bg);
 }
 .code-block-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 2px 6px 2px 10px;
+  padding: 4px 8px 4px 12px;
   background: var(--list-hover);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--code-border);
 }
-.code-block-lang { font-size: 10px; color: var(--muted); text-transform: lowercase; }
+.code-block-lang { font-size: 11px; color: var(--muted); text-transform: lowercase; letter-spacing: 0.02em; }
 .code-copy-btn {
   background: var(--input-bg);
   border: 1px solid var(--border);
   color: var(--muted);
   border-radius: 4px;
-  padding: 1px 8px;
+  padding: 2px 10px;
   cursor: pointer;
-  font-size: 10px;
-  line-height: 16px;
+  font-size: 11px;
+  line-height: 18px;
 }
 .code-copy-btn:hover { color: var(--fg); border-color: var(--fg); }
-.md .code-block pre { margin: 0; border: none; border-radius: 0; }
+.md .code-block pre { margin: 0; border: none; border-radius: 0; padding: 12px 14px; }
 
 .message code {
   background: var(--code-bg);
-  padding: 1px 5px;
-  border-radius: 3px;
+  border: 1px solid var(--code-border);
+  padding: 2px 6px;
+  border-radius: 4px;
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .message pre {
   background: var(--code-bg);
-  padding: 10px;
-  border-radius: 6px;
+  border: 1px solid var(--code-border);
+  padding: 12px 14px;
+  border-radius: 8px;
   overflow-x: auto;
-  margin: 6px 0;
+  margin: 8px 0;
+  line-height: 1.55;
 }
-.message pre code { background: none; padding: 0; }
+.message pre code { background: none; border: none; padding: 0; font-size: 13px; }
 
 .msg-action-btn {
   position: absolute;
@@ -2327,6 +2359,80 @@ body {
 .context-compressed-msg { padding: 4px 14px; font-size: 11px; color: var(--muted); font-style: italic; display: flex; align-items: center; gap: 4px; }
 .context-compressed-msg::before { content: '⟳'; font-size: 12px; }
 
+/* ── Message queue (stack follow-ups while a run is active) ── */
+.message-queue {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 6px 0 4px;
+  display: none;
+}
+.message-queue.visible { display: block; }
+.queue-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  padding: 2px 14px 6px;
+}
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  margin: 0 10px 6px;
+  background: var(--user-bg);
+  border: 1px solid var(--user-border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.queue-item.dragging { opacity: 0.55; }
+.queue-item.drag-over { border-color: var(--focus); }
+.queue-grip {
+  color: var(--muted);
+  font-size: 12px;
+  cursor: grab;
+  user-select: none;
+  padding: 0 2px;
+  letter-spacing: -2px;
+}
+.queue-item-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.4;
+  color: var(--fg);
+}
+.queue-item-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.queue-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  width: 26px;
+  height: 26px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.queue-btn:hover:not(:disabled) { color: var(--fg); border-color: var(--fg); }
+.queue-btn:disabled { opacity: 0.35; cursor: default; }
+.queue-btn.force { color: var(--btn-bg); border-color: color-mix(in srgb, var(--btn-bg) 55%, var(--border)); }
+.queue-btn.force:hover:not(:disabled) { background: var(--btn-bg); color: var(--btn-fg); border-color: var(--btn-bg); }
+
 /* ── Input Bar ── */
 .input-bar {
   display: flex;
@@ -2343,13 +2449,13 @@ body {
   color: var(--input-fg);
   border: 1px solid var(--input-border);
   border-radius: 8px;
-  padding: 9px 12px;
+  padding: 10px 12px;
   font-family: inherit;
-  font-size: 13px;
+  font-size: 14px;
   resize: none;
-  min-height: 38px;
+  min-height: 40px;
   max-height: 150px;
-  line-height: 1.4;
+  line-height: 1.5;
 }
 .input-bar textarea:focus { outline: none; border-color: var(--focus); }
 
@@ -2407,7 +2513,30 @@ body {
   flex-shrink: 0;
 }
 .send-btn:hover { background: var(--btn-hover); }
-.send-btn.stop { background: var(--error-fg); }
+.send-btn.stop {
+  background: var(--error-fg);
+  color: #fff;
+}
+.send-btn.stop:hover {
+  background: var(--error-fg);
+  opacity: 0.92;
+}
+.send-btn.stopping {
+  background: var(--error-fg);
+  color: #fff;
+  cursor: wait;
+  pointer-events: none;
+}
+.send-btn.stopping::before {
+  content: '';
+  display: block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
 
 /* ── Composer ── */
 .brand { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.3px; }
@@ -2536,9 +2665,8 @@ body {
   flex-shrink: 0;
 }
 .round-btn:hover { background: var(--list-hover); color: var(--fg); }
-.round-btn.send-btn { background: var(--btn-bg); color: var(--btn-fg); }
-.round-btn.send-btn:hover { background: var(--btn-hover); }
-.round-btn.send-btn.stop { background: var(--error-fg); }
+.round-btn.send-btn.stop { background: var(--error-fg); color: #fff; }
+.round-btn.send-btn.stopping { background: var(--error-fg); color: #fff; }
 
 .mode-menu {
   display: none;
@@ -2948,6 +3076,8 @@ body {
   <div class="mode-item" data-mode="ask"><span class="mi-icon">&#128172;</span><span class="mi-label">Ask</span><span class="mi-check">&#10003;</span></div>
 </div>
 
+<div class="message-queue" id="messageQueue" aria-label="Queued messages"></div>
+
 <div class="composer">
   <textarea id="input" rows="1" placeholder="Ask anything... (use @filename to reference files)"></textarea>
   <div class="composer-row">
@@ -2995,6 +3125,7 @@ function clearCtxEstimate() {
 const reconnectBanner = document.getElementById("reconnectBanner");
 const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("sendBtn");
+const messageQueueEl = document.getElementById("messageQueue");
 const modelPill = document.getElementById("modelPill");
 const modelPillLabel = document.getElementById("modelPillLabel");
 const modelPillIcon = document.getElementById("modelPillIcon");
@@ -3070,6 +3201,7 @@ if (settingsPanel) {
     else if (act === "removeKey") { removeKey(arg); }
     else if (act === "testProvider") { testProvider(arg); }
     else if (act === "removeAlwaysAllow") { vscode.postMessage({ type: "removeAlwaysAllow", tool: arg }); }
+    else if (act === "openIntegrationKey") { vscode.postMessage({ type: "openIntegrationKey" }); }
   });
   settingsPanel.addEventListener("change", (e) => {
     const t = e.target.closest("[data-act]");
@@ -3083,6 +3215,11 @@ if (settingsPanel) {
 }
 
 let streaming = false;
+let stopping = false;
+let messageQueue = [];
+let forcedNext = null;
+let queueSeq = 0;
+let dragQueueId = null;
 let streamEl = null;
 let streamContent = "";
 let agentTextEl = null;
@@ -3551,9 +3688,48 @@ function updateReasoningUi() {
 buildReasoningChips();
 
 /* ── Send ── */
+function setSendIdle() {
+  stopping = false;
+  sendBtn.innerHTML = "&#9654;";
+  sendBtn.classList.remove("stop", "stopping");
+  sendBtn.disabled = false;
+  sendBtn.title = "Send";
+  spinnerEl.classList.remove("visible");
+  clearCtxEstimate();
+}
+
+function setSendStreaming(spinnerText) {
+  stopping = false;
+  sendBtn.innerHTML = "&#9632;";
+  sendBtn.classList.add("stop");
+  sendBtn.classList.remove("stopping");
+  sendBtn.disabled = false;
+  sendBtn.title = "Stop";
+  if (spinnerText) { spinnerLabelEl.textContent = spinnerText; }
+  spinnerEl.classList.add("visible");
+}
+
+function setSendStopping() {
+  if (stopping) { return; }
+  stopping = true;
+  sendBtn.innerHTML = "";
+  sendBtn.classList.remove("stop");
+  sendBtn.classList.add("stopping");
+  sendBtn.disabled = true;
+  sendBtn.title = "Stopping…";
+  spinnerLabelEl.textContent = "Stopping…";
+  spinnerEl.classList.add("visible");
+}
+
+function requestStop() {
+  if (!streaming || stopping) { return; }
+  setSendStopping();
+  vscode.postMessage({ type: "stop" });
+}
+
 sendBtn.addEventListener("click", () => {
   if (streaming) {
-    vscode.postMessage({ type: "stop" });
+    requestStop();
   } else {
     send();
   }
@@ -3562,8 +3738,7 @@ sendBtn.addEventListener("click", () => {
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    if (streaming) vscode.postMessage({ type: "stop" });
-    else send();
+    send();
   }
 });
 
@@ -3577,6 +3752,151 @@ function detectPlanIntent(text) {
   return /\\b(plan|how (should|do|would|can) (i|we|you)|what(?:'s| is) the best way|best way to|approach to|strategy (for|to)|architecture (of|for)|design (a|an|the|for)|outline|steps to|break (this |it )?down|should (i|we))\\b/.test(t);
 }
 
+function buildQueueItem(text) {
+  const reasoning = currentModelSupportsThinking() ? currentReasoning : "off";
+  return {
+    id: "q" + (++queueSeq),
+    text: text,
+    provider: currentProvider,
+    model: currentModel,
+    mode: currentMode,
+    reasoningEffort: reasoning === "off" ? null : reasoning,
+    compress: compressEnabled && currentProvider === "getaibd",
+  };
+}
+
+function dispatchQueueItem(item) {
+  if (item.mode === "agent" && detectPlanIntent(item.text)) {
+    switchMode("plan");
+  }
+  vscode.postMessage({
+    type: "orchestratedSend",
+    provider: item.provider,
+    model: item.model,
+    text: item.text,
+    mode: item.mode,
+    reasoningEffort: item.reasoningEffort,
+    compress: item.compress,
+  });
+}
+
+function renderQueue() {
+  if (!messageQueueEl) { return; }
+  if (messageQueue.length === 0) {
+    messageQueueEl.classList.remove("visible");
+    messageQueueEl.innerHTML = "";
+    return;
+  }
+  messageQueueEl.classList.add("visible");
+  let html = '<div class="queue-header">Queued (' + messageQueue.length + ')</div>';
+  for (let i = 0; i < messageQueue.length; i++) {
+    const item = messageQueue[i];
+    const preview = escapeHtml(item.text.length > 120 ? item.text.slice(0, 117) + "..." : item.text);
+    html += '<div class="queue-item" draggable="true" data-id="' + item.id + '">'
+      + '<span class="queue-grip" title="Drag to reorder">&#8942;&#8942;</span>'
+      + '<span class="queue-item-text" title="' + escapeHtml(item.text) + '">' + preview + '</span>'
+      + '<span class="queue-item-actions">'
+      + '<button type="button" class="queue-btn" data-act="up" data-id="' + item.id + '" title="Move up"' + (i === 0 ? " disabled" : "") + '>&#9650;</button>'
+      + '<button type="button" class="queue-btn" data-act="down" data-id="' + item.id + '" title="Move down"' + (i === messageQueue.length - 1 ? " disabled" : "") + '>&#9660;</button>'
+      + '<button type="button" class="queue-btn force" data-act="force" data-id="' + item.id + '" title="Send now (interrupts current)">&#9654;</button>'
+      + '<button type="button" class="queue-btn" data-act="remove" data-id="' + item.id + '" title="Remove">&#10005;</button>'
+      + '</span></div>';
+  }
+  messageQueueEl.innerHTML = html;
+}
+
+function moveQueueItem(id, delta) {
+  const idx = messageQueue.findIndex(function (q) { return q.id === id; });
+  if (idx < 0) { return; }
+  const next = idx + delta;
+  if (next < 0 || next >= messageQueue.length) { return; }
+  const tmp = messageQueue[idx];
+  messageQueue[idx] = messageQueue[next];
+  messageQueue[next] = tmp;
+  renderQueue();
+}
+
+function removeQueueItem(id) {
+  messageQueue = messageQueue.filter(function (q) { return q.id !== id; });
+  renderQueue();
+}
+
+function forceQueueItem(id) {
+  const idx = messageQueue.findIndex(function (q) { return q.id === id; });
+  if (idx < 0) { return; }
+  const item = messageQueue.splice(idx, 1)[0];
+  renderQueue();
+  if (streaming) {
+    forcedNext = item;
+    requestStop();
+  } else {
+    dispatchQueueItem(item);
+  }
+}
+
+function onRunFinished() {
+  if (forcedNext) {
+    const item = forcedNext;
+    forcedNext = null;
+    dispatchQueueItem(item);
+    return;
+  }
+  if (messageQueue.length > 0) {
+    dispatchQueueItem(messageQueue.shift());
+    renderQueue();
+  }
+}
+
+if (messageQueueEl) {
+  messageQueueEl.addEventListener("click", function (e) {
+    const btn = e.target.closest(".queue-btn");
+    if (!btn || btn.disabled) { return; }
+    const id = btn.getAttribute("data-id");
+    const act = btn.getAttribute("data-act");
+    if (!id || !act) { return; }
+    if (act === "up") { moveQueueItem(id, -1); }
+    else if (act === "down") { moveQueueItem(id, 1); }
+    else if (act === "force") { forceQueueItem(id); }
+    else if (act === "remove") { removeQueueItem(id); }
+  });
+  messageQueueEl.addEventListener("dragstart", function (e) {
+    const row = e.target.closest(".queue-item");
+    if (!row) { return; }
+    dragQueueId = row.getAttribute("data-id");
+    row.classList.add("dragging");
+    if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; }
+  });
+  messageQueueEl.addEventListener("dragend", function (e) {
+    const row = e.target.closest(".queue-item");
+    if (row) { row.classList.remove("dragging"); }
+    dragQueueId = null;
+    messageQueueEl.querySelectorAll(".queue-item.drag-over").forEach(function (el) {
+      el.classList.remove("drag-over");
+    });
+  });
+  messageQueueEl.addEventListener("dragover", function (e) {
+    e.preventDefault();
+    const row = e.target.closest(".queue-item");
+    messageQueueEl.querySelectorAll(".queue-item.drag-over").forEach(function (el) {
+      el.classList.remove("drag-over");
+    });
+    if (row) { row.classList.add("drag-over"); }
+  });
+  messageQueueEl.addEventListener("drop", function (e) {
+    e.preventDefault();
+    const targetRow = e.target.closest(".queue-item");
+    if (!targetRow || !dragQueueId) { return; }
+    const targetId = targetRow.getAttribute("data-id");
+    if (!targetId || targetId === dragQueueId) { return; }
+    const from = messageQueue.findIndex(function (q) { return q.id === dragQueueId; });
+    const to = messageQueue.findIndex(function (q) { return q.id === targetId; });
+    if (from < 0 || to < 0) { return; }
+    const moved = messageQueue.splice(from, 1)[0];
+    messageQueue.splice(to, 0, moved);
+    renderQueue();
+  });
+}
+
 function send() {
   const text = inputEl.value.trim();
   if (!text) return;
@@ -3586,21 +3906,15 @@ function send() {
     renderModelList("");
     return;
   }
-  if (currentMode === "agent" && detectPlanIntent(text)) {
-    switchMode("plan");
-  }
+  const item = buildQueueItem(text);
   inputEl.value = "";
   inputEl.style.height = "auto";
-  const reasoning = currentModelSupportsThinking() ? currentReasoning : "off";
-  vscode.postMessage({
-    type: "orchestratedSend",
-    provider: currentProvider,
-    model: currentModel,
-    text,
-    mode: currentMode,
-    reasoningEffort: reasoning === "off" ? null : reasoning,
-    compress: compressEnabled && currentProvider === "getaibd",
-  });
+  if (streaming) {
+    messageQueue.push(item);
+    renderQueue();
+    return;
+  }
+  dispatchQueueItem(item);
 }
 
 /** Resumes a run that paused at the step limit, reusing the current selection. */
@@ -3953,6 +4267,11 @@ function renderSettings(data) {
       + '<button class="small-btn primary" data-act="saveKey" data-arg="' + escapeHtml(p.id) + '">Save</button>'
       + (p.hasKey ? '<button class="small-btn danger" data-act="removeKey" data-arg="' + escapeHtml(p.id) + '">Remove</button>' : '')
       + '</div>';
+    if (p.id === "getaibd") {
+      html += '<div class="setting-row" style="margin-top:8px">'
+        + '<button class="small-btn primary" data-act="openIntegrationKey">Get Integration API Key</button>'
+        + '</div>';
+    }
     html += '<div class="pref-row"><label>Status</label><span>' + (p.hasKey ? 'Key configured' : 'No key (free tier)') + '</span></div>';
     html += '</div>';
   }
@@ -4214,9 +4533,7 @@ window.addEventListener("message", (event) => {
     case "streamStart":
       streaming = true;
       streamContent = "";
-      sendBtn.innerHTML = "&#9632;";
-      sendBtn.classList.add("stop");
-      spinnerEl.classList.add("visible");
+      setSendStreaming("Generating...");
       reconnectBanner.classList.remove("visible");
       streamEl = addMessage("assistant", "");
       break;
@@ -4235,27 +4552,23 @@ window.addEventListener("message", (event) => {
       if (streamEl && streamContent) appendActionBtns(streamEl, streamContent);
       streamEl = null;
       streamContent = "";
-      sendBtn.innerHTML = "&#9654;";
-      sendBtn.classList.remove("stop");
-      spinnerEl.classList.remove("visible");
-      clearCtxEstimate();
+      setSendIdle();
       reconnectBanner.classList.remove("visible");
+      onRunFinished();
       break;
 
     case "streamError": {
       streaming = false;
       streamEl = null;
       streamContent = "";
-      sendBtn.innerHTML = "&#9654;";
-      sendBtn.classList.remove("stop");
-      spinnerEl.classList.remove("visible");
-      clearCtxEstimate();
+      setSendIdle();
       reconnectBanner.classList.remove("visible");
       const errDiv = document.createElement("div");
       errDiv.className = "error-msg";
       errDiv.textContent = "Error: " + msg.error;
       messagesEl.appendChild(errDiv);
       scrollToBottom();
+      onRunFinished();
       break;
     }
 
@@ -4287,10 +4600,7 @@ window.addEventListener("message", (event) => {
       toolGroupBodyEl = null;
       toolGroupCount = 0;
       pendingToolRows = [];
-      sendBtn.innerHTML = "&#9632;";
-      sendBtn.classList.add("stop");
-      spinnerLabelEl.textContent = "Agent working...";
-      spinnerEl.classList.add("visible");
+      setSendStreaming("Agent working...");
       break;
 
     case "contextEstimate":
@@ -4512,10 +4822,7 @@ window.addEventListener("message", (event) => {
       agentTextEl = null;
       agentDraftEl = null;
       agentTextContent = "";
-      sendBtn.innerHTML = "&#9654;";
-      sendBtn.classList.remove("stop");
-      spinnerEl.classList.remove("visible");
-      clearCtxEstimate();
+      setSendIdle();
       {
         const cd = document.createElement("div");
         cd.className = "agent-status";
@@ -4535,6 +4842,7 @@ window.addEventListener("message", (event) => {
         }
         scrollToBottom();
       }
+      onRunFinished();
       break;
 
     case "agentError":
@@ -4542,10 +4850,7 @@ window.addEventListener("message", (event) => {
       finalizeThought();
       agentTextEl = null;
       agentTextContent = "";
-      sendBtn.innerHTML = "&#9654;";
-      sendBtn.classList.remove("stop");
-      spinnerEl.classList.remove("visible");
-      clearCtxEstimate();
+      setSendIdle();
       {
         const ae = document.createElement("div");
         ae.className = "error-msg";
@@ -4553,6 +4858,7 @@ window.addEventListener("message", (event) => {
         messagesEl.appendChild(ae);
         scrollToBottom();
       }
+      onRunFinished();
       break;
 
     case "approvalRequest": {

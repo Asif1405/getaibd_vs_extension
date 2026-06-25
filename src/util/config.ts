@@ -10,7 +10,8 @@ export const FREE_MODEL_LABEL = "Auto";
 
 /** Paid usage stops at or below this balance (matches platform `API_CREDIT_FLOOR`). */
 export const CREDIT_FLOOR = 10;
-export const BILLING_URL = "https://getaibd.com/billing";
+export const BILLING_URL = "https://getaibd.com/dashboard";
+export const INTEGRATION_URL = "https://getaibd.com/connections";
 
 /** Whether a stored credential is an anonymous free-tier device token. */
 export function isFreeToken(key: string | undefined | null): boolean {
