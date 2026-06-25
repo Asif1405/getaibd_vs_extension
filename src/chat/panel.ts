@@ -3426,37 +3426,6 @@ const reconnectBanner = document.getElementById("reconnectBanner");
 const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("sendBtn");
 const messageQueueEl = document.getElementById("messageQueue");
-changesBarEl = document.getElementById("changesBar");
-changesFilesEl = document.getElementById("changesFiles");
-changesLabelEl = document.getElementById("changesLabel");
-const changesToggleBtn = document.getElementById("changesToggle");
-const changesRejectAllBtn = document.getElementById("changesRejectAll");
-const changesAcceptAllBtn = document.getElementById("changesAcceptAll");
-const changesReviewBtn = document.getElementById("changesReview");
-if (changesToggleBtn && changesBarEl) {
-  changesToggleBtn.addEventListener("click", () => {
-    changesExpanded = !changesExpanded;
-    changesBarEl.classList.toggle("expanded", changesExpanded);
-  });
-}
-if (changesRejectAllBtn) {
-  changesRejectAllBtn.addEventListener("click", () => {
-    vscode.postMessage({ type: "undoEdits" });
-    markAllCards("fe-reverted");
-    finalizeEdits("Rejected all changes");
-  });
-}
-if (changesAcceptAllBtn) {
-  changesAcceptAllBtn.addEventListener("click", () => {
-    const n = Object.keys(editStats).length;
-    vscode.postMessage({ type: "keepEdits" });
-    markAllCards("fe-accepted");
-    finalizeEdits("Accepted " + n + " file" + (n === 1 ? "" : "s"));
-  });
-}
-if (changesReviewBtn) {
-  changesReviewBtn.addEventListener("click", () => vscode.postMessage({ type: "openReview" }));
-}
 const modelPill = document.getElementById("modelPill");
 const modelPillLabel = document.getElementById("modelPillLabel");
 const modelPillIcon = document.getElementById("modelPillIcon");
@@ -3572,6 +3541,42 @@ let changesFilesEl = null;
 let changesLabelEl = null;
 let changesExpanded = false;
 let agentStreamedResponse = false;
+
+function initChangesBar() {
+  changesBarEl = document.getElementById("changesBar");
+  changesFilesEl = document.getElementById("changesFiles");
+  changesLabelEl = document.getElementById("changesLabel");
+  const changesToggleBtn = document.getElementById("changesToggle");
+  const changesRejectAllBtn = document.getElementById("changesRejectAll");
+  const changesAcceptAllBtn = document.getElementById("changesAcceptAll");
+  const changesReviewBtn = document.getElementById("changesReview");
+  if (changesToggleBtn && changesBarEl) {
+    changesToggleBtn.addEventListener("click", () => {
+      changesExpanded = !changesExpanded;
+      changesBarEl.classList.toggle("expanded", changesExpanded);
+    });
+  }
+  if (changesRejectAllBtn) {
+    changesRejectAllBtn.addEventListener("click", () => {
+      vscode.postMessage({ type: "undoEdits" });
+      markAllCards("fe-reverted");
+      finalizeEdits("Rejected all changes");
+    });
+  }
+  if (changesAcceptAllBtn) {
+    changesAcceptAllBtn.addEventListener("click", () => {
+      const n = Object.keys(editStats).length;
+      vscode.postMessage({ type: "keepEdits" });
+      markAllCards("fe-accepted");
+      finalizeEdits("Accepted " + n + " file" + (n === 1 ? "" : "s"));
+    });
+  }
+  if (changesReviewBtn) {
+    changesReviewBtn.addEventListener("click", () => vscode.postMessage({ type: "openReview" }));
+  }
+}
+initChangesBar();
+
 let toolGroupEl = null;
 let toolGroupBodyEl = null;
 let toolGroupCount = 0;

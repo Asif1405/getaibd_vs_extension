@@ -4,6 +4,11 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.42]
+
+- **Fix chat stuck on "Getting ready…"** — webview script no longer crashes on startup
+  (changes bar initialized after variable declarations).
+
 ## [0.4.41]
 
 - **Stop button spins while a task runs** — animated ring on the red stop square; status
