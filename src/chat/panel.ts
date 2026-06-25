@@ -497,8 +497,20 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "openDiff":
         if (msg.path) {await this.openDiff(msg.path as string);}
         break;
+      case "openReview":
+        await this.openReview();
+        break;
       case "restoreCheckpoint":
         if (msg.turnId) {await this.restoreCheckpoint(msg.turnId as string);}
+        break;
+      case "editUserMessage":
+        if (msg.text) {
+          await this.editUserMessage(
+            msg.turnId as string | undefined,
+            typeof msg.historyPos === "number" ? msg.historyPos : undefined,
+            msg.text as string,
+          );
+        }
         break;
       case "keepEdits":
         this.keepEdits();
@@ -1137,7 +1149,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.history.push({ kind: "checkpoint", content: text, turnId, baselines: [] });
     this.history.push({ kind: "message", role: "user", content: text, turnId });
     this.saveHistory();
-    this.post({ type: "addMessage", role: "user", content: text, turnId, canRestore: true });
+    this.post({ type: "addMessage", role: "user", content: text, turnId, canRestore: true, historyPos: this.history.length - 1 });
     const explicitCtx = await this.buildAgentContext(text);
     const priorHistory = this.buildPriorHistory(text, explicitCtx);
     this.postContextEstimate(priorHistory, text);
@@ -1276,19 +1288,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.saveHistory();
   }
 
-  /** Reverts every file change from this checkpoint onward and rolls the chat back to it. */
-  private async restoreCheckpoint(turnId: string) {
-    const idx = this.history.findIndex((e) => e.kind === "checkpoint" && e.turnId === turnId);
+  /** Reverts file changes from `idx` onward and truncates chat history there. */
+  private async rollbackHistoryFrom(idx: number): Promise<void> {
     if (idx < 0) {return;}
-    const confirm = await vscode.window.showWarningMessage(
-      "Restore to this checkpoint? This reverts file changes made from this point onward and removes later messages.",
-      { modal: true },
-      "Restore",
-    );
-    if (confirm !== "Restore") {return;}
-    this.abortController?.abort();
-    this.abortController = undefined;
-
     const restore = new Map<string, CheckpointBaseline>();
     for (let i = idx; i < this.history.length; i++) {
       const e = this.history[i];
@@ -1323,6 +1325,67 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.saveHistory();
     this.post({ type: "clearMessages" });
     this.restoreHistory();
+  }
+
+  /** Reverts every file change from this checkpoint onward and rolls the chat back to it. */
+  private async restoreCheckpoint(turnId: string) {
+    const idx = this.history.findIndex((e) => e.kind === "checkpoint" && e.turnId === turnId);
+    if (idx < 0) {return;}
+    const confirm = await vscode.window.showWarningMessage(
+      "Restore to this checkpoint? This reverts file changes made from this point onward and removes later messages.",
+      { modal: true },
+      "Restore",
+    );
+    if (confirm !== "Restore") {return;}
+    this.abortController?.abort();
+    this.abortController = undefined;
+    await this.rollbackHistoryFrom(idx);
+  }
+
+  /** Edits a prior user message: rolls back to that turn and resends with new text. */
+  private async editUserMessage(
+    turnId: string | undefined,
+    historyPos: number | undefined,
+    newText: string,
+  ) {
+    const trimmed = newText.trim();
+    if (!trimmed) {return;}
+
+    let cutIdx = -1;
+    if (turnId) {
+      cutIdx = this.history.findIndex((e) => e.kind === "checkpoint" && e.turnId === turnId);
+    }
+    if (cutIdx < 0 && historyPos !== undefined && historyPos >= 0 && historyPos < this.history.length) {
+      const entry = this.history[historyPos];
+      if (entry?.kind === "message" && entry.role === "user" && entry.turnId) {
+        const cpIdx = this.history.findIndex(
+          (e) => e.kind === "checkpoint" && e.turnId === entry.turnId,
+        );
+        cutIdx = cpIdx >= 0 ? cpIdx : historyPos;
+      } else {
+        cutIdx = historyPos;
+      }
+    }
+    if (cutIdx < 0) {return;}
+
+    this.abortController?.abort();
+    this.abortController = undefined;
+    await this.rollbackHistoryFrom(cutIdx);
+
+    const provider = this.globalState.get<string>(PROVIDER_KEY) ?? "";
+    const model = this.globalState.get<string>(MODEL_KEY) ?? "";
+    const mode = this.globalState.get<string>(MODE_KEY) ?? "agent";
+    const reasoning = this.globalState.get<string>(REASONING_KEY);
+    const compress = this.globalState.get<boolean>(COMPRESS_KEY) ?? false;
+    if (!provider || !model) {return;}
+    await this.sendOrchestrated(
+      provider,
+      model,
+      trimmed,
+      mode,
+      reasoning,
+      compress,
+    );
   }
 
   /** Syncs chat card, maps, and persistence after a per-block accept/reject in the editor. */
@@ -1407,28 +1470,64 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   /** Opens an agent edit as a native VS Code diff (original vs current file). */
   private async openDiff(filePath: string) {
-    const edit = this.editContents.get(filePath);
-    if (!edit) {return;}
+    const uris = await this.diffUrisFor(filePath);
+    if (!uris) {return;}
     this.lastDiffPath = filePath;
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      uris.original,
+      uris.modified,
+      `${filePath} (agent edit)`,
+    );
+    this.updateDiffContext();
+  }
+
+  /** Resolves original/modified URIs for a pending agent edit. */
+  private async diffUrisFor(
+    filePath: string,
+  ): Promise<{ original: vscode.Uri; modified: vscode.Uri } | undefined> {
+    const edit = this.editContents.get(filePath);
+    if (!edit) {return undefined;}
     const q = encodeURIComponent(filePath);
-    const leftUri = vscode.Uri.parse(`getaibd-diff:/${filePath}?${q}`);
+    const original = vscode.Uri.parse(`getaibd-diff:/${filePath}?${q}`);
+    let modified = vscode.Uri.parse(`getaibd-diff-new:/${filePath}?${q}`);
     const folder = vscode.workspace.workspaceFolders?.[0];
-    const fileUri = folder ? vscode.Uri.joinPath(folder.uri, filePath) : undefined;
-    let rightUri = vscode.Uri.parse(`getaibd-diff-new:/${filePath}?${q}`);
-    if (fileUri) {
+    if (folder) {
+      const fileUri = vscode.Uri.joinPath(folder.uri, filePath);
       try {
         await vscode.workspace.fs.stat(fileUri);
-        rightUri = fileUri;
+        modified = fileUri;
       } catch {
         /* file removed; fall back to the captured new content */
       }
     }
-    await vscode.commands.executeCommand(
-      "vscode.diff",
-      leftUri,
-      rightUri,
-      `${filePath} (agent edit)`,
-    );
+    return { original, modified };
+  }
+
+  /** Opens all pending edits in a multi-file diff review (PR-style). */
+  private async openReview() {
+    const paths = [...this.fileEdits.keys()];
+    if (!paths.length) {return;}
+    if (paths.length === 1) {
+      await this.openDiff(paths[0]);
+      return;
+    }
+    const resources: { originalUri: vscode.Uri; modifiedUri: vscode.Uri }[] = [];
+    for (const p of paths) {
+      const uris = await this.diffUrisFor(p);
+      if (uris) {
+        resources.push({ originalUri: uris.original, modifiedUri: uris.modified });
+      }
+    }
+    if (!resources.length) {return;}
+    try {
+      await vscode.commands.executeCommand("_workbench.openMultiDiffEditor", {
+        title: `Agent changes (${resources.length} files)`,
+        resources,
+      });
+    } catch {
+      await this.openDiff(paths[0]);
+    }
     this.updateDiffContext();
   }
 
@@ -1595,7 +1694,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.editContents.clear();
     this.fileEdits.clear();
     this.editReview.clearAll();
-    for (const entry of this.history) {
+    for (let i = 0; i < this.history.length; i++) {
+      const entry = this.history[i];
       if (entry.kind === "context") {
         this.post({ type: "addContext", label: entry.label, code: entry.content });
       } else if (entry.kind === "fileEdit") {
@@ -1609,6 +1709,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           content: entry.content,
           turnId: entry.turnId,
           canRestore: !!entry.turnId && entry.role === "user",
+          historyPos: i,
         });
       }
     }
@@ -2029,12 +2130,18 @@ body {
   border: 1px solid var(--user-border);
   align-self: flex-end;
   max-width: 88%;
-  padding: 10px 14px;
+  padding: 10px 14px 10px 14px;
+  padding-right: 72px;
   border-bottom-right-radius: 4px;
   margin-top: 4px;
   color: var(--fg);
   box-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
 }
+.message.user.editing {
+  padding-right: 14px;
+  max-width: 92%;
+}
+.message.user .msg-body { white-space: pre-wrap; word-break: break-word; }
 
 .message.assistant {
   align-self: stretch;
@@ -2182,6 +2289,42 @@ body {
 .btn-copy { right: 6px; }
 .btn-insert { right: 48px; }
 .btn-restore { right: 6px; }
+.btn-edit { right: 6px; font-size: 11px; padding: 2px 7px; }
+.message.user .btn-restore { right: 36px; }
+
+.user-edit-wrap { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.user-edit-input {
+  width: 100%;
+  min-height: 56px;
+  max-height: 240px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--focus);
+  background: var(--vscode-input-background, var(--input-bg));
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.user-edit-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.user-edit-actions button {
+  font-size: 11px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  background: transparent;
+  color: var(--fg);
+}
+.user-edit-save {
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  border-color: var(--btn-bg);
+}
+.user-edit-cancel:hover { border-color: var(--muted); }
+.user-edit-save:hover { opacity: 0.9; }
 
 .context-block {
   background: var(--code-bg);
@@ -2197,7 +2340,16 @@ body {
 
 .spinner { display: none; padding: 8px 14px; color: var(--muted); font-size: 12px; align-items: center; gap: 8px; }
 .spinner.visible { display: flex; }
-.spinner::before { content: ''; width: 14px; height: 14px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+.spinner-ring {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--muted);
+  border-top-color: var(--btn-bg);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
 .ctx-estimate { margin-left: auto; font-size: 11px; color: var(--muted); opacity: 0.85; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -2315,6 +2467,128 @@ body {
 .edit-summary .es-keep { background: var(--btn-bg); color: var(--btn-fg); border-color: var(--btn-bg); }
 .edit-summary .es-keep:hover { opacity: 0.9; }
 .edit-summary .es-undo:hover { border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+
+/* ── Pending changes bar (above composer, Cursor-style) ── */
+.changes-bar {
+  display: none;
+  flex-direction: column;
+  gap: 0;
+  margin: 0 10px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--vscode-editorWidget-background, var(--code-bg));
+  font-size: 12px;
+  overflow: hidden;
+}
+.changes-bar.visible { display: flex; }
+.changes-bar-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  min-height: 32px;
+}
+.changes-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.changes-toggle:hover { background: var(--vscode-toolbar-hoverBackground, rgba(120,160,255,0.1)); }
+.changes-chevron {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 10px;
+  color: var(--muted);
+}
+.changes-bar.expanded .changes-chevron { transform: rotate(90deg); }
+.changes-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.changes-bar-actions button {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  background: transparent;
+  color: var(--fg);
+  white-space: nowrap;
+}
+.changes-bar-actions .cb-reject:hover {
+  border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336);
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336);
+}
+.changes-bar-actions .cb-accept {
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  border-color: var(--btn-bg);
+}
+.changes-bar-actions .cb-accept:hover { opacity: 0.9; }
+.changes-bar-actions .cb-review {
+  font-weight: 600;
+}
+.changes-bar-actions .cb-review:hover { border-color: var(--btn-bg); color: var(--btn-bg); }
+.changes-files {
+  display: none;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  max-height: 160px;
+  overflow-y: auto;
+}
+.changes-bar.expanded .changes-files { display: flex; }
+.changes-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.changes-file-row:last-child { border-bottom: none; }
+.changes-file-row:hover { background: var(--vscode-list-hoverBackground, rgba(120,160,255,0.08)); }
+.changes-file-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+}
+.changes-file-stats { font-size: 11px; flex-shrink: 0; }
+.changes-file-stats .add { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+.changes-file-stats .del { color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336); }
+.changes-file-btns { display: flex; gap: 4px; flex-shrink: 0; }
+.changes-file-btns button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+.changes-file-btns .cb-file-accept:hover {
+  border-color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50);
+  color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50);
+}
+.changes-file-btns .cb-file-reject:hover {
+  border-color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336);
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #f44336);
+}
 
 /* ── Thinking Blocks ── */
 .thinking-block {
@@ -2514,8 +2788,19 @@ body {
 }
 .send-btn:hover { background: var(--btn-hover); }
 .send-btn.stop {
+  position: relative;
   background: var(--error-fg);
   color: #fff;
+}
+.send-btn.stop::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+  pointer-events: none;
 }
 .send-btn.stop:hover {
   background: var(--error-fg);
@@ -3051,7 +3336,7 @@ body {
 
 <div class="messages" id="messages"></div>
 <div class="reconnect-banner" id="reconnectBanner"></div>
-<div class="spinner" id="spinner"><span id="spinnerLabel">Generating...</span><span class="ctx-estimate" id="ctxEstimate" style="display:none"></span></div>
+<div class="spinner" id="spinner"><span class="spinner-ring" aria-hidden="true"></span><span id="spinnerLabel">Generating...</span><span class="ctx-estimate" id="ctxEstimate" style="display:none"></span></div>
 
 <div class="settings-panel" id="settingsPanel"></div>
 
@@ -3077,6 +3362,21 @@ body {
 </div>
 
 <div class="message-queue" id="messageQueue" aria-label="Queued messages"></div>
+
+<div class="changes-bar" id="changesBar" aria-label="Pending file changes">
+  <div class="changes-bar-head">
+    <button type="button" class="changes-toggle" id="changesToggle" title="Show changed files">
+      <span class="changes-chevron">&#9654;</span>
+      <span id="changesLabel">0 Files</span>
+    </button>
+    <div class="changes-bar-actions">
+      <button type="button" class="cb-reject" id="changesRejectAll" title="Reject all pending edits">Reject</button>
+      <button type="button" class="cb-accept" id="changesAcceptAll" title="Accept all pending edits">Accept all</button>
+      <button type="button" class="cb-review" id="changesReview" title="Open multi-file diff review">Review</button>
+    </div>
+  </div>
+  <div class="changes-files" id="changesFiles"></div>
+</div>
 
 <div class="composer">
   <textarea id="input" rows="1" placeholder="Ask anything... (use @filename to reference files)"></textarea>
@@ -3126,6 +3426,37 @@ const reconnectBanner = document.getElementById("reconnectBanner");
 const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("sendBtn");
 const messageQueueEl = document.getElementById("messageQueue");
+changesBarEl = document.getElementById("changesBar");
+changesFilesEl = document.getElementById("changesFiles");
+changesLabelEl = document.getElementById("changesLabel");
+const changesToggleBtn = document.getElementById("changesToggle");
+const changesRejectAllBtn = document.getElementById("changesRejectAll");
+const changesAcceptAllBtn = document.getElementById("changesAcceptAll");
+const changesReviewBtn = document.getElementById("changesReview");
+if (changesToggleBtn && changesBarEl) {
+  changesToggleBtn.addEventListener("click", () => {
+    changesExpanded = !changesExpanded;
+    changesBarEl.classList.toggle("expanded", changesExpanded);
+  });
+}
+if (changesRejectAllBtn) {
+  changesRejectAllBtn.addEventListener("click", () => {
+    vscode.postMessage({ type: "undoEdits" });
+    markAllCards("fe-reverted");
+    finalizeEdits("Rejected all changes");
+  });
+}
+if (changesAcceptAllBtn) {
+  changesAcceptAllBtn.addEventListener("click", () => {
+    const n = Object.keys(editStats).length;
+    vscode.postMessage({ type: "keepEdits" });
+    markAllCards("fe-accepted");
+    finalizeEdits("Accepted " + n + " file" + (n === 1 ? "" : "s"));
+  });
+}
+if (changesReviewBtn) {
+  changesReviewBtn.addEventListener("click", () => vscode.postMessage({ type: "openReview" }));
+}
 const modelPill = document.getElementById("modelPill");
 const modelPillLabel = document.getElementById("modelPillLabel");
 const modelPillIcon = document.getElementById("modelPillIcon");
@@ -3236,7 +3567,11 @@ let currentMode = "agent";
 let settingsOpen = false;
 let editStats = {};
 let editCardEls = {};
-let editSummaryEl = null;
+let changesBarEl = null;
+let changesFilesEl = null;
+let changesLabelEl = null;
+let changesExpanded = false;
+let agentStreamedResponse = false;
 let toolGroupEl = null;
 let toolGroupBodyEl = null;
 let toolGroupCount = 0;
@@ -3339,6 +3674,7 @@ function closeSettings() {
   settingsBtn.classList.remove("active");
   settingsPanel.classList.remove("visible");
   messagesEl.style.display = "";
+  spinnerEl.style.display = "";
 }
 
 if (newChatBtn) {
@@ -3706,6 +4042,7 @@ function setSendStreaming(spinnerText) {
   sendBtn.disabled = false;
   sendBtn.title = "Stop";
   if (spinnerText) { spinnerLabelEl.textContent = spinnerText; }
+  spinnerEl.style.display = "";
   spinnerEl.classList.add("visible");
 }
 
@@ -3933,19 +4270,121 @@ function continueRun() {
 }
 
 /* ── Messages ── */
+let activeUserEditEl = null;
+
 function addMessage(role, content, opts) {
   const div = document.createElement("div");
   div.className = "message " + role;
-  const body = role === "assistant"
-    ? '<div class="md">' + mdToHtml(content) + "</div>"
-    : escapeHtml(content);
-  div.innerHTML = '<span class="role-label">' + role + "</span>" + body;
-  if (role === "assistant") enhanceCodeBlocks(div);
-  if (role === "assistant" && content) appendActionBtns(div, content);
-  if (opts && opts.canRestore && opts.turnId) appendRestoreBtn(div, opts.turnId);
+  if (role === "user") {
+    div.innerHTML = '<span class="role-label">user</span><div class="msg-body">' + escapeHtml(content) + "</div>";
+    if (opts && opts.turnId) { div.dataset.turnId = opts.turnId; }
+    if (opts && opts.historyPos !== undefined) { div.dataset.historyPos = String(opts.historyPos); }
+    div.dataset.content = content;
+    appendUserEditBtn(div, opts && opts.turnId, opts && opts.historyPos, content);
+    if (opts && opts.canRestore && opts.turnId) { appendRestoreBtn(div, opts.turnId); }
+  } else {
+    const body = '<div class="md">' + mdToHtml(content) + "</div>";
+    div.innerHTML = '<span class="role-label">' + role + "</span>" + body;
+    if (content) { appendActionBtns(div, content); }
+    enhanceCodeBlocks(div);
+  }
   messagesEl.appendChild(div);
   scrollToBottom();
   return div;
+}
+
+function appendUserEditBtn(container, turnId, historyPos, content) {
+  const btn = document.createElement("button");
+  btn.className = "msg-action-btn btn-edit";
+  btn.title = "Edit and resend";
+  btn.textContent = "\u270E";
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    startUserMessageEdit(container, turnId, historyPos, content);
+  });
+  container.appendChild(btn);
+}
+
+function startUserMessageEdit(container, turnId, historyPos, content) {
+  if (streaming) { return; }
+  if (activeUserEditEl && activeUserEditEl !== container) {
+    cancelUserMessageEdit(activeUserEditEl);
+  }
+  activeUserEditEl = container;
+  container.classList.add("editing");
+  const body = container.querySelector(".msg-body");
+  if (!body) { return; }
+  const editBtns = container.querySelectorAll(".btn-edit, .btn-restore");
+  editBtns.forEach((b) => { b.style.display = "none"; });
+  const wrap = document.createElement("div");
+  wrap.className = "user-edit-wrap";
+  const ta = document.createElement("textarea");
+  ta.className = "user-edit-input";
+  ta.value = content;
+  const lineCount = (content || "").split("\\n").length;
+  ta.rows = Math.min(12, Math.max(2, lineCount));
+  const actions = document.createElement("div");
+  actions.className = "user-edit-actions";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "user-edit-cancel";
+  cancelBtn.textContent = "Cancel";
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "user-edit-save";
+  saveBtn.textContent = "Send";
+  cancelBtn.addEventListener("click", () => cancelUserMessageEdit(container));
+  saveBtn.addEventListener("click", () => saveUserMessageEdit(container, turnId, historyPos));
+  ta.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      cancelUserMessageEdit(container);
+    } else if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+      ev.preventDefault();
+      saveUserMessageEdit(container, turnId, historyPos);
+    }
+  });
+  actions.appendChild(cancelBtn);
+  actions.appendChild(saveBtn);
+  wrap.appendChild(ta);
+  wrap.appendChild(actions);
+  body.replaceWith(wrap);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+
+function cancelUserMessageEdit(container) {
+  if (!container) { return; }
+  const wrap = container.querySelector(".user-edit-wrap");
+  const saved = container.dataset.content || "";
+  if (wrap) {
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    body.textContent = saved;
+    wrap.replaceWith(body);
+  }
+  container.classList.remove("editing");
+  const editBtns = container.querySelectorAll(".btn-edit, .btn-restore");
+  editBtns.forEach((b) => { b.style.display = ""; });
+  if (activeUserEditEl === container) { activeUserEditEl = null; }
+}
+
+function saveUserMessageEdit(container, turnId, historyPos) {
+  const ta = container.querySelector(".user-edit-input");
+  if (!ta) { return; }
+  const text = ta.value.trim();
+  if (!text) { return; }
+  activeUserEditEl = null;
+  const pos = historyPos !== undefined && historyPos !== null
+    ? Number(historyPos)
+    : (container.dataset.historyPos ? Number(container.dataset.historyPos) : undefined);
+  const tid = turnId || container.dataset.turnId || undefined;
+  vscode.postMessage({
+    type: "editUserMessage",
+    turnId: tid,
+    historyPos: pos,
+    text: text,
+  });
 }
 
 function appendRestoreBtn(container, turnId) {
@@ -4140,39 +4579,68 @@ function diffBodyHtml(diff) {
 
 function renderEditSummary() {
   const paths = Object.keys(editStats);
+  if (!changesBarEl) { return; }
   if (paths.length === 0) {
-    if (editSummaryEl) { editSummaryEl.style.display = "none"; editSummaryEl = null; }
+    changesBarEl.classList.remove("visible", "expanded");
+    changesExpanded = false;
+    if (changesFilesEl) { changesFilesEl.innerHTML = ""; }
+    if (changesLabelEl) { changesLabelEl.textContent = "0 Files"; }
     return;
   }
-  if (!editSummaryEl) {
-    editSummaryEl = document.createElement("div");
-    editSummaryEl.className = "edit-summary";
-    messagesEl.appendChild(editSummaryEl);
-  }
+  changesBarEl.classList.add("visible");
+  if (changesExpanded) { changesBarEl.classList.add("expanded"); }
   let a = 0, d = 0;
   for (const p of paths) { a += editStats[p].a; d += editStats[p].d; }
   const n = paths.length;
-  const label = '<span class="es-label" title="Open diff">' + n + ' file' + (n === 1 ? '' : 's')
-    + ' changed <span class="add">+' + a + '</span> <span class="del">-' + d + '</span></span>';
-  const actions = '<span class="es-actions"><button class="es-keep">Accept all</button>'
-    + '<button class="es-undo">Revert all</button></span>';
-  editSummaryEl.innerHTML = label + actions;
-  const labelEl = editSummaryEl.querySelector(".es-label");
-  if (labelEl) {
-    labelEl.style.cursor = "pointer";
-    labelEl.addEventListener("click", () => vscode.postMessage({ type: "openDiff", path: paths[0] }));
+  if (changesLabelEl) {
+    changesLabelEl.textContent = n + " File" + (n === 1 ? "" : "s")
+      + "  +" + a + " -" + d;
   }
-  editSummaryEl.querySelector(".es-keep").addEventListener("click", () => {
-    vscode.postMessage({ type: "keepEdits" });
-    markAllCards("fe-accepted");
-    finalizeEdits("Accepted " + n + " file" + (n === 1 ? '' : 's'));
+  if (!changesFilesEl) { return; }
+  let html = "";
+  for (const p of paths) {
+    const st = editStats[p];
+    const stats = '<span class="add">+' + st.a + '</span> <span class="del">-' + st.d + '</span>';
+    html += '<div class="changes-file-row" data-path="' + escapeHtml(p) + '">'
+      + '<span class="changes-file-path" title="' + escapeHtml(p) + '">' + escapeHtml(p) + '</span>'
+      + '<span class="changes-file-stats">' + stats + '</span>'
+      + '<span class="changes-file-btns">'
+      + '<button type="button" class="cb-file-accept" data-path="' + escapeHtml(p) + '" title="Accept">&#10003;</button>'
+      + '<button type="button" class="cb-file-reject" data-path="' + escapeHtml(p) + '" title="Reject">&#10005;</button>'
+      + '</span></div>';
+  }
+  changesFilesEl.innerHTML = html;
+  changesFilesEl.querySelectorAll(".changes-file-row").forEach(function (row) {
+    row.addEventListener("click", function (e) {
+      if (e.target && e.target.closest && e.target.closest("button")) { return; }
+      const path = row.getAttribute("data-path");
+      if (path) { vscode.postMessage({ type: "openDiff", path: path }); }
+    });
   });
-  editSummaryEl.querySelector(".es-undo").addEventListener("click", () => {
-    vscode.postMessage({ type: "undoEdits" });
-    markAllCards("fe-reverted");
-    finalizeEdits("Reverted " + n + " file" + (n === 1 ? '' : 's'));
+  changesFilesEl.querySelectorAll(".cb-file-accept").forEach(function (btn) {
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      const path = btn.getAttribute("data-path");
+      if (!path) { return; }
+      vscode.postMessage({ type: "keepEdit", path: path });
+      const card = editCardEls[path];
+      if (card) { card.classList.add("fe-accepted"); }
+      delete editStats[path];
+      renderEditSummary();
+    });
   });
-  messagesEl.appendChild(editSummaryEl);
+  changesFilesEl.querySelectorAll(".cb-file-reject").forEach(function (btn) {
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      const path = btn.getAttribute("data-path");
+      if (!path) { return; }
+      vscode.postMessage({ type: "undoEdit", path: path });
+      const card = editCardEls[path];
+      if (card) { card.classList.add("fe-reverted"); }
+      delete editStats[path];
+      renderEditSummary();
+    });
+  });
 }
 
 function markAllCards(cls) {
@@ -4183,13 +4651,14 @@ function markAllCards(cls) {
 }
 
 function finalizeEdits(text) {
-  if (editSummaryEl) {
-    editSummaryEl.innerHTML = '<span class="es-label es-done">' + escapeHtml(text) + '</span>';
-    editSummaryEl.style.display = "";
+  if (changesLabelEl && text) {
+    changesLabelEl.textContent = text;
+    setTimeout(function () { renderEditSummary(); }, 2200);
+  } else {
+    renderEditSummary();
   }
   editStats = {};
   editCardEls = {};
-  editSummaryEl = null;
 }
 
 function appendThinkingBlock(cssClass, label, content) {
@@ -4518,7 +4987,11 @@ window.addEventListener("message", (event) => {
     }
 
     case "addMessage":
-      addMessage(msg.role, msg.content, { turnId: msg.turnId, canRestore: msg.canRestore });
+      addMessage(msg.role, msg.content, {
+        turnId: msg.turnId,
+        canRestore: msg.canRestore,
+        historyPos: msg.historyPos,
+      });
       break;
 
     case "addContext": {
@@ -4590,12 +5063,10 @@ window.addEventListener("message", (event) => {
       agentTextEl = null;
       agentDraftEl = null;
       agentTextContent = "";
+      agentStreamedResponse = false;
       thoughtEl = null;
       thoughtBodyEl = null;
       thoughtStart = 0;
-      editStats = {};
-      editCardEls = {};
-      editSummaryEl = null;
       toolGroupEl = null;
       toolGroupBodyEl = null;
       toolGroupCount = 0;
@@ -4738,6 +5209,7 @@ window.addEventListener("message", (event) => {
       agentTextContent += msg.content || "";
       const clean = stripThinkingTags(agentTextContent);
       if (!clean.trim()) break;
+      agentStreamedResponse = true;
       if (!agentTextEl) {
         agentTextEl = addMessage("assistant", "");
       }
@@ -4790,6 +5262,7 @@ window.addEventListener("message", (event) => {
       agentTextEl = null;
       agentDraftEl = null;
       agentTextContent = "";
+      agentStreamedResponse = false;
       break;
     }
 
@@ -4799,7 +5272,7 @@ window.addEventListener("message", (event) => {
       if (agentTextEl) {
         const clean = stripThinkingTags(agentTextContent);
         if (clean.trim()) appendActionBtns(agentTextEl, clean);
-      } else if (msg.content) {
+      } else if (msg.content && !agentStreamedResponse) {
         const clean = stripThinkingTags(msg.content);
         if (clean.trim()) {
           const el = addMessage("assistant", clean);

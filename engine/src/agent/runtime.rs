@@ -319,13 +319,13 @@ async fn agent_loop(
     const ABSOLUTE_MAX_ITERATIONS: u32 = 200;
     const MAX_STALL_ROUNDS: u32 = 3;
     const STEP_EXTENSION: u32 = 40;
+    let task_ctx = resolve_task_context(session, task);
     let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
     let mut force_continue = 0u32;
-    // Counts only file-mutating tool calls (see `is_mutating_tool`). Progress is
-    // "did real work happen since the last review" — used by the stall detector so
-    // re-reading or re-checking the same files never counts as headway.
-    let mut mutating_total = 0usize;
-    let mut mutating_at_last_force = 0usize;
+    // Counts substantive work: file mutations plus non-inspection shell commands
+    // (git commit/push, tests, builds, etc.). Used for completion + stall detection.
+    let mut work_total = 0usize;
+    let mut work_at_last_force = 0usize;
     // Stall detection: consecutive reviewer rounds with no new progress AND an
     // unchanged outstanding-items list mean we're genuinely stuck — stop cleanly
     // instead of forcing forever.
@@ -334,6 +334,18 @@ async fn agent_loop(
 
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
+    }
+
+    if task_ctx.is_follow_up {
+        session.push_message(ToolMessage::system(format!(
+            "The user's latest message is a short follow-up (\"{}\"). The active task from \
+             this conversation is: \"{}\". Read the full history: if that task was already \
+             fully completed in a prior assistant reply, answer the follow-up briefly only — \
+             do NOT redo, re-summarize, or re-explore work you already finished. If the task is \
+             genuinely unfinished, continue from where you left off and finish only what remains \
+             — never restart from the beginning.",
+            task_ctx.current_input, task_ctx.effective_task
+        )));
     }
 
     // Seed a structured plan up front for any task that can use tools. The model
@@ -369,14 +381,11 @@ async fn agent_loop(
                 };
                 let workspace = workspace_changes_brief(registry).await;
                 let verdict =
-                    verify_task_complete(session, task, final_text, &workspace, provider).await;
-                let done = if verdict.verified {
-                    verdict.done
-                } else {
-                    mutating_total > 0
-                };
+                    verify_task_complete(session, &task_ctx, final_text, &workspace, provider)
+                        .await;
+                let done = completion_accepted(&verdict, work_total, session, &task_ctx);
                 if !done {
-                    let progressed = mutating_total > mutating_at_last_force;
+                    let progressed = work_total > work_at_last_force;
                     let stalled = is_stalled(
                         progressed,
                         &verdict.missing,
@@ -386,7 +395,7 @@ async fn agent_loop(
                     );
                     if !stalled {
                         force_continue += 1;
-                        mutating_at_last_force = mutating_total;
+                        work_at_last_force = work_total;
                         nudge_count = 0;
                         force_tool_call = true;
                         session.max_iterations += STEP_EXTENSION;
@@ -398,12 +407,13 @@ async fn agent_loop(
                                  automatically ({force_continue}/{MAX_FORCE_CONTINUE}).\n{remaining}"
                             )),
                         });
-                        session.push_message(ToolMessage::system(format!(
-                            "A completion reviewer checked your work against the ORIGINAL task and \
-                             found it is NOT yet complete. Outstanding items:\n{remaining}\n\nKeep \
-                             working and finish these by calling the appropriate tools. Do not stop \
-                             until done."
-                        )));
+                    session.push_message(ToolMessage::system(format!(
+                        "A completion reviewer checked your work against the ACTIVE TASK and \
+                         found it is NOT yet complete. Outstanding items:\n{remaining}\n\n\
+                         Continue from your current progress — finish only what is still missing. \
+                         Do NOT restart from scratch, re-read the whole repo, or repeat summaries \
+                         you already gave."
+                    )));
                         continue;
                     }
                     // Genuinely stuck — fall through to the wrap-up summary stop.
@@ -549,16 +559,11 @@ async fn agent_loop(
                 };
                 let workspace = workspace_changes_brief(registry).await;
                 let verdict =
-                    verify_task_complete(session, task, final_text, &workspace, provider).await;
-                // When the reviewer couldn't run, accept completion only if real work
-                // actually happened — never quit a task with nothing done.
-                let done = if verdict.verified {
-                    verdict.done
-                } else {
-                    mutating_total > 0
-                };
+                    verify_task_complete(session, &task_ctx, final_text, &workspace, provider)
+                        .await;
+                let done = completion_accepted(&verdict, work_total, session, &task_ctx);
                 if !done {
-                    let progressed = mutating_total > mutating_at_last_force;
+                    let progressed = work_total > work_at_last_force;
                     let stalled = is_stalled(
                         progressed,
                         &verdict.missing,
@@ -590,7 +595,7 @@ async fn agent_loop(
                         .await;
                     }
                     force_continue += 1;
-                    mutating_at_last_force = mutating_total;
+                    work_at_last_force = work_total;
                     nudge_count = 0;
                     force_tool_call = true;
                     // Drop the summary we just streamed FIRST, before any other event. The client
@@ -610,12 +615,11 @@ async fn agent_loop(
                         )),
                     });
                     session.push_message(ToolMessage::system(format!(
-                        "A completion reviewer checked your work against the ORIGINAL task and the \
+                        "A completion reviewer checked your work against the ACTIVE TASK and the \
                          actual workspace and found it is NOT yet complete. Outstanding \
-                         items:\n{remaining}\n\nResume now and finish these by calling the \
-                         appropriate tools (write_file, patch_file, run_command, etc.). Do the work \
-                         end to end, then verify with git_diff. Do not stop or summarize until \
-                         everything is genuinely done."
+                         items:\n{remaining}\n\nResume from where you left off — finish only \
+                         these remaining items with the appropriate tools. Do NOT restart from \
+                         scratch or re-summarize work already done."
                     )));
                     continue;
                 }
@@ -636,11 +640,18 @@ async fn agent_loop(
             // tool), so a long, productive run is never cut off just because it paused to narrate.
             const MAX_NUDGES: u32 = 6;
             let described_only = !looks_like_user_question(content_txt)
+                && task_ctx.requires_tools
                 && nudge_count < MAX_NUDGES
                 && !tool_defs.is_empty()
                 && session.max_iterations > 1
                 && iterations < session.max_iterations;
             if described_only {
+                if !last_text.trim().is_empty() {
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::DiscardDraft,
+                        content: None,
+                    });
+                }
                 nudge_count += 1;
                 // Force the next turn to emit a tool call — prose nudges alone don't
                 // move weak models that keep narrating instead of acting.
@@ -676,10 +687,10 @@ async fn agent_loop(
         // not the whole run.
         nudge_count = 0;
         force_tool_call = false;
-        mutating_total += response
+        work_total += response
             .tool_calls
             .iter()
-            .filter(|tc| is_mutating_tool(&tc.name))
+            .filter(|tc| counts_as_work_progress(&tc.name, &tc.arguments))
             .count();
         session.push_message(ToolMessage::assistant_tool_calls(
             response.tool_calls.clone(),
@@ -692,14 +703,66 @@ async fn agent_loop(
     }
 }
 
-/// True for tools that actually change the workspace. Only these count as "new
-/// progress" for the auto-complete force-continue guard: a model that merely
-/// re-reads files, runs `git_status`, or re-runs a `--check` and then repeats its
-/// "I'm done" summary is NOT making progress, so it must not be able to keep the
-/// completion-reviewer loop alive (which otherwise re-summarises up to the hard
-/// cap and looks like the agent is stuck).
+/// True for tools that actually change the workspace (file writes/moves/deletes).
 fn is_mutating_tool(name: &str) -> bool {
     matches!(name, "write_file" | "patch_file" | "move_file" | "delete_file")
+}
+
+/// True when a tool call performs real work (not read-only inspection).
+fn counts_as_work_progress(name: &str, arguments: &serde_json::Value) -> bool {
+    if is_mutating_tool(name) {
+        return true;
+    }
+    if name != "run_command" {
+        return false;
+    }
+    let cmd = arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if cmd.is_empty() {
+        return false;
+    }
+    const READ_ONLY: &[&str] = &[
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "ls ",
+        "cat ",
+        "head ",
+        "tail ",
+        "find ",
+        "grep ",
+        "rg ",
+        "pwd",
+        "which ",
+        "echo ",
+    ];
+    if READ_ONLY.iter().any(|k| cmd.contains(k)) {
+        return false;
+    }
+    const SUBSTANTIVE: &[&str] = &[
+        "git commit",
+        "git push",
+        "git add",
+        "git checkout",
+        "git merge",
+        "git pull",
+        "git stash",
+        "npm install",
+        "npm run",
+        "pip install",
+        "uv run",
+        "pytest",
+        "cargo build",
+        "docker compose",
+        "docker-compose",
+        "make ",
+        "manage.py migrate",
+    ];
+    SUBSTANTIVE.iter().any(|k| cmd.contains(k))
 }
 
 /// Verdict from the completion reviewer ("manager") about whether the original task is done.
@@ -841,34 +904,52 @@ fn parse_verdict(s: &str) -> CompletionVerdict {
     }
 }
 
-/// Ask the same model, acting as a strict completion reviewer ("manager"), whether the original
-/// task is fully done. Used to auto-continue instead of stopping at a half-finished task.
+/// Resolved view of what the agent is actually working on in a multi-turn chat.
+struct TaskContext {
+    /// Latest user message for this run (e.g. "ok").
+    current_input: String,
+    /// The real task to judge completion against (may be an earlier user turn).
+    effective_task: String,
+    /// True when `current_input` is a short follow-up, not a new substantive request.
+    is_follow_up: bool,
+    /// True when the effective task expects file/shell mutations (not explain-only).
+    requires_tools: bool,
+}
+
+/// Ask the same model, acting as a strict completion reviewer ("manager"), whether the active
+/// task is fully done given conversation progress so far.
 async fn verify_task_complete(
     session: &Session,
-    task: &str,
+    ctx: &TaskContext,
     final_text: &str,
     workspace: &str,
     provider: &Arc<dyn Provider>,
 ) -> CompletionVerdict {
     let recent = recent_activity_brief(&session.messages);
+    let progress = prior_progress_brief(&session.messages);
     let system = "You are a STRICT completion reviewer for an autonomous coding agent. Given the \
-        ORIGINAL TASK, the agent's final message, recent activity, and the ACTUAL WORKSPACE \
-        CHANGES (real files modified/created this session), decide whether the EXPLICIT \
-        requirements of the ORIGINAL TASK are FULLY and CONCRETELY complete. Reply with ONLY \
-        compact JSON: {\"done\": true|false, \"missing\": [\"specific unfinished item\"]}. Judge \
-        ONLY against what the original task actually asked for. CRUCIALLY: trust the WORKSPACE \
-        CHANGES over the agent's claims — if the agent says it created or edited a file but that \
-        file does NOT appear in the workspace changes, the work was NOT done, so set done=false \
-        and list it (e.g. 'USER_MANUAL.md was described but never written'). If a requested part \
-        was only described or planned but not actually carried out, set done=false. IGNORE the \
-        agent's own suggestions, offers, ideas, or 'next steps' (e.g. 'I can also…', 'want me \
-        to…', 'optionally…') — these are NOT requirements, so never list them as missing. If \
-        everything the task explicitly asked for was actually done — or it was a \
-        question/explanation that has already been fully answered (no files required) — set \
-        done=true with an empty missing list. Never output anything except the JSON object.";
+        CURRENT USER MESSAGE, the ACTIVE TASK (the real work item in this thread), what the agent \
+        has already done in this conversation, the agent's latest message, recent activity, and \
+        ACTUAL WORKSPACE CHANGES, decide whether the ACTIVE TASK is FULLY complete. Reply with \
+        ONLY compact JSON: {\"done\": true|false, \"missing\": [\"specific unfinished item\"]}. \
+        Judge ONLY against what the ACTIVE TASK asked for — NOT follow-ups like \"ok\" or \"thanks\". \
+        CRUCIALLY: trust WORKSPACE CHANGES over claims. If the agent says it wrote a file but it \
+        does NOT appear in workspace changes, set done=false. If the ACTIVE TASK was a \
+        question/explanation and a prior assistant message in PROGRESS SO FAR already fully \
+        answered it, set done=true even when the CURRENT USER MESSAGE is only an acknowledgment \
+        (ok, great, thanks) and the latest reply is brief. For commit/push/git tasks: if PROGRESS \
+        SO FAR shows git commit and/or push already succeeded, set done=true — a clean working \
+        tree afterward is expected, not evidence of missing work. IGNORE offers and optional next \
+        steps. Never output anything except the JSON object.";
     let user = format!(
-        "ORIGINAL TASK:\n{task}\n\nAGENT'S FINAL MESSAGE:\n{final_text}\n\nWORKSPACE CHANGES \
-         (actual files changed this session):\n{workspace}\n\nRECENT ACTIVITY:\n{recent}"
+        "CURRENT USER MESSAGE:\n{}\n\nACTIVE TASK:\n{}\n\nPROGRESS SO FAR (prior work in this \
+         thread):\n{}\n\nAGENT'S LATEST MESSAGE:\n{}\n\nWORKSPACE CHANGES (actual files changed \
+         this session):\n{}\n\nRECENT ACTIVITY:\n{recent}",
+        ctx.current_input,
+        ctx.effective_task,
+        progress,
+        final_text,
+        workspace,
     );
     // On GetAIBD, route this lightweight review to a cheap fast model. Other
     // providers (BYOK) keep using the user's selected model, since a GetAIBD
@@ -900,6 +981,176 @@ async fn verify_task_complete(
             verified: false,
         },
     }
+}
+
+/// Short follow-ups that refer to the prior substantive turn, not a new task.
+fn is_short_follow_up(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t.len() > 28 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    let normalized: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
+    const EXACT: &[&str] = &[
+        "ok", "okay", "k", "kk", "yep", "yeah", "yes", "no", "nope", "nah", "thanks", "thankyou",
+        "thx", "ty", "great", "cool", "nice", "good", "gotit", "understood", "sure", "fine",
+        "alright", "right", "so", "hi", "hello", "hey", "bye", "done", "perfect", "awesome",
+        "listed", "hm", "hmm",
+    ];
+    if EXACT.iter().any(|w| normalized == *w) {
+        return true;
+    }
+    matches!(lower.as_str(), "so?" | "and?" | "and so?" | "now what?")
+}
+
+fn is_substantive_user_message(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty() && !is_short_follow_up(t)
+}
+
+/// Last substantive user request in the thread (skips "ok", "thanks", etc.).
+fn last_substantive_user_task(messages: &[ToolMessage]) -> Option<String> {
+    messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .rev()
+        .find(|t| is_substantive_user_message(t))
+        .map(|s| s.to_string())
+}
+
+fn task_requires_tools(task: &str) -> bool {
+    if looks_like_info_request(task) {
+        return false;
+    }
+    let lower = task.to_lowercase();
+    [
+        "implement",
+        "create",
+        "add",
+        "build",
+        "write",
+        "modify",
+        "update",
+        "refactor",
+        "change",
+        "fix",
+        "delete",
+        "move",
+        "patch",
+        "setup",
+        "install",
+        "run ",
+        "migrate",
+        "commit",
+        "push",
+        "pull",
+        "git ",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+fn resolve_task_context(session: &Session, current: &str) -> TaskContext {
+    let is_follow_up = is_short_follow_up(current);
+    let effective_task = if is_follow_up {
+        last_substantive_user_task(&session.messages)
+            .filter(|t| t.trim() != current.trim())
+            .unwrap_or_else(|| current.to_string())
+    } else {
+        current.to_string()
+    };
+    let requires_tools = task_requires_tools(&effective_task);
+    TaskContext {
+        current_input: current.to_string(),
+        effective_task,
+        is_follow_up,
+        requires_tools,
+    }
+}
+
+/// Prior assistant answers and tool use so the reviewer can tell what's already done.
+fn prior_progress_brief(messages: &[ToolMessage]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for m in messages {
+        match m.role.as_str() {
+            "assistant" => {
+                if let Some(c) = m.content.as_deref() {
+                    let t = c.trim();
+                    if !t.is_empty() {
+                        let cut = t.char_indices().nth(400).map_or(t.len(), |(i, _)| i);
+                        lines.push(format!("Assistant: {}", &t[..cut]));
+                    }
+                }
+                if let Some(calls) = &m.tool_calls {
+                    for call in calls {
+                        lines.push(format!("Tool called: {}", call.name));
+                    }
+                }
+            }
+            "tool" => {
+                if let Some(c) = m.content.as_deref() {
+                    let t = c.trim();
+                    if !t.is_empty() {
+                        let cut = t.char_indices().nth(160).map_or(t.len(), |(i, _)| i);
+                        let label = m.name.as_deref().unwrap_or("tool");
+                        lines.push(format!("Tool result ({label}): {}", &t[..cut]));
+                    }
+                } else if let Some(name) = &m.name {
+                    lines.push(format!("Tool result: {name}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        "(no prior progress in this thread)".to_string()
+    } else {
+        // Keep the tail — most recent work matters most for resume vs restart.
+        lines.into_iter().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// Explain / describe / overview requests — answer in prose, no tool nudge.
+fn looks_like_info_request(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    [
+        "explain",
+        "what is",
+        "what's",
+        "whats",
+        "describe",
+        "tell me",
+        "how does",
+        "overview",
+        "summarize",
+        "summary of",
+        "walk me through",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+fn completion_accepted(
+    verdict: &CompletionVerdict,
+    work_total: usize,
+    _session: &Session,
+    _ctx: &TaskContext,
+) -> bool {
+    if verdict.verified {
+        if verdict.done {
+            return true;
+        }
+        // Reviewer said incomplete but listed nothing — don't loop on repeat summaries.
+        if verdict.missing.is_empty() && work_total > 0 {
+            return true;
+        }
+        return false;
+    }
+    work_total > 0
 }
 
 /// True when the model's text is a genuine question/confirmation for the user (so we
@@ -1509,4 +1760,62 @@ async fn check_approval(
         ),
     });
     gate.request(req_id).await
+}
+
+#[cfg(test)]
+mod task_context_tests {
+    use super::*;
+    use crate::models::ToolMessage;
+
+    #[test]
+    fn follow_up_resolves_effective_task() {
+        let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        session.push_message(ToolMessage::user("explain the repo"));
+        session.push_message(ToolMessage::assistant("SweLoop is a Django app…"));
+        let ctx = resolve_task_context(&session, "ok");
+        assert!(ctx.is_follow_up);
+        assert_eq!(ctx.effective_task, "explain the repo");
+        assert!(!ctx.requires_tools);
+    }
+
+    #[test]
+    fn action_task_requires_tools() {
+        assert!(task_requires_tools("implement login"));
+        assert!(!task_requires_tools("explain the repo"));
+    }
+
+    #[test]
+    fn completion_verdict_when_unverified() {
+        let v = CompletionVerdict {
+            done: false,
+            missing: vec!["x".into()],
+            verified: false,
+        };
+        assert!(!completion_accepted(&v, 0, &Session::new("getaibd", "test", std::path::PathBuf::from("/tmp")), &TaskContext {
+            current_input: "x".into(),
+            effective_task: "x".into(),
+            is_follow_up: false,
+            requires_tools: true,
+        }));
+        let ctx = TaskContext {
+            current_input: "commit".into(),
+            effective_task: "commit and push".into(),
+            is_follow_up: false,
+            requires_tools: true,
+        };
+        assert!(completion_accepted(&v, 1, &Session::new("getaibd", "test", std::path::PathBuf::from("/tmp")), &ctx));
+    }
+
+    #[test]
+    fn git_commit_counts_as_work_progress() {
+        let args = serde_json::json!({ "command": "git commit -m test" });
+        assert!(counts_as_work_progress("run_command", &args));
+        let status = serde_json::json!({ "command": "git status -sb" });
+        assert!(!counts_as_work_progress("run_command", &status));
+    }
+
+    #[test]
+    fn commit_tasks_require_tools() {
+        assert!(task_requires_tools("commit and push staged files"));
+    }
 }

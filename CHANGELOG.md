@@ -4,14 +4,33 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.4.41]
+
+- **Stop button spins while a task runs** — animated ring on the red stop square; status
+  spinner uses a real element so animation works reliably in the VS Code webview.
+- **Fix repeat-after-"ok" loops** — the completion reviewer now judges the **active task**
+  from chat history (last real question + progress so far), not the literal word "ok".
+  Follow-ups get a continuity prompt; incomplete work resumes from the checkpoint instead
+  of restarting; tool nudges only fire for action tasks that still need mutations.
+- **Fix repeat summaries after git commit/push** — `git commit`/`git push` count as real
+  progress; the reviewer treats a clean tree after commit as done; empty "missing" lists
+  no longer force another summary loop.
+- **No duplicate assistant bubbles** — if a response was already streamed, the final
+  `done` event no longer appends a second copy.
+- **Changes bar above chat input** — pending file edits show in a Cursor-style bar with
+  expandable file list, per-file accept/reject, **Accept all**, **Reject**, and **Review**
+  (multi-file diff, PR-style).
+- **Editable user messages** — hover a user message and click **✎** to edit and resend;
+  rolls back to that turn (reverting later file changes) and runs again with the new text.
+
 ## [0.4.40]
 
 - **Free "Auto" model works at zero credits** — paid keys no longer block the free
   model when balance is at the floor; only paid models require topping up.
 - **Settings: Get Integration API Key** opens the site integrations page.
 - **Top-up prompts include** `https://getaibd.com/dashboard`.
-- **Stop shows a spinner only while cancelling** — red stop square while a task runs;
-  clicking stop swaps to a loader until the run ends (send arrow returns after).
+  - **Stop shows a spinner only while cancelling** — red stop square with a spinning ring
+    while a task runs; clicking stop swaps to a loader until the run ends.
 - **Chat typography** — larger body text, clearer markdown headings/lists/blockquotes,
   bordered code blocks, and a more visible user-message background.
 - **Message queue** — stack follow-up prompts while a run is active; reorder (drag or
