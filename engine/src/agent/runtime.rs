@@ -388,6 +388,9 @@ async fn agent_loop(
     const ABSOLUTE_MAX_ITERATIONS: u32 = 200;
     const MAX_STALL_ROUNDS: u32 = 3;
     const STEP_EXTENSION: u32 = 40;
+    // Loop/repeat guard thresholds (see `last_iter_sig` below).
+    const REPEAT_STOP_TOOLS: u32 = 2; // stop on the 3rd identical tool turn in a row
+    const REPEAT_STOP_TEXT: u32 = 1; // stop on the 2nd identical no-tool answer
     let task_ctx = resolve_task_context(session, task);
     let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
     let mut force_continue = 0u32;
@@ -400,6 +403,15 @@ async fn agent_loop(
     // instead of forcing forever.
     let mut stall_rounds = 0u32;
     let mut last_missing: Vec<String> = Vec::new();
+    // Loop/repeat guard. Catches the model emitting a byte-identical action on
+    // consecutive turns — re-running the SAME tool call (e.g. re-writing the same
+    // file) or re-emitting the SAME answer text. Without this, a repeated write
+    // bumps `work_total`, which resets stall detection, so the agent can redo
+    // finished work up to MAX_FORCE_CONTINUE times. We (a) never count an identical
+    // repeat as progress, (b) nudge once to break the loop, and (c) hard-stop after
+    // a couple of identical turns (thresholds REPEAT_STOP_* declared above).
+    let mut last_iter_sig: Option<u64> = None;
+    let mut repeat_rounds = 0u32;
 
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
@@ -606,6 +618,38 @@ async fn agent_loop(
             }
         }
 
+        // Loop guard: detect an action byte-identical to the previous turn.
+        let iter_sig = iteration_signature(&response);
+        let is_repeat = iter_sig.is_some() && iter_sig == last_iter_sig;
+        if is_repeat {
+            repeat_rounds += 1;
+        } else {
+            repeat_rounds = 0;
+        }
+        if iter_sig.is_some() {
+            last_iter_sig = iter_sig;
+        }
+        let repeat_limit = if response.tool_calls.is_empty() {
+            REPEAT_STOP_TEXT
+        } else {
+            REPEAT_STOP_TOOLS
+        };
+        if repeat_rounds >= repeat_limit {
+            // The model is spinning on the same step. Drop the superseded draft and
+            // finish with the last substantive thing it said.
+            on_event(AgentEvent {
+                kind: AgentEventKind::DiscardDraft,
+                content: None,
+            });
+            let msg = if last_text.trim().is_empty() {
+                "I stopped because I was repeating the same step without making new progress."
+                    .to_string()
+            } else {
+                last_text.clone()
+            };
+            return finish_agent(session, Some(msg), memory, provider, iterations, on_event).await;
+        }
+
         if enable_thinking {
             if let Some(text) = &response.content {
                 emit_thinking_events(text, on_event);
@@ -776,17 +820,31 @@ async fn agent_loop(
 
         // The model is making progress (it called tools), so refill the nudge budget
         // and stop forcing tool calls: the limit is for consecutive empty replies,
-        // not the whole run.
+        // not the whole run. An identical repeat is NOT progress — counting it would
+        // reset stall detection and let the agent redo the same work indefinitely.
         nudge_count = 0;
-        work_total += response
-            .tool_calls
-            .iter()
-            .filter(|tc| counts_as_work_progress(&tc.name, &tc.arguments))
-            .count();
+        if !is_repeat {
+            work_total += response
+                .tool_calls
+                .iter()
+                .filter(|tc| counts_as_work_progress(&tc.name, &tc.arguments))
+                .count();
+        }
         session.push_message(ToolMessage::assistant_tool_calls(
             response.tool_calls.clone(),
         ));
         execute_tool_calls(&response.tool_calls, registry, options, session, on_event).await;
+
+        if is_repeat {
+            // One identical repeat (below the hard stop): tell the model plainly so it
+            // can break the loop on the next turn instead of redoing the same step.
+            session.push_message(ToolMessage::system(
+                "That step was identical to your previous one and has already taken effect. \
+                 Do NOT repeat it. Either perform the NEXT remaining step, or — if everything \
+                 the task asked for is done — stop and reply with a brief final summary."
+                    .to_string(),
+            ));
+        }
 
         if enable_thinking {
             session.push_message(ToolMessage::system(thinking::REFLECTION_PROMPT.to_string()));
@@ -917,6 +975,44 @@ fn is_stalled(
     }
     *last_missing = missing.to_vec();
     *stall_rounds >= max_stall
+}
+
+/// A stable fingerprint of one model turn, used to detect a spinning loop where
+/// the model redoes the identical action. When the turn has tool calls, only the
+/// calls matter (name + canonical args) — narration around them often varies even
+/// when the action is the same. With no tool calls, the normalized answer text is
+/// the fingerprint. Returns None for an empty turn (nothing to compare).
+fn iteration_signature(response: &ToolChatResponse) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if response.tool_calls.is_empty() {
+        let text = response.content.as_deref().unwrap_or("").trim();
+        if text.is_empty() {
+            return None;
+        }
+        "text".hash(&mut h);
+        normalize_for_sig(text).hash(&mut h);
+    } else {
+        "tools".hash(&mut h);
+        for c in &response.tool_calls {
+            c.name.hash(&mut h);
+            // serde_json sorts object keys by default, so this is canonical for
+            // identical argument sets.
+            serde_json::to_string(&c.arguments)
+                .unwrap_or_default()
+                .hash(&mut h);
+        }
+    }
+    Some(h.finish())
+}
+
+/// Normalize text for repeat comparison: collapse whitespace and lowercase, so
+/// trivial reformatting doesn't hide that the same answer was produced again.
+fn normalize_for_sig(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Render the reviewer's outstanding items as a short bullet list for prompts/events.
@@ -1125,7 +1221,9 @@ fn last_substantive_user_task(messages: &[ToolMessage]) -> Option<String> {
 /// from "write a file/function/test", which genuinely needs tools.
 fn looks_like_prose_deliverable(task: &str) -> bool {
     let lower = task.to_lowercase();
-    [
+
+    // Unambiguous prose artifacts — always prose, whatever verb is used.
+    const STRONG: &[&str] = &[
         "pr description",
         "pr desc",
         "pr message",
@@ -1136,9 +1234,83 @@ fn looks_like_prose_deliverable(task: &str) -> bool {
         "mr description",
         "commit message",
         "release notes",
+    ];
+    if STRONG.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
+    // "write / draft / compose / give me a <prose-noun>" — but NOT when the object
+    // is clearly a file, code, or something written to disk (those need tools).
+    let has_gen_verb = [
+        "write ",
+        "draft ",
+        "compose ",
+        "give me ",
+        "generate ",
+        "rewrite ",
+        "reword ",
+        "rephrase ",
+        "summarize ",
+        "summarise ",
     ]
     .iter()
-    .any(|p| lower.contains(p))
+    .any(|v| lower.contains(v));
+    if !has_gen_verb {
+        return false;
+    }
+    let has_prose_noun = [
+        "description",
+        "message",
+        "summary",
+        "blurb",
+        "paragraph",
+        "reply",
+        "response",
+        "email",
+        "caption",
+        "tagline",
+        "headline",
+        "explanation",
+        "write-up",
+        "writeup",
+    ]
+    .iter()
+    .any(|n| lower.contains(n));
+    if !has_prose_noun {
+        return false;
+    }
+    let targets_file_or_code = [
+        "file",
+        "function",
+        "class",
+        "method",
+        "module",
+        "test",
+        "script",
+        "config",
+        "endpoint",
+        "component",
+        "schema",
+        "migration",
+        "readme",
+        "changelog",
+        "docstring",
+        "doc string",
+        "to disk",
+        "into ",
+        ".md",
+        ".py",
+        ".rs",
+        ".ts",
+        ".js",
+        ".json",
+        ".yml",
+        ".yaml",
+        ".txt",
+    ]
+    .iter()
+    .any(|c| lower.contains(c));
+    !targets_file_or_code
 }
 
 fn task_requires_tools(task: &str) -> bool {
@@ -2000,5 +2172,69 @@ mod task_context_tests {
         let ctx = resolve_task_context(&session, "write a brief PR description");
         assert!(ctx.prose_deliverable);
         assert!(!ctx.requires_tools);
+    }
+
+    #[test]
+    fn broadened_prose_matcher() {
+        // Generic prose deliverables now match.
+        assert!(looks_like_prose_deliverable("write a short summary of the changes"));
+        assert!(looks_like_prose_deliverable("draft a reply to this issue"));
+        assert!(looks_like_prose_deliverable("compose a release email"));
+        // …but not when the object is clearly a file or code (those need tools).
+        assert!(!looks_like_prose_deliverable("write a description into the README file"));
+        assert!(!looks_like_prose_deliverable("write the error message in utils.py"));
+        assert!(!looks_like_prose_deliverable("write a docstring for this function"));
+        // No prose noun → not a prose deliverable.
+        assert!(!looks_like_prose_deliverable("write the login handler"));
+    }
+
+    fn tool_call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments: args,
+            extra: None,
+        }
+    }
+
+    fn resp(content: Option<&str>, calls: Vec<ToolCall>) -> ToolChatResponse {
+        ToolChatResponse {
+            content: content.map(str::to_string),
+            tool_calls: calls,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn identical_tool_turns_share_a_signature() {
+        let a = resp(
+            Some("writing the file"),
+            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "x"}))],
+        );
+        let b = resp(
+            Some("different narration, same action"),
+            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "x"}))],
+        );
+        // Narration differs but the action is identical → same signature.
+        assert_eq!(iteration_signature(&a), iteration_signature(&b));
+
+        let c = resp(
+            None,
+            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "DIFFERENT"}))],
+        );
+        assert_ne!(iteration_signature(&a), iteration_signature(&c));
+    }
+
+    #[test]
+    fn text_signature_ignores_whitespace_and_case() {
+        let a = resp(Some("Here is the answer."), vec![]);
+        let b = resp(Some("here   is the   ANSWER."), vec![]);
+        assert_eq!(iteration_signature(&a), iteration_signature(&b));
+    }
+
+    #[test]
+    fn empty_turn_has_no_signature() {
+        assert!(iteration_signature(&resp(None, vec![])).is_none());
+        assert!(iteration_signature(&resp(Some("   "), vec![])).is_none());
     }
 }

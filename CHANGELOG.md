@@ -4,6 +4,19 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.6.2]
+
+- **Fix: agent no longer redoes the same step (even file writes)** — a general loop
+  guard now fingerprints each turn and stops the agent when it repeats the identical
+  action (re-running the same tool call / re-writing the same file) or re-emits the
+  same answer. Previously a repeated write counted as "progress" and reset stall
+  detection, so the agent could redo finished work many times. Identical repeats no
+  longer count as progress; the agent gets one corrective nudge, then stops cleanly.
+- **Broader prose-deliverable detection** — "write/draft/compose a description,
+  summary, reply, email, …" is recognized as prose (answered once, not force-continued),
+  while requests that target a file or code (`README`, `.py`, docstring, etc.) still
+  correctly require tools.
+
 ## [0.6.1]
 
 - **Fix: agent no longer repeats a finished answer** — for prose deliverables (a PR/MR
