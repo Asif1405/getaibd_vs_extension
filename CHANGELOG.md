@@ -4,6 +4,23 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.6.0]
+
+- **Big token-usage reduction** — large tool outputs (full-file `read_file`, noisy
+  `run_command` dumps) are now clipped (head + tail, with a marker) before they enter the
+  conversation history, so one big result no longer gets re-sent on every later turn. The
+  full output is still shown in the UI.
+- **Context compaction on large-window models** — the agent now compacts once a conversation
+  crosses an absolute token budget, not just 85% of the model window, so million-token-window
+  models (e.g. Gemini) stop quietly resending the whole transcript each turn.
+- **Model picker "Auto" search (real fix)** — the free model is now identified by the
+  catalog's `free` flag rather than a hardcoded id, so searching "Auto" reliably finds it even
+  when the engine serves it under a different name; other model names also display properly.
+- **Queue** — pressing Enter on an empty composer releases the first queued message (runs it
+  now), so a follow-up Enter starts the next in line.
+- Pairs with gateway-side prompt-cache improvements (full static-prefix caching) for further
+  per-turn input savings on multi-step runs.
+
 ## [0.5.0]
 
 - **Cursor-aligned project instructions** — agent runs load `.getaibd/AGENTS.md`, nested

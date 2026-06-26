@@ -42,6 +42,57 @@ fn completion_model() -> String {
         .unwrap_or_else(|| DEFAULT_COMPLETION_MODEL.to_string())
 }
 
+/// Even on million-token-window models, resending the whole transcript every turn
+/// is the dominant token cost of a long agent run. Compact once the conversation
+/// crosses this absolute budget regardless of how large the model's window is, so
+/// Gemini (1M window) doesn't quietly resend ~850k tokens per turn before its 85%
+/// threshold kicks in.
+const MAX_CONTEXT_TOKENS_BEFORE_COMPACT: usize = 200_000;
+
+/// A single tool result kept verbatim in history is re-sent on every subsequent
+/// turn, so one giant `read_file`/`run_command` dump inflates every later request.
+/// Clip oversized results (head + tail, with a marker) before they enter history;
+/// the FULL output is still streamed to the UI via the `ToolResult` event.
+const MAX_TOOL_RESULT_CHARS: usize = 16_000;
+const TOOL_RESULT_HEAD_CHARS: usize = 12_000;
+const TOOL_RESULT_TAIL_CHARS: usize = 2_000;
+
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Clip an oversized serialized tool result for the model's context, keeping the
+/// head and tail (the most useful parts) and noting how much was elided.
+fn cap_tool_result_for_history(s: String) -> String {
+    if s.len() <= MAX_TOOL_RESULT_CHARS {
+        return s;
+    }
+    let head_end = floor_char_boundary(&s, TOOL_RESULT_HEAD_CHARS);
+    let tail_start = ceil_char_boundary(&s, s.len().saturating_sub(TOOL_RESULT_TAIL_CHARS));
+    if tail_start <= head_end {
+        return s;
+    }
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n\n…[{omitted} characters truncated to save context; the full output is shown in the UI]…\n\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
 pub struct AgentEvent {
     pub kind: AgentEventKind,
     pub content: Option<String>,
@@ -487,7 +538,11 @@ async fn agent_loop(
         let ctx_limit = crate::context::context_window_for(&session.model);
         let tool_tokens = crate::context::count_tool_definition_tokens(&tool_defs);
         #[allow(clippy::cast_precision_loss)]
-        let summarize_threshold = (ctx_limit as f32 * 0.85) as usize;
+        // Compact at 85% of the model's window OR an absolute budget, whichever is
+        // smaller — so huge-window models (Gemini = 1M) don't resend a giant
+        // transcript every turn before their percentage threshold would trigger.
+        let summarize_threshold =
+            ((ctx_limit as f32 * 0.85) as usize).min(MAX_CONTEXT_TOKENS_BEFORE_COMPACT);
         // Summarize-and-refeed: never trim. Keep compressing the older middle until
         // we're back under 85% of the model's real window, or a pass can no longer
         // compress anything (guarantees termination even if the recent tail alone
@@ -1702,7 +1757,10 @@ async fn execute_tool_calls(
         });
 
         let result_str = serde_json::to_string(&result).unwrap_or_default();
-        session.push_message(ToolMessage::tool_result(&call.id, result_str));
+        session.push_message(ToolMessage::tool_result(
+            &call.id,
+            cap_tool_result_for_history(result_str),
+        ));
     }
 }
 
@@ -1804,6 +1862,31 @@ mod task_context_tests {
     fn action_task_requires_tools() {
         assert!(task_requires_tools("implement login"));
         assert!(!task_requires_tools("explain the repo"));
+    }
+
+    #[test]
+    fn small_tool_results_are_untouched() {
+        let s = "small output".to_string();
+        assert_eq!(cap_tool_result_for_history(s.clone()), s);
+    }
+
+    #[test]
+    fn large_tool_results_are_clipped_with_marker() {
+        let big = "x".repeat(MAX_TOOL_RESULT_CHARS + 50_000);
+        let out = cap_tool_result_for_history(big.clone());
+        assert!(out.len() < big.len());
+        assert!(out.contains("characters truncated"));
+        // Head and tail are preserved.
+        assert!(out.starts_with(&"x".repeat(100)));
+        assert!(out.ends_with(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn clipping_respects_utf8_boundaries() {
+        // Multi-byte chars must not be split mid-codepoint (would panic on slice).
+        let big = "é".repeat(MAX_TOOL_RESULT_CHARS);
+        let out = cap_tool_result_for_history(big);
+        assert!(out.contains("characters truncated"));
     }
 
     #[test]

@@ -49,6 +49,8 @@ export interface ModelInfo {
   id: string;
   name: string;
   capabilities?: string[];
+  /** True for the platform's free / "Auto" model (from the catalog `free` flag). */
+  free?: boolean;
 }
 
 export interface ChatMessage {

@@ -3652,14 +3652,21 @@ let needsPlan = false;
 let freeModelId = "qwen-flash";
 let freeModelLabel = "Auto";
 
-function modelDisplay(modelId, name) {
-  return modelId === freeModelId ? freeModelLabel : (name || modelId);
+// The free model is identified by the catalog free flag (robust) and, as a
+// fallback, the configured free id. The id alone is brittle: the engine may serve
+// it under a different name, which is exactly why searching Auto used to fail.
+function isFreeModel(modelId, free) {
+  return free === true || modelId === freeModelId;
 }
 
-// The free model is shown to users as "Auto" — search it by that label only,
-// so it surfaces for "Auto" and stays hidden behind its underlying engine name.
-function matchesModel(modelId, name, filter) {
-  if (modelId === freeModelId) {
+function modelDisplay(modelId, name, free) {
+  return isFreeModel(modelId, free) ? freeModelLabel : (name || modelId);
+}
+
+// The free model is shown to users as "Auto" — search it by that label only, so
+// it surfaces for "Auto" and stays hidden behind its underlying engine name.
+function matchesModel(modelId, name, filter, free) {
+  if (isFreeModel(modelId, free)) {
     return freeModelLabel.toLowerCase().includes(filter);
   }
   return (
@@ -3902,13 +3909,13 @@ function renderModelList(filter) {
   for (const pid of providerIds) {
     const curated = (curatedModels[pid] || []).filter(m =>
       !filter ||
-      matchesModel(m.id, m.name, filter) ||
+      matchesModel(m.id, m.name, filter, m.free) ||
       getProviderLabel(pid).toLowerCase().includes(filter)
     );
 
     const apiModels = (allModels[pid] || []).filter(m =>
       !curated.find(c => c.id === m.id) &&
-      (!filter || matchesModel(m.id, m.name, filter))
+      (!filter || matchesModel(m.id, m.name, filter, m.free))
     );
 
     if (curated.length === 0 && apiModels.length === 0) continue;
@@ -3921,7 +3928,7 @@ function renderModelList(filter) {
     modelList.appendChild(header);
 
     for (const m of curated) {
-      modelList.appendChild(makeModelItem(pid, m.id, m.name, m.ctx, m.tags || [], m.capabilities || []));
+      modelList.appendChild(makeModelItem(pid, m.id, m.name, m.ctx, m.tags || [], m.capabilities || [], m.free));
       total++;
     }
 
@@ -3932,7 +3939,7 @@ function renderModelList(filter) {
         modelList.appendChild(div);
       }
       for (const m of apiModels) {
-        modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, [], m.capabilities || []));
+        modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, [], m.capabilities || [], m.free));
         total++;
       }
     }
@@ -3946,9 +3953,9 @@ function renderModelList(filter) {
   }
 }
 
-function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities) {
-  const isFreeModel = modelId === freeModelId;
-  const locked = needsPlan || (freeMode && !isFreeModel);
+function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities, free) {
+  const isFree = isFreeModel(modelId, free);
+  const locked = needsPlan || (freeMode && !isFree);
   const isSelected = modelId === currentModel && providerId === currentProvider;
   const item = document.createElement("div");
   item.className = "model-item" + (isSelected ? " selected" : "") + (locked ? " locked" : "");
@@ -3959,12 +3966,12 @@ function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities
 
   const name = document.createElement("span");
   name.className = "model-item-name";
-  name.textContent = modelDisplay(modelId, displayName);
+  name.textContent = modelDisplay(modelId, displayName, free);
 
   const badges = document.createElement("span");
   badges.className = "model-item-badges";
 
-  if (isFreeModel) {
+  if (isFree) {
     const freeBadge = document.createElement("span");
     freeBadge.className = "tag-badge free";
     freeBadge.textContent = "free";

@@ -404,6 +404,12 @@ impl Provider for OpenAiCompatProvider {
         #[derive(Deserialize)]
         struct ModelEntry {
             id: String,
+            /// Friendly catalog display name (e.g. the family name); falls back to id.
+            #[serde(default)]
+            name: Option<String>,
+            /// True for the platform's free / "Auto" model.
+            #[serde(default)]
+            free: bool,
             #[serde(default)]
             capabilities: Vec<String>,
             /// Real context window (tokens) from the catalog; 0/absent when unknown.
@@ -428,10 +434,12 @@ impl Provider for OpenAiCompatProvider {
                 // Cache the catalog's real context window so the agent loop can use
                 // it instead of guessing from the model name.
                 crate::context::record_model_window(&m.id, m.context_window);
+                let name = m.name.filter(|s| !s.is_empty()).unwrap_or_else(|| m.id.clone());
                 ModelInfo {
-                    name: m.id.clone(),
                     id: m.id,
+                    name,
                     capabilities: m.capabilities,
+                    free: m.free,
                 }
             })
             .collect();
