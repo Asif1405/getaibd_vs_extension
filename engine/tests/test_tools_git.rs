@@ -1,5 +1,5 @@
 use mcp_universal::tools::edits::EditTracker;
-use mcp_universal::tools::git::{GitAdd, GitCommit, GitDiff, GitLog, GitStatus};
+use mcp_universal::tools::git::{GitDiff, GitLog, GitStatus};
 use mcp_universal::tools::workspace::PatchFile;
 use mcp_universal::tools::Tool;
 use serde_json::json;
@@ -47,13 +47,11 @@ async fn git_status_shows_clean() {
     let (_dir, root) = setup_git_repo();
     let tool = GitStatus::new(root);
     let result = tool.execute(json!({})).await.unwrap();
-    let text = result["status"].as_str().unwrap();
-    assert!(
-        text.is_empty()
-            || text.contains("nothing to commit")
-            || text.contains("working tree clean"),
-        "unexpected status: {text}"
-    );
+    assert!(result["staged"].as_array().unwrap().is_empty());
+    assert!(result["unstaged"].as_array().unwrap().is_empty());
+    assert!(result["untracked"].as_array().unwrap().is_empty());
+    let branch = result["branch"].as_str().unwrap();
+    assert!(!branch.is_empty());
 }
 
 #[tokio::test]
@@ -62,8 +60,8 @@ async fn git_status_shows_modified() {
     std::fs::write(root.join("hello.txt"), "changed\n").unwrap();
     let tool = GitStatus::new(root);
     let result = tool.execute(json!({})).await.unwrap();
-    let text = result["status"].as_str().unwrap();
-    assert!(text.contains("hello.txt"));
+    let unstaged = result["unstaged"].as_array().unwrap();
+    assert!(unstaged.iter().any(|p| p.as_str().unwrap().contains("hello.txt")));
 }
 
 #[tokio::test]
@@ -124,44 +122,6 @@ async fn git_log_respects_max_count() {
 }
 
 #[tokio::test]
-async fn git_add_stages_file() {
-    let (_dir, root) = setup_git_repo();
-    std::fs::write(root.join("new.txt"), "new file\n").unwrap();
-    let tool = GitAdd::new(root.clone());
-    let result = tool.execute(json!({ "paths": ["new.txt"] })).await.unwrap();
-    assert!(result["staged"].as_bool().unwrap());
-
-    let status = GitStatus::new(root);
-    let status_result = status.execute(json!({})).await.unwrap();
-    let text = status_result["status"].as_str().unwrap();
-    assert!(text.contains("new.txt"));
-}
-
-#[tokio::test]
-async fn git_commit_creates_commit() {
-    let (_dir, root) = setup_git_repo();
-    std::fs::write(root.join("commit_me.txt"), "data\n").unwrap();
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(root.as_path())
-        .output()
-        .unwrap();
-
-    let tool = GitCommit::new(root.clone());
-    let result = tool
-        .execute(json!({ "message": "test commit msg" }))
-        .await
-        .unwrap();
-    let text = result["output"].as_str().unwrap();
-    assert!(text.contains("test commit msg"));
-
-    let log = GitLog::new(root);
-    let log_result = log.execute(json!({})).await.unwrap();
-    let log_text = log_result["log"].as_str().unwrap();
-    assert!(log_text.contains("test commit msg"));
-}
-
-#[tokio::test]
 async fn git_diff_falls_back_to_tracked_edits_without_repo() {
     let dir = TempDir::new().unwrap();
     let root = Arc::new(dir.path().to_path_buf());
@@ -182,12 +142,10 @@ async fn git_diff_falls_back_to_tracked_edits_without_repo() {
 }
 
 #[tokio::test]
-async fn git_tools_report_requires_approval() {
+async fn git_read_tools_do_not_require_approval() {
     let (_dir, root) = setup_git_repo();
 
     assert!(!GitStatus::new(root.clone()).requires_approval());
     assert!(!GitDiff::new(root.clone(), EditTracker::new()).requires_approval());
-    assert!(!GitLog::new(root.clone()).requires_approval());
-    assert!(GitAdd::new(root.clone()).requires_approval());
-    assert!(GitCommit::new(root).requires_approval());
+    assert!(!GitLog::new(root).requires_approval());
 }

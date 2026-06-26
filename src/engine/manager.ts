@@ -146,6 +146,23 @@ function ensureGetaibdIgnored(projectRoot: string): void {
   }
 }
 
+/** Copy root `MEMORY.md` into `.getaibd/MEMORY.md` once when only the legacy file exists. */
+function ensureGetaibdMemoryMigrated(projectRoot: string): void {
+  try {
+    const getaibdDir = path.join(projectRoot, ".getaibd");
+    const nested = path.join(getaibdDir, "MEMORY.md");
+    const legacy = path.join(projectRoot, "MEMORY.md");
+    if (fs.existsSync(nested) || !fs.existsSync(legacy)) {
+      return;
+    }
+    fs.mkdirSync(getaibdDir, { recursive: true });
+    fs.copyFileSync(legacy, nested);
+    log("Migrated MEMORY.md → .getaibd/MEMORY.md");
+  } catch {
+    /* best effort */
+  }
+}
+
 /** Ensures a healthy engine is running and returns its URL. Idempotent. */
 export async function ensureEngine(context: vscode.ExtensionContext): Promise<string> {
   if (engineProcess && engineProcess.exitCode === null) {
@@ -208,6 +225,7 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
   }
 
   ensureGetaibdIgnored(projectRoot);
+  ensureGetaibdMemoryMigrated(projectRoot);
 
   await freePort(port);
 

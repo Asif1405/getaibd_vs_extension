@@ -22,6 +22,9 @@ pub struct ChatRequest {
     /// If omitted, platform key or account-stored key is used.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Stable per-workspace chat id for GetAIBD prompt-cache sticky routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,6 +208,9 @@ pub struct ToolChatRequest {
     /// When true, ask GetAIBD to compress tool outputs server-side (Headroom).
     #[serde(default)]
     pub compress: bool,
+    /// Stable per-workspace chat id for GetAIBD prompt-cache sticky routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

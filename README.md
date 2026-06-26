@@ -50,6 +50,50 @@ balance.
 | `getaibd.chat.reasoningDefault` | `medium` | Reasoning effort for thinking models (`off` cheapest, `high` most capable) |
 | `getaibd.agent.autoMode` | `auto` | `auto`/`ask`/`plan`/`agent`/`debug` |
 | `getaibd.agent.maxIterations` | `25` | Max model calls per agent task |
+| `getaibd.agent.userRules` | `""` | Personal rules injected on every agent run (after conduct, before project AGENTS) |
+
+## Project layout (`.getaibd/`)
+
+GetAIBD reads project instructions from a `.getaibd/` folder in your workspace (kept out of
+git by default):
+
+```
+.getaibd/
+  AGENTS.md          # project rules (also nested: packages/api/.getaibd/AGENTS.md)
+  MEMORY.md          # long-term facts (legacy root MEMORY.md still works)
+  mcp.json           # optional MCP servers for agent sessions
+  rules/             # glob-matched rules (*.md with YAML frontmatter)
+  skills/            # on-demand skills (*/SKILL.md)
+  plans/             # plan output from plan mode
+```
+
+Example glob rule (`.getaibd/rules/api.md`):
+
+```markdown
+---
+description: Backend API conventions
+globs: packages/api/**
+alwaysApply: false
+---
+- Use FastAPI dependency injection
+```
+
+Example MCP config (`.getaibd/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${env:GITHUB_TOKEN}" }
+    }
+  }
+}
+```
+
+Git mutations (`git add`, `commit`, `push`, etc.) run via **`run_command`** with approval —
+read-only `git_status`, `git_diff`, and `git_log` tools remain available.
 
 ## Support
 

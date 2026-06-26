@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "AI coding agent for VS Code — chat with your codebase, make multi-file edits, and run agentic tasks.",
-  "version": "0.4.42",
+  "version": "0.5.0",
   "homepage": "https://getaibd.com",
   "bugs": {
     "url": "https://getaibd.com"
@@ -195,6 +195,12 @@
           "type": "boolean",
           "default": false,
           "description": "Inject local RAG memory into agent runs. Off by default — costs extra tokens; enable if you want codebase hints without tool reads."
+        },
+        "getaibd.agent.userRules": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "description": "Global agent rules applied to every run (like Cursor User Rules). Project-specific rules go in .getaibd/AGENTS.md."
         },
         "getaibd.chat.compressDefault": {
           "type": "boolean",

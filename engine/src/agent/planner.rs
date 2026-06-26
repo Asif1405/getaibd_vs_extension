@@ -114,6 +114,7 @@ Order steps by dependency. Keep steps atomic and verifiable."#;
             reasoning_effort: None,
             tool_choice: None,
             compress: false,
+            cache_session_id: None,
         };
 
         let response = self.provider.chat_with_tools(&request).await?;

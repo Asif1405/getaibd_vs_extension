@@ -67,6 +67,9 @@ async fn tools_list_returns_list_of_tool_definitions() {
     assert!(!tools.is_empty());
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"run_command"));
+    assert!(names.contains(&"fetch_skill"));
+    assert!(!names.contains(&"git_add"));
+    assert!(!names.contains(&"git_commit"));
 }
 
 #[tokio::test]

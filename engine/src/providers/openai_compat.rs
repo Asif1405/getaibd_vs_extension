@@ -94,6 +94,16 @@ impl OpenAiCompatProvider {
             None
         }
     }
+
+    /// OpenRouter sticky-routing key (max 256 chars). GetAIBD platform only.
+    fn compat_cache_session_id(cache_session_id: &Option<String>) -> Option<String> {
+        let sid = cache_session_id.as_ref()?.trim();
+        if sid.is_empty() {
+            None
+        } else {
+            Some(sid.chars().take(256).collect())
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -107,6 +117,8 @@ struct CompatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -124,6 +136,8 @@ struct CompatToolRequest {
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compress: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -142,6 +156,8 @@ struct CompatToolStreamRequest {
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compress: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -178,6 +194,51 @@ fn default_tool_type() -> String {
 fn norm_effort(effort: &Option<String>) -> Option<String> {
     let v = effort.as_deref()?.trim().to_ascii_lowercase();
     matches!(v.as_str(), "low" | "medium" | "high").then_some(v)
+}
+
+/// Normalize tool-call args for replay. Alibaba/Qwen reject empty, `null`, or non-object JSON.
+pub fn parse_tool_arguments(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::json!({});
+    }
+    match serde_json::from_str(trimmed) {
+        Ok(serde_json::Value::Object(_)) => serde_json::from_str(trimmed).unwrap_or_default(),
+        Ok(_) => serde_json::json!({}),
+        Err(_) => serde_json::json!({}),
+    }
+}
+
+pub fn compat_tool_arguments(arguments: &serde_json::Value) -> String {
+    let normalized = if arguments.is_null() {
+        serde_json::json!({})
+    } else if matches!(arguments, serde_json::Value::String(s) if s.trim().is_empty()) {
+        serde_json::json!({})
+    } else if !arguments.is_object() {
+        serde_json::json!({})
+    } else {
+        arguments.clone()
+    };
+    serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn compat_tool_choice(
+    tools_empty: bool,
+    request: &ToolChatRequest,
+) -> Option<String> {
+    if tools_empty {
+        return None;
+    }
+    // Never omit tool_choice when tools are present — some upstream routers
+    // (GetAIBD → Alibaba/Qwen thinking mode) default missing values to
+    // `required`, which those models reject. Explicit `auto` is safe everywhere.
+    if norm_effort(&request.reasoning_effort).is_some() {
+        return Some("auto".to_string());
+    }
+    request
+        .tool_choice
+        .clone()
+        .or_else(|| Some("auto".to_string()))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -283,8 +344,7 @@ impl From<&ToolMessage> for CompatMessage {
                         r#type: "function".to_string(),
                         function: CompatToolCallFunction {
                             name: tc.name.clone(),
-                            arguments: serde_json::to_string(&tc.arguments)
-                                .unwrap_or_else(|_| "{}".to_string()),
+                            arguments: compat_tool_arguments(&tc.arguments),
                         },
                         extra_content: tc.extra.clone(),
                     })
@@ -393,6 +453,11 @@ impl Provider for OpenAiCompatProvider {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             reasoning_effort: norm_effort(&request.reasoning_effort),
+            session_id: if self.provider_id == "getaibd" {
+                Self::compat_cache_session_id(&request.cache_session_id)
+            } else {
+                None
+            },
         };
 
         let req = self
@@ -455,6 +520,11 @@ impl Provider for OpenAiCompatProvider {
                 temperature: request.temperature,
                 max_tokens: request.max_tokens,
                 reasoning_effort: norm_effort(&request.reasoning_effort),
+                session_id: if pid == "getaibd" {
+                    Self::compat_cache_session_id(&request.cache_session_id)
+                } else {
+                    None
+                },
             };
 
             let mut req = client
@@ -545,11 +615,7 @@ impl Provider for OpenAiCompatProvider {
             })
             .collect();
 
-        let tool_choice = if tools.is_empty() {
-            None
-        } else {
-            request.tool_choice.clone()
-        };
+        let tool_choice = compat_tool_choice(tools.is_empty(), request);
         let body = CompatToolRequest {
             model: model.to_string(),
             messages: request.messages.iter().map(CompatMessage::from).collect(),
@@ -559,6 +625,11 @@ impl Provider for OpenAiCompatProvider {
             max_tokens: request.max_tokens,
             reasoning_effort: norm_effort(&request.reasoning_effort),
             compress: self.compat_compress(request),
+            session_id: if self.provider_id == "getaibd" {
+                Self::compat_cache_session_id(&request.cache_session_id)
+            } else {
+                None
+            },
         };
 
         let req = self
@@ -590,8 +661,7 @@ impl Provider for OpenAiCompatProvider {
                     .map(|tc| ToolCall {
                         id: tc.id.clone(),
                         name: tc.function.name.clone(),
-                        arguments: serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or(serde_json::Value::Null),
+                        arguments: parse_tool_arguments(&tc.function.arguments),
                         extra: tc.extra_content.clone(),
                     })
                     .collect()
@@ -649,11 +719,7 @@ impl Provider for OpenAiCompatProvider {
                 })
                 .collect();
 
-            let tool_choice = if tools.is_empty() {
-                None
-            } else {
-                request.tool_choice.clone()
-            };
+            let tool_choice = compat_tool_choice(tools.is_empty(), &request);
             let body = CompatToolStreamRequest {
                 model: model.to_string(),
                 messages: request.messages.iter().map(CompatMessage::from).collect(),
@@ -664,6 +730,11 @@ impl Provider for OpenAiCompatProvider {
                 max_tokens: request.max_tokens,
                 reasoning_effort: norm_effort(&request.reasoning_effort),
                 compress,
+                session_id: if pid == "getaibd" {
+                    Self::compat_cache_session_id(&request.cache_session_id)
+                } else {
+                    None
+                },
             };
 
             let mut req = client
@@ -780,5 +851,81 @@ impl OpenAiCompatProvider {
         } else {
             AppError::ProviderUnavailable(format!("{}: {e}", self.provider_id))
         }
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+    use crate::models::{ToolChatRequest, ToolMessage};
+
+    fn tool_request(reasoning: Option<&str>) -> ToolChatRequest {
+        ToolChatRequest {
+            model: "qwen-flash".into(),
+            messages: vec![ToolMessage::user("hi")],
+            tools: vec![crate::models::ToolDefinition {
+                name: "read_file".into(),
+                description: "read".into(),
+                input_schema: serde_json::json!({}),
+            }],
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: reasoning.map(str::to_string),
+            tool_choice: None,
+            compress: false,
+            cache_session_id: None,
+        }
+    }
+
+    #[test]
+    fn getaibd_forwards_cache_session_id_on_tool_request() {
+        assert_eq!(
+            OpenAiCompatProvider::compat_cache_session_id(&Some("ws-chat-abc".into())).as_deref(),
+            Some("ws-chat-abc")
+        );
+        assert!(OpenAiCompatProvider::compat_cache_session_id(&None).is_none());
+    }
+
+    #[test]
+    fn thinking_mode_forces_auto_tool_choice() {
+        let tc = compat_tool_choice(false, &tool_request(Some("high")));
+        assert_eq!(tc.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn default_tool_choice_is_auto_when_tools_present() {
+        let tc = compat_tool_choice(false, &tool_request(None));
+        assert_eq!(tc.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn no_tool_choice_when_tools_empty() {
+        let mut req = tool_request(None);
+        req.tools.clear();
+        assert!(compat_tool_choice(true, &req).is_none());
+    }
+
+    #[test]
+    fn compat_tool_arguments_rejects_null_and_empty() {
+        assert_eq!(compat_tool_arguments(&serde_json::Value::Null), "{}");
+        assert_eq!(
+            compat_tool_arguments(&serde_json::json!("")),
+            "{}"
+        );
+        assert_eq!(
+            compat_tool_arguments(&serde_json::json!({"plan": "step 1"})),
+            r#"{"plan":"step 1"}"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_arguments_normalizes_invalid() {
+        assert_eq!(parse_tool_arguments(""), serde_json::json!({}));
+        assert_eq!(parse_tool_arguments("null"), serde_json::json!({}));
+        assert_eq!(parse_tool_arguments("not json"), serde_json::json!({}));
+        assert_eq!(
+            parse_tool_arguments(r#"{"path":"a"}"#),
+            serde_json::json!({"path": "a"})
+        );
     }
 }

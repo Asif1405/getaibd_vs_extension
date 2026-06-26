@@ -4,6 +4,54 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.5.0]
+
+- **Cursor-aligned project instructions** — agent runs load `.getaibd/AGENTS.md`, nested
+  `subdir/.getaibd/AGENTS.md` (scoped to your active working directory), glob rules from
+  `.getaibd/rules/*.md`, and `.getaibd/MEMORY.md` (fallback: root `MEMORY.md`).
+- **User rules** — new setting `getaibd.agent.userRules` injected after conduct, before
+  project AGENTS.
+- **Skills** — catalog from `.getaibd/skills/*/SKILL.md`; `fetch_skill` tool loads full
+  instructions on demand; when your task clearly matches exactly one skill, its body is
+  auto-injected for that run.
+- **MCP client** — optional `.getaibd/mcp.json` (Cursor-compatible `mcpServers` shape)
+  spawns stdio MCP servers per agent session; external tools register as `mcp_{server}_{tool}`
+  with approval required by default.
+- **Shell-first git (breaking)** — removed `git_add`, `git_commit`, `git_push`, and
+  `git_reset` tools; use `run_command` for git mutations (with approval). Read-only
+  `git_status`, `git_diff`, and `git_log` remain; `git_status` now returns structured
+  branch/staged/unstaged/untracked arrays.
+- **Extension** — sends `workspace_cwd` and `user_rules` on agent requests; copies root
+  `MEMORY.md` → `.getaibd/MEMORY.md` on first engine start when only the legacy file exists.
+- **Built-in baseline guidance** — every agent run now gets a tool-agnostic baseline
+  (verify-before-commit, discover-don't-assume, testing discipline, correctness, security,
+  VC hygiene). A project's own `.getaibd/AGENTS.md` overrides per `##` section and the
+  baseline fills only the aspects it omits — so guidance is always present, never duplicated.
+- **Auto-managed `.getaibd/.gitignore`** — when a project uses `.getaibd/`, generated state
+  (`MEMORY.md`, caches, indexes, DBs) is ignored automatically while authored config
+  (`AGENTS.md`, `rules/`, `skills/`) stays tracked; never clobbers a user-edited file.
+  Generated memory now writes to `.getaibd/MEMORY.md` (legacy root `MEMORY.md` still read).
+- **Prompt caching (sticky routing)** — agent/chat requests forward a stable
+  `cache_session_id` so multi-turn sessions pin to the same upstream, maximizing provider
+  prompt-cache hits (e.g. OpenRouter `session_id`); workspace + chat scoped.
+- **Model picker** — searching "Auto" now finds the free model; it's matched by its display
+  label only, so its underlying engine name no longer surfaces under other searches.
+- **Queue** — pressing Enter on an empty composer releases the first queued message (runs it
+  now) instead of doing nothing, so a follow-up Enter starts the next in line.
+
+## [0.4.43]
+
+- **Agent scope discipline** — general conduct rules injected every run: follow the request
+  literally, no unstated extra steps, corrections override, denied actions are final, stop when
+  done, and ask_question options stay in scope.
+- **Denial tracking** — user-denied tools/commands are blocked for the rest of the run; two
+  denials or a "do nothing" answer stops auto-continue; equivalent git commands share one
+  fingerprint (`git add .` == `git_add` with `["."]`).
+- **Git tools** — `git_reset` and `git_push`; clearer `git_add`/`git_commit` descriptions
+  (staged-only commit, no broad staging unless asked); prefer `git_*` over `run_command`.
+- **Completion reviewer** — sees denied actions and stop state so it does not force rejected steps.
+- **Shorter wrap-ups** — step-limit summaries capped at ~400 tokens.
+
 ## [0.4.42]
 
 - **Fix chat stuck on "Getting ready…"** — webview script no longer crashes on startup

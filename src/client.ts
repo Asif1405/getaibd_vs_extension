@@ -143,6 +143,7 @@ export function streamChat(
   messages: ChatMessage[],
   callbacks: SseCallbacks,
   apiKey?: string,
+  cacheSessionId?: string,
 ): AbortController {
   const controller = new AbortController();
 
@@ -150,6 +151,7 @@ export function streamChat(
     try {
       const body: Record<string, unknown> = { provider, model, messages };
       if (apiKey) {body.api_key = apiKey;}
+      if (cacheSessionId?.trim()) {body.cache_session_id = cacheSessionId.trim();}
       const resp = await fetch(`${getServerUrl()}/sse/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -307,7 +309,15 @@ export function streamAgent(
   model: string,
   task: string,
   callbacks: AgentCallbacks,
-  options?: { systemPrompt?: string; requireApproval?: boolean; apiKey?: string },
+  options?: {
+    systemPrompt?: string;
+    requireApproval?: boolean;
+    apiKey?: string;
+    userRules?: string;
+    workspaceCwd?: string;
+    /** Per-workspace chat id for GetAIBD prompt-cache sticky routing. */
+    cacheSessionId?: string;
+  },
 ): AbortController {
   const controller = new AbortController();
 
@@ -324,6 +334,9 @@ export function streamAgent(
       };
       if (options?.systemPrompt) {body.system_prompt = options.systemPrompt;}
       if (options?.apiKey) {body.api_key = options.apiKey;}
+      if (options?.userRules?.trim()) {body.user_rules = options.userRules.trim();}
+      if (options?.workspaceCwd?.trim()) {body.workspace_cwd = options.workspaceCwd.trim();}
+      if (options?.cacheSessionId?.trim()) {body.cache_session_id = options.cacheSessionId.trim();}
 
       const resp = await fetch(`${getServerUrl()}/agent/run`, {
         method: "POST",
@@ -390,6 +403,17 @@ export function streamAgent(
   return controller;
 }
 
+function parseSseText(data: string): string {
+  if (!data) {return "";}
+  try {
+    const parsed = JSON.parse(data) as unknown;
+    if (typeof parsed === "string") {return parsed;}
+  } catch {
+    /* legacy plain-text SSE payloads */
+  }
+  return data;
+}
+
 function processAgentEvent(
   event: string,
   data: string,
@@ -446,10 +470,10 @@ function processAgentEvent(
         break;
       }
       case "text":
-        callbacks.onText(data);
+        callbacks.onText(parseSseText(data));
         break;
       case "done":
-        callbacks.onDone(data);
+        callbacks.onDone(parseSseText(data));
         break;
       case "complete": {
         const parsed = JSON.parse(data);
@@ -457,22 +481,22 @@ function processAgentEvent(
         break;
       }
       case "error":
-        callbacks.onError(data);
+        callbacks.onError(parseSseText(data));
         break;
       case "planning":
-        callbacks.onPlanning?.(data);
+        callbacks.onPlanning?.(parseSseText(data));
         break;
       case "thinking":
-        callbacks.onThinking?.(data);
+        callbacks.onThinking?.(parseSseText(data));
         break;
       case "reflecting":
-        callbacks.onReflecting?.(data);
+        callbacks.onReflecting?.(parseSseText(data));
         break;
       case "replanning":
-        callbacks.onReplanning?.(data);
+        callbacks.onReplanning?.(parseSseText(data));
         break;
       case "context_compressed":
-        callbacks.onContextCompressed?.(data);
+        callbacks.onContextCompressed?.(parseSseText(data));
         break;
       case "step_limit":
         callbacks.onStepLimit?.();
@@ -509,6 +533,10 @@ export function streamOrchestrated(
     compress?: boolean;
     /** Local RAG index injection (off by default — agent uses read_file instead). */
     useMemory?: boolean;
+    userRules?: string;
+    workspaceCwd?: string;
+    /** Per-workspace chat id for GetAIBD prompt-cache sticky routing. */
+    cacheSessionId?: string;
   },
 ): AbortController {
   const controller = new AbortController();
@@ -532,6 +560,9 @@ export function streamOrchestrated(
       if (options?.apiKey) {body.api_key = options.apiKey;}
       if (options?.reasoningEffort) {body.reasoning_effort = options.reasoningEffort;}
       if (options?.compress) {body.compress = true;}
+      if (options?.userRules?.trim()) {body.user_rules = options.userRules.trim();}
+      if (options?.workspaceCwd?.trim()) {body.workspace_cwd = options.workspaceCwd.trim();}
+      if (options?.cacheSessionId?.trim()) {body.cache_session_id = options.cacheSessionId.trim();}
 
       const resp = await fetch(`${getServerUrl()}/agent/orchestrated`, {
         method: "POST",
@@ -608,7 +639,7 @@ function processOrchestratedEvent(
     return;
   }
   if (event === "response") {
-    callbacks.onText(data);
+    callbacks.onText(parseSseText(data));
     return;
   }
   processAgentEvent(event, data, callbacks);

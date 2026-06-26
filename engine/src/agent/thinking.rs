@@ -49,6 +49,32 @@ pub fn model_uses_reasoning(model: &str) -> bool {
     REASONING.iter().any(|marker| m.contains(marker))
 }
 
+/// True when the client sends `reasoning_effort` (low/medium/high). Upstream thinking
+/// mode (e.g. Alibaba/Qwen) rejects `tool_choice=required`.
+#[must_use]
+pub fn provider_thinking_mode_active(reasoning_effort: Option<&str>) -> bool {
+    let Some(v) = reasoning_effort.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "low" | "medium" | "high"
+    )
+}
+
+/// Whether the agent may send `tool_choice=required` to nudge tool use.
+#[must_use]
+pub fn may_force_tool_choice(
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
+    model: &str,
+) -> bool {
+    if provider_thinking_mode_active(reasoning_effort) {
+        return false;
+    }
+    !(enable_thinking && model_uses_reasoning(model))
+}
+
 /// Detected structured block from an LLM response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingBlock {
@@ -228,5 +254,12 @@ mod tests {
             StreamPhase::Plan.update("hello <plan>step</plan> done"),
             StreamPhase::Normal
         );
+    }
+
+    #[test]
+    fn provider_thinking_blocks_forced_tool_choice() {
+        assert!(provider_thinking_mode_active(Some("medium")));
+        assert!(!provider_thinking_mode_active(Some("off")));
+        assert!(!may_force_tool_choice(Some("high"), false, "qwen-flash"));
     }
 }

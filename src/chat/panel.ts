@@ -209,6 +209,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private lastOpenFileFingerprint: string | null = null;
   /** Manual context blocks already included in a prior turn this session. */
   private injectedContextFingerprints = new Set<string>();
+  /** Accumulated streamed agent prose for persistence when SSE `done` is truncated. */
+  private agentStreamBuffer = "";
+  private agentReplySaved = false;
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -436,7 +439,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.refreshCreditsBalance(provider);
         this.maybeHandlePaymentError(error);
       },
-    }, apiKey);
+    }, apiKey, provider === "getaibd" ? this.promptCacheSessionId() : undefined);
   }
 
   private async handleMessage(msg: WebviewMessage) {
@@ -1060,6 +1063,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private async sendAgentTask(provider: string, model: string, task: string) {
     if (!(await this.checkSecrets(task))) {return;}
     if (provider === "getaibd" && !(await this.ensureCreditsAllowance(model))) {return;}
+    this.beginAgentRun();
     this.history.push({ kind: "message", role: "user", content: task });
     this.saveHistory();
     this.post({ type: "addMessage", role: "user", content: task });
@@ -1083,6 +1087,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.handleAskRequest(requestId, sessionId, question, options, multiple);
       },
       onText: (text) => {
+        this.agentStreamBuffer += text;
         this.post({ type: "agentText", content: text });
       },
       onPlanning: (content) => {
@@ -1107,11 +1112,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.handleFileEdit(edit);
       },
       onDone: (content) => {
-        const clean = stripThinking(content);
-        if (clean) {
-          this.history.push({ kind: "message", role: "assistant", content: clean });
-          this.saveHistory();
-        }
+        this.persistAgentReply(content);
         this.post({ type: "agentDone", content });
         if (content && looksLikePatch(content)) {
           this.previewPatch(content).catch(() => {});
@@ -1120,17 +1121,48 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         if (taskId) {this.startTaskPolling(taskId);}
       },
       onComplete: (iterations) => {
+        this.persistAgentReply();
         this.post({ type: "agentComplete", iterations });
         this.abortController = undefined;
         this.refreshCreditsBalance(provider);
+        this.resetAgentRunState();
       },
       onError: (error) => {
+        this.persistAgentReply();
         this.post({ type: "agentError", error });
         this.abortController = undefined;
         this.refreshCreditsBalance(provider);
+        this.resetAgentRunState();
         this.maybeHandlePaymentError(error);
       },
-    }, { requireApproval: true, apiKey });
+    }, { requireApproval: true, apiKey, userRules: this.getAgentUserRules(), workspaceCwd: this.getWorkspaceCwd(), cacheSessionId: this.promptCacheSessionId() });
+  }
+
+  private getAgentUserRules(): string | undefined {
+    const rules = vscode.workspace.getConfiguration("getaibd").get<string>("agent.userRules", "");
+    const trimmed = rules?.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
+  private getWorkspaceCwd(): string | undefined {
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const active = vscode.window.activeTextEditor?.document.uri.fsPath;
+    if (active && folder) {
+      return path.dirname(active);
+    }
+    return folder;
+  }
+
+  /** Stable OpenRouter sticky-routing key: one workspace + chat tab. */
+  private promptCacheSessionId(): string {
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "__noworkspace__";
+    const chat = this.activeSessionId || "default";
+    const raw = `${ws}|${chat}`;
+    if (raw.length <= 256) {
+      return raw;
+    }
+    const hash = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 32);
+    return `getaibd-${hash}-chat-${chat}`.slice(0, 256);
   }
 
   private async sendOrchestrated(
@@ -1143,6 +1175,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   ) {
     if (!(await this.checkSecrets(text))) {return;}
     if (provider === "getaibd" && !(await this.ensureCreditsAllowance(model))) {return;}
+    this.beginAgentRun();
     this.stepLimitHit = false;
     const turnId = newId();
     this.currentTurnId = turnId;
@@ -1178,8 +1211,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onAskRequired: (requestId, sessionId, question, options, multiple) => {
         this.handleAskRequest(requestId, sessionId, question, options, multiple);
       },
-      onText: (text) => {
-        this.post({ type: "agentText", content: text });
+      onText: (chunk) => {
+        this.agentStreamBuffer += chunk;
+        this.post({ type: "agentText", content: chunk });
       },
       onPlanning: (content) => {
         this.post({ type: "agentPlanning", content });
@@ -1206,26 +1240,26 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.handleFileEdit(edit);
       },
       onDone: (content) => {
-        const clean = stripThinking(content);
-        if (clean) {
-          this.history.push({ kind: "message", role: "assistant", content: clean });
-          this.saveHistory();
-        }
+        this.persistAgentReply(content);
         this.post({ type: "agentDone", content });
       },
       onComplete: (iterations) => {
+        this.persistAgentReply();
         this.post({ type: "agentComplete", iterations, stepLimit: this.stepLimitHit });
         this.stepLimitHit = false;
         this.abortController = undefined;
         this.refreshCreditsBalance(provider);
+        this.resetAgentRunState();
       },
       onError: (error) => {
+        this.persistAgentReply();
         this.post({ type: "agentError", error });
         this.abortController = undefined;
         this.refreshCreditsBalance(provider);
+        this.resetAgentRunState();
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress, useMemory: agentUseMemory });
+    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress, useMemory: agentUseMemory, userRules: this.getAgentUserRules(), workspaceCwd: this.getWorkspaceCwd(), cacheSessionId: this.promptCacheSessionId() });
   }
 
   private handleFileEdit(edit: FileEdit) {
@@ -1718,6 +1752,28 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private saveHistory() {
     this.sessionStore.update(SESSION_HISTORY_PREFIX + this.activeSessionId, this.history);
     this.maybeTitleFromHistory();
+  }
+
+  private beginAgentRun() {
+    this.agentStreamBuffer = "";
+    this.agentReplySaved = false;
+  }
+
+  private resetAgentRunState() {
+    this.agentStreamBuffer = "";
+    this.agentReplySaved = false;
+  }
+
+  /** Persist the assistant turn from `done` and/or streamed tokens (once per run). */
+  private persistAgentReply(doneContent?: string) {
+    if (this.agentReplySaved) {return;}
+    const fromDone = stripThinking(doneContent ?? "");
+    const fromStream = stripThinking(this.agentStreamBuffer);
+    const clean = fromDone || fromStream;
+    if (!clean) {return;}
+    this.history.push({ kind: "message", role: "assistant", content: clean });
+    this.saveHistory();
+    this.agentReplySaved = true;
   }
 
   /** Prior user/assistant turns, most-recent-first within a char budget. The engine
@@ -3600,6 +3656,18 @@ function modelDisplay(modelId, name) {
   return modelId === freeModelId ? freeModelLabel : (name || modelId);
 }
 
+// The free model is shown to users as "Auto" — search it by that label only,
+// so it surfaces for "Auto" and stays hidden behind its underlying engine name.
+function matchesModel(modelId, name, filter) {
+  if (modelId === freeModelId) {
+    return freeModelLabel.toLowerCase().includes(filter);
+  }
+  return (
+    modelId.toLowerCase().includes(filter) ||
+    (name || "").toLowerCase().includes(filter)
+  );
+}
+
 const MODE_PLACEHOLDERS = {
   plan: "Describe what you want to plan...",
   ask: "Ask a question...",
@@ -3834,14 +3902,13 @@ function renderModelList(filter) {
   for (const pid of providerIds) {
     const curated = (curatedModels[pid] || []).filter(m =>
       !filter ||
-      m.id.toLowerCase().includes(filter) ||
-      m.name.toLowerCase().includes(filter) ||
+      matchesModel(m.id, m.name, filter) ||
       getProviderLabel(pid).toLowerCase().includes(filter)
     );
 
     const apiModels = (allModels[pid] || []).filter(m =>
       !curated.find(c => c.id === m.id) &&
-      (!filter || m.id.toLowerCase().includes(filter) || (m.name || "").toLowerCase().includes(filter))
+      (!filter || matchesModel(m.id, m.name, filter))
     );
 
     if (curated.length === 0 && apiModels.length === 0) continue;
@@ -4080,6 +4147,13 @@ sendBtn.addEventListener("click", () => {
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
+    // Empty composer + a non-empty queue: release the first queued item (run it
+    // now) instead of doing nothing — so a follow-up Enter starts the next in line
+    // without reaching for the ▶ button.
+    if (!inputEl.value.trim() && messageQueue.length > 0) {
+      forceQueueItem(messageQueue[0].id);
+      return;
+    }
     send();
   }
 });

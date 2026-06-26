@@ -11,6 +11,25 @@ use crate::error::AppError;
 use crate::models::{ChatRequest, SseDoneEvent, SseErrorEvent, SseTokenEvent};
 use crate::state::AppState;
 
+/// JSON-encode freeform SSE payloads so embedded blank lines (`\n\n`) cannot
+/// prematurely terminate an SSE event block on the client.
+pub fn sse_text_data(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+#[cfg(test)]
+mod sse_text_tests {
+    use super::sse_text_data;
+
+    #[test]
+    fn multiline_text_survives_json_encoding() {
+        let encoded = sse_text_data("line1\n\nline2");
+        assert!(encoded.contains("\\n"));
+        let decoded: String = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, "line1\n\nline2");
+    }
+}
+
 #[allow(clippy::unused_async)]
 pub async fn sse_chat_handler(
     State(state): State<Arc<AppState>>,

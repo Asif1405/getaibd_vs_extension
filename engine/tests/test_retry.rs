@@ -78,6 +78,7 @@ fn test_request() -> ChatRequest {
         max_tokens: None,
         api_key: None,
         reasoning_effort: None,
+        cache_session_id: None,
     }
 }
 

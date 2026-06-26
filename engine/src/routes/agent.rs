@@ -32,6 +32,13 @@ pub struct AgentRequest {
     /// Active shell reported by the client (e.g. "PowerShell", "zsh", "bash").
     #[serde(default)]
     pub shell: Option<String>,
+    #[serde(default)]
+    pub user_rules: Option<String>,
+    #[serde(default)]
+    pub workspace_cwd: Option<String>,
+    /// Stable per-workspace chat id for GetAIBD prompt-cache sticky routing.
+    #[serde(default)]
+    pub cache_session_id: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -83,11 +90,11 @@ pub async fn agent_handler(
 
     let project_root = state.project_root.clone();
     let max_iter = req.max_iterations.min(state.max_iterations);
-    let registry = crate::tools::ToolRegistry::build_default(&project_root);
     let sid = session_id.clone();
 
     let sid_for_task = session_id.clone();
     tokio::spawn(async move {
+        let registry = crate::tools::ToolRegistry::build_for_session(&project_root).await;
         run_agent_task(
             &state,
             req,
@@ -124,9 +131,20 @@ async fn run_agent_task(
 ) {
     let environment =
         crate::agent::runtime::format_environment(req.os.as_deref(), req.shell.as_deref());
+    let workspace_cwd = req.workspace_cwd.as_ref().map(|p| {
+        let path = std::path::PathBuf::from(p);
+        if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        }
+    });
     let mut session = Session::new(&req.provider, &req.model, project_root)
         .with_max_iterations(max_iter)
-        .with_environment(environment);
+        .with_environment(environment)
+        .with_user_rules(req.user_rules.clone())
+        .with_workspace_cwd(workspace_cwd)
+        .with_cache_session_id(req.cache_session_id.clone());
 
     if let Some(sys) = req.system_prompt {
         session = session.with_system_prompt(sys);
@@ -182,7 +200,9 @@ async fn run_agent_task(
             }
         }
         Err(e) => {
-            let evt = Event::default().event("error").data(e.to_string());
+            let evt = Event::default()
+                .event("error")
+                .data(crate::routes::sse::sse_text_data(&e.to_string()));
             let _ = tx.send(Ok(evt)).await;
         }
     }
@@ -198,11 +218,21 @@ fn agent_event_to_sse(
         AgentEventKind::Think => Some(Event::default().event("think").data("Thinking...")),
         AgentEventKind::ToolCall => Some(Event::default().event("tool_call").data(data)),
         AgentEventKind::ToolResult => Some(Event::default().event("tool_result").data(data)),
-        AgentEventKind::Response => Some(Event::default().event("response").data(data)),
-        AgentEventKind::Complete => {
-            Some(Event::default().event("complete").data("Agent completed"))
-        }
-        AgentEventKind::Error => Some(Event::default().event("error").data(data)),
+        AgentEventKind::Response => Some(
+            Event::default()
+                .event("response")
+                .data(crate::routes::sse::sse_text_data(data)),
+        ),
+        AgentEventKind::Complete => Some(
+            Event::default()
+                .event("done")
+                .data(crate::routes::sse::sse_text_data(data)),
+        ),
+        AgentEventKind::Error => Some(
+            Event::default()
+                .event("error")
+                .data(crate::routes::sse::sse_text_data(data)),
+        ),
         AgentEventKind::ModeSelected => {
             Some(Event::default().event("mode_selected").data(data))
         }

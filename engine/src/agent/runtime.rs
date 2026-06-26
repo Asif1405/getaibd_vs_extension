@@ -15,11 +15,13 @@ use crate::models::{
     ChatRequest, Message, ToolCall, ToolChatRequest, ToolChatResponse, ToolMessage,
     ToolStreamDelta,
 };
+use crate::providers::openai_compat::parse_tool_arguments;
 use crate::providers::Provider;
 use crate::retry::chat_with_tools_retry_cb;
 use crate::tools::approval::ApprovalGate;
 use crate::tools::ToolRegistry;
 
+use super::project_rules;
 use super::session::Session;
 use super::thinking;
 
@@ -187,6 +189,31 @@ fn environment_note(env: Option<&str>) -> String {
     )
 }
 
+/// File paths referenced in context messages the extension injects, in the form
+/// `[Currently open file: path]` or `[File: path]`. Used as glob-rule hints and
+/// to seed RAG context.
+fn open_file_hints(messages: &[ToolMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|msg| msg.content.as_deref())
+        .flat_map(|content| {
+            let mut files = Vec::new();
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("[Currently open file: ") {
+                    if let Some(path) = rest.strip_suffix(']') {
+                        files.push(path.to_string());
+                    }
+                } else if let Some(rest) = line.strip_prefix("[File: ") {
+                    if let Some(path) = rest.strip_suffix(']') {
+                        files.push(path.to_string());
+                    }
+                }
+            }
+            files
+        })
+        .collect()
+}
+
 async fn inject_context(session: &mut Session, task: &str, memory: Option<&MemoryContext<'_>>) {
     // Build the static prefix (system prompt + long-term memory) and prepend it so it sits
     // BEFORE the conversation history. This keeps the most recent turns closest to the task,
@@ -195,6 +222,21 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
 
     if let Some(sys) = &session.system_prompt {
         prefix.push(ToolMessage::system(sys.clone()));
+    }
+
+    // Project instructions: the built-in baseline merged with the project's own
+    // .getaibd/AGENTS.md (user sections win, baseline fills the gaps), plus user
+    // rules, nested AGENTS.md, matched glob rules, memory, and the skills catalog.
+    let hint_paths = open_file_hints(&session.messages);
+    let instructions = project_rules::load_project_instructions(
+        Path::new(&session.project_root),
+        session.workspace_cwd.as_deref(),
+        session.user_rules.as_deref(),
+        task,
+        &hint_paths,
+    );
+    for msg in instructions.system_messages {
+        prefix.push(ToolMessage::system(msg));
     }
 
     // Make the model aware of the host OS/shell so it always generates commands for the
@@ -212,28 +254,8 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
     }
 
     if let Some(mem) = memory {
-        // Extract file paths referenced in prior context messages injected by the extension.
-        // The extension injects content in the form "[Currently open file: path]" or "[File: path]".
-        let current_files: Vec<String> = session
-            .messages
-            .iter()
-            .filter_map(|msg| msg.content.as_deref())
-            .flat_map(|content| {
-                let mut files = Vec::new();
-                for line in content.lines() {
-                    if let Some(rest) = line.strip_prefix("[Currently open file: ") {
-                        if let Some(path) = rest.strip_suffix(']') {
-                            files.push(path.to_string());
-                        }
-                    } else if let Some(rest) = line.strip_prefix("[File: ") {
-                        if let Some(path) = rest.strip_suffix(']') {
-                            files.push(path.to_string());
-                        }
-                    }
-                }
-                files
-            })
-            .collect();
+        // Reuse the file paths the extension referenced in prior context messages.
+        let current_files = hint_paths.clone();
 
         // Try to enrich context with cached project graph when available.
         let ctx_result = if let Some(cache) = mem.analysis_cache.as_ref() {
@@ -299,10 +321,6 @@ async fn agent_loop(
     let mut iterations = 0;
     let mut last_text = String::new();
     let mut nudge_count = 0u32;
-    // When a weak model replies with prose instead of a tool call, we set this so
-    // the NEXT request sends tool_choice="required", forcing it to actually act.
-    // Reset as soon as it emits a real tool call.
-    let mut force_tool_call = false;
     let use_streaming = provider.supports_streaming_tools();
     let enable_thinking = options.is_none_or(|o| o.enable_thinking);
 
@@ -351,7 +369,7 @@ async fn agent_loop(
     // Seed a structured plan up front for any task that can use tools. The model
     // lays out its own checklist via update_plan; we then keep it pinned in context
     // and use it (plus the diff-aware reviewer) to drive the run to real completion.
-    if auto_complete && session.task_ledger.is_none() {
+    if auto_complete && session.task_ledger.is_none() && task_ctx.requires_tools {
         session.push_message(ToolMessage::system(
             "FIRST, for any task that needs more than one step, call the update_plan tool with a \
              short checklist: a one-line goal followed by concrete steps each marked [ ]. As you \
@@ -397,7 +415,6 @@ async fn agent_loop(
                         force_continue += 1;
                         work_at_last_force = work_total;
                         nudge_count = 0;
-                        force_tool_call = true;
                         session.max_iterations += STEP_EXTENSION;
                         let remaining = format_missing(&verdict.missing);
                         on_event(AgentEvent {
@@ -437,6 +454,7 @@ async fn agent_loop(
                 reasoning_effort: None,
                 tool_choice: None,
                 compress: false,
+                cache_session_id: session.cache_session_id.clone(),
             };
             let summary = match chat_with_tools_retry_cb(provider, &wrap, None).await {
                 Ok(r) => r.content.filter(|c| !c.trim().is_empty()),
@@ -512,10 +530,11 @@ async fn agent_loop(
             temperature: None,
             max_tokens: None,
             reasoning_effort: session.reasoning_effort.clone(),
-            // Force a tool call after a narration so weak models stop describing
-            // work and actually do it; auto otherwise.
-            tool_choice: force_tool_call.then(|| "required".to_string()),
+            // Never send tool_choice=required — breaks Alibaba/Qwen thinking mode.
+            // Weak models are nudged via system messages; compat layer defaults to "auto".
+            tool_choice: None,
             compress: session.compress,
+            cache_session_id: session.cache_session_id.clone(),
         };
 
         let response = if use_streaming {
@@ -597,7 +616,6 @@ async fn agent_loop(
                     force_continue += 1;
                     work_at_last_force = work_total;
                     nudge_count = 0;
-                    force_tool_call = true;
                     // Drop the summary we just streamed FIRST, before any other event. The client
                     // discards the last streamed draft by the handle it is still holding; emitting
                     // a status event (e.g. Reflecting) first would detach that handle and leave the
@@ -653,9 +671,6 @@ async fn agent_loop(
                     });
                 }
                 nudge_count += 1;
-                // Force the next turn to emit a tool call — prose nudges alone don't
-                // move weak models that keep narrating instead of acting.
-                force_tool_call = true;
                 session.push_message(ToolMessage::system(
                     "You replied without calling any tool, so the task has NOT been performed yet \
                      and no files have changed. Call the appropriate tools NOW (write_file, \
@@ -686,7 +701,6 @@ async fn agent_loop(
         // and stop forcing tool calls: the limit is for consecutive empty replies,
         // not the whole run.
         nudge_count = 0;
-        force_tool_call = false;
         work_total += response
             .tool_calls
             .iter()
@@ -968,6 +982,7 @@ async fn verify_task_complete(
         reasoning_effort: None,
         tool_choice: None,
         compress: false,
+        cache_session_id: session.cache_session_id.clone(),
     };
     match chat_with_tools_retry_cb(provider, &request, None).await {
         Ok(r) => parse_verdict(r.content.as_deref().unwrap_or("")),
@@ -1239,8 +1254,7 @@ async fn collect_streaming_response(
             }
             ToolStreamDelta::ToolCallStart { id, name, extra } => {
                 if !current_tool_id.is_empty() {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&current_tool_args).unwrap_or_default();
+                    let args = parse_tool_arguments(&current_tool_args);
                     tool_calls.push(ToolCall {
                         id: current_tool_id.clone(),
                         name: current_tool_name.clone(),
@@ -1258,8 +1272,7 @@ async fn collect_streaming_response(
             }
             ToolStreamDelta::ToolCallEnd | ToolStreamDelta::Done => {
                 if !current_tool_id.is_empty() {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&current_tool_args).unwrap_or_default();
+                    let args = parse_tool_arguments(&current_tool_args);
                     tool_calls.push(ToolCall {
                         id: current_tool_id.clone(),
                         name: current_tool_name.clone(),
@@ -1369,6 +1382,7 @@ async fn summarize_old_messages(session: &mut Session, provider: &Arc<dyn Provid
         max_tokens: Some(800),
         reasoning_effort: None,
         api_key: None,
+        cache_session_id: session.cache_session_id.clone(),
     };
 
     let summary = match provider.chat(&req).await {
@@ -1561,6 +1575,7 @@ async fn reflect(session: &Session, provider: &Arc<dyn Provider>) -> Reflection 
         max_tokens: Some(800),
         reasoning_effort: None,
         api_key: None,
+        cache_session_id: session.cache_session_id.clone(),
     };
 
     match provider.chat(&req).await {
@@ -1615,6 +1630,11 @@ async fn execute_tool_calls(
 
         let result = match registry.get(&call.name) {
             Some(tool) => {
+                if session.is_action_denied(&call.name, &call.arguments) {
+                    serde_json::json!({
+                        "error": "This action was denied earlier in this run. Do not retry it — ask the user or try a different approach."
+                    })
+                } else {
                 let approved = check_approval(tool.as_ref(), call, options, on_event).await;
                 if approved {
                     let ask_gate = options
@@ -1643,7 +1663,9 @@ async fn execute_tool_calls(
                         }
                     }
                 } else {
+                    session.record_denied(&call.name, &call.arguments);
                     serde_json::json!({ "error": "Tool execution denied by user" })
+                }
                 }
             }
             None => serde_json::json!({ "error": format!("Unknown tool: {}", call.name) }),

@@ -5,16 +5,20 @@ pub mod command;
 pub mod edits;
 pub mod env_manager;
 pub mod git;
+pub mod mcp_proxy;
 pub mod plan;
+pub mod skill;
 pub mod terminal_gate;
 pub mod workspace;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::AppError;
+use crate::mcp::client;
 use crate::models::ToolDefinition;
 
 #[async_trait]
@@ -60,12 +64,47 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.definition()).collect()
     }
 
-    pub fn build_default(project_root: &std::path::Path) -> Self {
+    /// Subset of tools whose names pass `pred`.
+    pub fn filter<F>(&self, mut pred: F) -> Self
+    where
+        F: FnMut(&str) -> bool,
+    {
         let mut registry = Self::new();
+        for (name, tool) in &self.tools {
+            if pred(name) {
+                registry.register(Arc::clone(tool));
+            }
+        }
+        registry
+    }
+
+    /// Built-in tools for MCP HTTP/stdio and non-agent routes (no external MCP servers).
+    pub fn build_default(project_root: &Path) -> Self {
+        let mut registry = Self::new();
+        Self::register_builtin(&mut registry, project_root);
+        registry
+    }
+
+    /// Agent session registry: built-ins + optional MCP servers from `.getaibd/mcp.json`.
+    pub async fn build_for_session(project_root: &Path) -> Self {
+        let mut registry = Self::build_default(project_root);
+        for server in client::connect_all(project_root).await {
+            let server = Arc::new(server);
+            for tool in &server.tools {
+                registry.register(Arc::new(mcp_proxy::McpProxyTool::new(
+                    server.clone(),
+                    tool.name.clone(),
+                    tool.description.clone(),
+                    tool.input_schema.clone(),
+                )));
+            }
+        }
+        registry
+    }
+
+    fn register_builtin(registry: &mut Self, project_root: &Path) {
         let root = Arc::new(project_root.to_path_buf());
         let env_mgr = env_manager::EnvManager::new(root.clone());
-        // Shared across the edit + diff tools so git_diff can fall back to the
-        // session's tracked edits when the workspace isn't a git repo.
         let edits = edits::EditTracker::new();
 
         registry.register(Arc::new(workspace::ReadFile::new(root.clone())));
@@ -78,8 +117,6 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitStatus::new(root.clone())));
         registry.register(Arc::new(git::GitDiff::new(root.clone(), edits.clone())));
         registry.register(Arc::new(git::GitLog::new(root.clone())));
-        registry.register(Arc::new(git::GitAdd::new(root.clone())));
-        registry.register(Arc::new(git::GitCommit::new(root.clone())));
         registry.register(Arc::new(command::RunCommand::new(
             root.clone(),
             command::default_allowlist(),
@@ -88,8 +125,7 @@ impl ToolRegistry {
         registry.register(Arc::new(env_manager::ManageEnv::new(env_mgr)));
         registry.register(Arc::new(ask::AskQuestion::new()));
         registry.register(Arc::new(plan::UpdatePlan::new()));
-
-        registry
+        registry.register(Arc::new(skill::FetchSkill::new(root.clone())));
     }
 }
 

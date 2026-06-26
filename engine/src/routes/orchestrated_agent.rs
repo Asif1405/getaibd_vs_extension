@@ -52,6 +52,15 @@ pub struct OrchestratedRequest {
     /// Active shell reported by the client (e.g. "PowerShell", "zsh", "bash").
     #[serde(default)]
     pub shell: Option<String>,
+    /// Global user rules from VS Code settings.
+    #[serde(default)]
+    pub user_rules: Option<String>,
+    /// Working directory for nested `.getaibd/AGENTS.md` (absolute or relative to project root).
+    #[serde(default)]
+    pub workspace_cwd: Option<String>,
+    /// Stable per-workspace chat id for GetAIBD prompt-cache sticky routing.
+    #[serde(default)]
+    pub cache_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,7 +79,7 @@ pub async fn orchestrated_agent_handler(
         .get_provider(&req.provider)
         .ok_or_else(|| AppError::UnknownProvider(req.provider.clone()))?;
 
-    let registry = ToolRegistry::build_default(&state.project_root);
+    let registry = ToolRegistry::build_for_session(&state.project_root).await;
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -124,7 +133,9 @@ pub async fn orchestrated_agent_handler(
             }
             Err(e) => {
                 let _ = tx
-                    .send(Ok(Event::default().event("error").data(e.to_string())))
+                    .send(Ok(Event::default()
+                        .event("error")
+                        .data(crate::routes::sse::sse_text_data(&e.to_string()))))
                     .await;
             }
         }
@@ -147,10 +158,21 @@ async fn run_orchestrated_task(
 ) -> Result<OrchestratedResponse, AppError> {
     let environment =
         crate::agent::runtime::format_environment(req.os.as_deref(), req.shell.as_deref());
+    let workspace_cwd = req.workspace_cwd.as_ref().map(|p| {
+        let path = std::path::PathBuf::from(p);
+        if path.is_absolute() {
+            path
+        } else {
+            state.project_root.join(path)
+        }
+    });
     let mut session = Session::new(&req.provider, &req.model, state.project_root.clone())
         .with_reasoning_effort(req.reasoning_effort.clone())
         .with_compress(req.compress)
-        .with_environment(environment);
+        .with_environment(environment)
+        .with_user_rules(req.user_rules.clone())
+        .with_workspace_cwd(workspace_cwd)
+        .with_cache_session_id(req.cache_session_id.clone());
 
     for h in &req.history {
         let msg = match h.role.as_str() {
@@ -208,6 +230,20 @@ async fn run_orchestrated_task(
             AgentEventKind::ApprovalRequired
             | AgentEventKind::TerminalExec
             | AgentEventKind::AskRequired => inject_session_id(&event.content, &session_id),
+            AgentEventKind::ToolCall | AgentEventKind::ToolResult | AgentEventKind::FileEdit => {
+                event.content.unwrap_or_default()
+            }
+            AgentEventKind::Complete
+            | AgentEventKind::Error
+            | AgentEventKind::Response
+            | AgentEventKind::Planning
+            | AgentEventKind::Thinking
+            | AgentEventKind::Reflecting
+            | AgentEventKind::Replanning
+            | AgentEventKind::ContextCompressed
+            | AgentEventKind::StepLimitReached => {
+                crate::routes::sse::sse_text_data(&event.content.unwrap_or_default())
+            }
             _ => event.content.unwrap_or_default(),
         };
 

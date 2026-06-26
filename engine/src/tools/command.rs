@@ -46,7 +46,8 @@ impl Tool for RunCommand {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command. Only allowlisted commands are permitted."
+        "Execute a shell command. Prefer dedicated git_* tools for git operations (git_status, \
+         git_add, git_commit, git_push, git_reset). Only allowlisted commands are permitted."
     }
 
     fn input_schema(&self) -> Value {

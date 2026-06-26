@@ -55,7 +55,7 @@ impl Tool for GitStatus {
     }
 
     fn description(&self) -> &'static str {
-        "Show git working tree status."
+        "Show git working tree status with branch, staged, unstaged, and untracked file lists."
     }
 
     fn input_schema(&self) -> Value {
@@ -64,10 +64,50 @@ impl Tool for GitStatus {
 
     async fn execute(&self, _input: Value) -> Result<Value, AppError> {
         if !is_git_repo(&self.root).await {
-            return Ok(json!({ "status": "", "note": NOT_A_REPO }));
+            return Ok(json!({
+                "status": "",
+                "branch": "",
+                "staged": [],
+                "unstaged": [],
+                "untracked": [],
+                "note": NOT_A_REPO
+            }));
         }
+        let branch = run_git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let output = run_git(&self.root, &["status", "--porcelain"]).await?;
-        Ok(json!({ "status": output.trim() }))
+        let mut staged = Vec::new();
+        let mut unstaged = Vec::new();
+        let mut untracked = Vec::new();
+        for line in output.lines() {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            let path = line.get(3..).unwrap_or(line).trim();
+            if line.starts_with("??") {
+                untracked.push(path.to_string());
+            } else {
+                let x = line.as_bytes().first().copied().unwrap_or(b' ');
+                let y = line.as_bytes().get(1).copied().unwrap_or(b' ');
+                if x != b' ' {
+                    staged.push(path.to_string());
+                }
+                if y != b' ' {
+                    unstaged.push(path.to_string());
+                }
+            }
+        }
+        Ok(json!({
+            "status": output.trim(),
+            "branch": branch,
+            "staged": staged,
+            "unstaged": unstaged,
+            "untracked": untracked,
+        }))
     }
 }
 
@@ -237,7 +277,9 @@ impl Tool for GitAdd {
     }
 
     fn description(&self) -> &'static str {
-        "Stage files for commit."
+        "Stage specific files for commit. List explicit paths only — do NOT use [\".\"] or \
+         [\"-A\"] unless the user asked to stage everything. For \"commit staged\" tasks, skip \
+         staging and use git_commit directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -247,7 +289,7 @@ impl Tool for GitAdd {
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Files to stage (use [\".\"] for all)"
+                    "description": "Specific file paths to stage (never use \".\" unless user asked to stage all)"
                 }
             },
             "required": ["paths"]
@@ -294,7 +336,8 @@ impl Tool for GitCommit {
     }
 
     fn description(&self) -> &'static str {
-        "Commit staged changes with a message."
+        "Commit already-staged changes only. Does not stage new files — use git_add first only \
+         when the user asked to stage specific paths."
     }
 
     fn input_schema(&self) -> Value {
@@ -319,6 +362,120 @@ impl Tool for GitCommit {
             .as_str()
             .ok_or_else(|| AppError::InvalidRequest("message is required".into()))?;
         let output = run_git(&self.root, &["commit", "-m", message]).await?;
+        Ok(json!({ "output": output.trim() }))
+    }
+}
+
+pub struct GitReset {
+    root: Arc<PathBuf>,
+}
+
+impl GitReset {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitReset {
+    fn name(&self) -> &'static str {
+        "git_reset"
+    }
+
+    fn description(&self) -> &'static str {
+        "Unstage files (git reset HEAD). Use to undo staging when the user wants only staged \
+         files committed or rejected a broad git add."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Files to unstage; omit or use [\".\"] to unstage all"
+                }
+            }
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
+        let paths = input.get("paths").and_then(|p| p.as_array());
+        let mut args: Vec<String> = vec!["reset".into(), "HEAD".into()];
+        if let Some(paths) = paths {
+            if !paths.is_empty() {
+                args.push("--".into());
+                for p in paths {
+                    if let Some(s) = p.as_str() {
+                        args.push(s.into());
+                    }
+                }
+            }
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git(&self.root, &arg_refs).await?;
+        Ok(json!({ "unstaged": true }))
+    }
+}
+
+pub struct GitPush {
+    root: Arc<PathBuf>,
+}
+
+impl GitPush {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitPush {
+    fn name(&self) -> &'static str {
+        "git_push"
+    }
+
+    fn description(&self) -> &'static str {
+        "Push committed changes to the remote. Only when the user asked to push."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "remote": { "type": "string", "description": "Remote name (default: origin)" },
+                "branch": { "type": "string", "description": "Branch to push (default: current)" },
+                "set_upstream": { "type": "boolean", "description": "Use -u on first push" }
+            }
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
+        let remote = input["remote"].as_str().unwrap_or("origin");
+        let set_upstream = input["set_upstream"].as_bool().unwrap_or(false);
+        let mut args = vec!["push"];
+        if set_upstream {
+            args.push("-u");
+        }
+        args.push(remote);
+        if let Some(branch) = input["branch"].as_str() {
+            args.push(branch);
+        }
+        let output = run_git(&self.root, &args).await?;
         Ok(json!({ "output": output.trim() }))
     }
 }
