@@ -52,10 +52,6 @@ pub struct ModelInfo {
     /// Empty when the upstream `/models` endpoint does not report them.
     #[serde(default)]
     pub capabilities: Vec<String>,
-    /// True when this is the platform's free / "Auto" model. Lets the UI surface
-    /// and search it by its friendly label without hardcoding its engine id.
-    #[serde(default)]
-    pub free: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

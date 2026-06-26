@@ -42,57 +42,6 @@ fn completion_model() -> String {
         .unwrap_or_else(|| DEFAULT_COMPLETION_MODEL.to_string())
 }
 
-/// Even on million-token-window models, resending the whole transcript every turn
-/// is the dominant token cost of a long agent run. Compact once the conversation
-/// crosses this absolute budget regardless of how large the model's window is, so
-/// Gemini (1M window) doesn't quietly resend ~850k tokens per turn before its 85%
-/// threshold kicks in.
-const MAX_CONTEXT_TOKENS_BEFORE_COMPACT: usize = 200_000;
-
-/// A single tool result kept verbatim in history is re-sent on every subsequent
-/// turn, so one giant `read_file`/`run_command` dump inflates every later request.
-/// Clip oversized results (head + tail, with a marker) before they enter history;
-/// the FULL output is still streamed to the UI via the `ToolResult` event.
-const MAX_TOOL_RESULT_CHARS: usize = 16_000;
-const TOOL_RESULT_HEAD_CHARS: usize = 12_000;
-const TOOL_RESULT_TAIL_CHARS: usize = 2_000;
-
-fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
-fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    idx
-}
-
-/// Clip an oversized serialized tool result for the model's context, keeping the
-/// head and tail (the most useful parts) and noting how much was elided.
-fn cap_tool_result_for_history(s: String) -> String {
-    if s.len() <= MAX_TOOL_RESULT_CHARS {
-        return s;
-    }
-    let head_end = floor_char_boundary(&s, TOOL_RESULT_HEAD_CHARS);
-    let tail_start = ceil_char_boundary(&s, s.len().saturating_sub(TOOL_RESULT_TAIL_CHARS));
-    if tail_start <= head_end {
-        return s;
-    }
-    let omitted = tail_start - head_end;
-    format!(
-        "{}\n\n…[{omitted} characters truncated to save context; the full output is shown in the UI]…\n\n{}",
-        &s[..head_end],
-        &s[tail_start..]
-    )
-}
-
 pub struct AgentEvent {
     pub kind: AgentEventKind,
     pub content: Option<String>,
@@ -388,9 +337,6 @@ async fn agent_loop(
     const ABSOLUTE_MAX_ITERATIONS: u32 = 200;
     const MAX_STALL_ROUNDS: u32 = 3;
     const STEP_EXTENSION: u32 = 40;
-    // Loop/repeat guard thresholds (see `last_iter_sig` below).
-    const REPEAT_STOP_TOOLS: u32 = 2; // stop on the 3rd identical tool turn in a row
-    const REPEAT_STOP_TEXT: u32 = 1; // stop on the 2nd identical no-tool answer
     let task_ctx = resolve_task_context(session, task);
     let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
     let mut force_continue = 0u32;
@@ -403,15 +349,6 @@ async fn agent_loop(
     // instead of forcing forever.
     let mut stall_rounds = 0u32;
     let mut last_missing: Vec<String> = Vec::new();
-    // Loop/repeat guard. Catches the model emitting a byte-identical action on
-    // consecutive turns — re-running the SAME tool call (e.g. re-writing the same
-    // file) or re-emitting the SAME answer text. Without this, a repeated write
-    // bumps `work_total`, which resets stall detection, so the agent can redo
-    // finished work up to MAX_FORCE_CONTINUE times. We (a) never count an identical
-    // repeat as progress, (b) nudge once to break the loop, and (c) hard-stop after
-    // a couple of identical turns (thresholds REPEAT_STOP_* declared above).
-    let mut last_iter_sig: Option<u64> = None;
-    let mut repeat_rounds = 0u32;
 
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
@@ -550,11 +487,7 @@ async fn agent_loop(
         let ctx_limit = crate::context::context_window_for(&session.model);
         let tool_tokens = crate::context::count_tool_definition_tokens(&tool_defs);
         #[allow(clippy::cast_precision_loss)]
-        // Compact at 85% of the model's window OR an absolute budget, whichever is
-        // smaller — so huge-window models (Gemini = 1M) don't resend a giant
-        // transcript every turn before their percentage threshold would trigger.
-        let summarize_threshold =
-            ((ctx_limit as f32 * 0.85) as usize).min(MAX_CONTEXT_TOKENS_BEFORE_COMPACT);
+        let summarize_threshold = (ctx_limit as f32 * 0.85) as usize;
         // Summarize-and-refeed: never trim. Keep compressing the older middle until
         // we're back under 85% of the model's real window, or a pass can no longer
         // compress anything (guarantees termination even if the recent tail alone
@@ -618,38 +551,6 @@ async fn agent_loop(
             }
         }
 
-        // Loop guard: detect an action byte-identical to the previous turn.
-        let iter_sig = iteration_signature(&response);
-        let is_repeat = iter_sig.is_some() && iter_sig == last_iter_sig;
-        if is_repeat {
-            repeat_rounds += 1;
-        } else {
-            repeat_rounds = 0;
-        }
-        if iter_sig.is_some() {
-            last_iter_sig = iter_sig;
-        }
-        let repeat_limit = if response.tool_calls.is_empty() {
-            REPEAT_STOP_TEXT
-        } else {
-            REPEAT_STOP_TOOLS
-        };
-        if repeat_rounds >= repeat_limit {
-            // The model is spinning on the same step. Drop the superseded draft and
-            // finish with the last substantive thing it said.
-            on_event(AgentEvent {
-                kind: AgentEventKind::DiscardDraft,
-                content: None,
-            });
-            let msg = if last_text.trim().is_empty() {
-                "I stopped because I was repeating the same step without making new progress."
-                    .to_string()
-            } else {
-                last_text.clone()
-            };
-            return finish_agent(session, Some(msg), memory, provider, iterations, on_event).await;
-        }
-
         if enable_thinking {
             if let Some(text) = &response.content {
                 emit_thinking_events(text, on_event);
@@ -658,28 +559,6 @@ async fn agent_loop(
 
         if response.tool_calls.is_empty() {
             let content_txt = response.content.as_deref().unwrap_or("");
-
-            // Prose deliverable (PR description, commit message, release notes, …): the
-            // answer IS the text the model just wrote — there are no workspace changes to
-            // verify. If it produced a substantive reply and made no edits, accept it and
-            // STOP. Running the strict diff-aware reviewer here would never see a file
-            // change, so it would force-continue and re-emit the same text over and over.
-            if auto_complete
-                && task_ctx.prose_deliverable
-                && work_total == 0
-                && !content_txt.trim().is_empty()
-                && !looks_like_user_question(content_txt)
-            {
-                return finish_agent(
-                    session,
-                    response.content,
-                    memory,
-                    provider,
-                    iterations,
-                    on_event,
-                )
-                .await;
-            }
 
             // Auto-complete: the worker stopped calling tools, so it is implicitly claiming the
             // task is done. A strict, diff-aware reviewer independently checks the result against
@@ -820,31 +699,17 @@ async fn agent_loop(
 
         // The model is making progress (it called tools), so refill the nudge budget
         // and stop forcing tool calls: the limit is for consecutive empty replies,
-        // not the whole run. An identical repeat is NOT progress — counting it would
-        // reset stall detection and let the agent redo the same work indefinitely.
+        // not the whole run.
         nudge_count = 0;
-        if !is_repeat {
-            work_total += response
-                .tool_calls
-                .iter()
-                .filter(|tc| counts_as_work_progress(&tc.name, &tc.arguments))
-                .count();
-        }
+        work_total += response
+            .tool_calls
+            .iter()
+            .filter(|tc| counts_as_work_progress(&tc.name, &tc.arguments))
+            .count();
         session.push_message(ToolMessage::assistant_tool_calls(
             response.tool_calls.clone(),
         ));
         execute_tool_calls(&response.tool_calls, registry, options, session, on_event).await;
-
-        if is_repeat {
-            // One identical repeat (below the hard stop): tell the model plainly so it
-            // can break the loop on the next turn instead of redoing the same step.
-            session.push_message(ToolMessage::system(
-                "That step was identical to your previous one and has already taken effect. \
-                 Do NOT repeat it. Either perform the NEXT remaining step, or — if everything \
-                 the task asked for is done — stop and reply with a brief final summary."
-                    .to_string(),
-            ));
-        }
 
         if enable_thinking {
             session.push_message(ToolMessage::system(thinking::REFLECTION_PROMPT.to_string()));
@@ -977,44 +842,6 @@ fn is_stalled(
     *stall_rounds >= max_stall
 }
 
-/// A stable fingerprint of one model turn, used to detect a spinning loop where
-/// the model redoes the identical action. When the turn has tool calls, only the
-/// calls matter (name + canonical args) — narration around them often varies even
-/// when the action is the same. With no tool calls, the normalized answer text is
-/// the fingerprint. Returns None for an empty turn (nothing to compare).
-fn iteration_signature(response: &ToolChatResponse) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    if response.tool_calls.is_empty() {
-        let text = response.content.as_deref().unwrap_or("").trim();
-        if text.is_empty() {
-            return None;
-        }
-        "text".hash(&mut h);
-        normalize_for_sig(text).hash(&mut h);
-    } else {
-        "tools".hash(&mut h);
-        for c in &response.tool_calls {
-            c.name.hash(&mut h);
-            // serde_json sorts object keys by default, so this is canonical for
-            // identical argument sets.
-            serde_json::to_string(&c.arguments)
-                .unwrap_or_default()
-                .hash(&mut h);
-        }
-    }
-    Some(h.finish())
-}
-
-/// Normalize text for repeat comparison: collapse whitespace and lowercase, so
-/// trivial reformatting doesn't hide that the same answer was produced again.
-fn normalize_for_sig(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 /// Render the reviewer's outstanding items as a short bullet list for prompts/events.
 fn format_missing(missing: &[String]) -> String {
     if missing.is_empty() {
@@ -1101,10 +928,6 @@ struct TaskContext {
     is_follow_up: bool,
     /// True when the effective task expects file/shell mutations (not explain-only).
     requires_tools: bool,
-    /// True when the deliverable is prose the user reads/copies (PR description,
-    /// commit message, etc.) — satisfied by the text itself, with no workspace
-    /// changes to verify, so it must not be force-continued by the diff reviewer.
-    prose_deliverable: bool,
 }
 
 /// Ask the same model, acting as a strict completion reviewer ("manager"), whether the active
@@ -1214,107 +1037,8 @@ fn last_substantive_user_task(messages: &[ToolMessage]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Requests whose deliverable is prose the user will read or copy — a PR/MR
-/// description, commit message, release notes, etc. These are satisfied by the
-/// text the model writes; there are NO file or shell changes to make, so the
-/// diff-aware completion reviewer must not force them to keep going. Distinct
-/// from "write a file/function/test", which genuinely needs tools.
-fn looks_like_prose_deliverable(task: &str) -> bool {
-    let lower = task.to_lowercase();
-
-    // Unambiguous prose artifacts — always prose, whatever verb is used.
-    const STRONG: &[&str] = &[
-        "pr description",
-        "pr desc",
-        "pr message",
-        "pr summary",
-        "pull request description",
-        "pull-request description",
-        "merge request description",
-        "mr description",
-        "commit message",
-        "release notes",
-    ];
-    if STRONG.iter().any(|p| lower.contains(p)) {
-        return true;
-    }
-
-    // "write / draft / compose / give me a <prose-noun>" — but NOT when the object
-    // is clearly a file, code, or something written to disk (those need tools).
-    let has_gen_verb = [
-        "write ",
-        "draft ",
-        "compose ",
-        "give me ",
-        "generate ",
-        "rewrite ",
-        "reword ",
-        "rephrase ",
-        "summarize ",
-        "summarise ",
-    ]
-    .iter()
-    .any(|v| lower.contains(v));
-    if !has_gen_verb {
-        return false;
-    }
-    let has_prose_noun = [
-        "description",
-        "message",
-        "summary",
-        "blurb",
-        "paragraph",
-        "reply",
-        "response",
-        "email",
-        "caption",
-        "tagline",
-        "headline",
-        "explanation",
-        "write-up",
-        "writeup",
-    ]
-    .iter()
-    .any(|n| lower.contains(n));
-    if !has_prose_noun {
-        return false;
-    }
-    let targets_file_or_code = [
-        "file",
-        "function",
-        "class",
-        "method",
-        "module",
-        "test",
-        "script",
-        "config",
-        "endpoint",
-        "component",
-        "schema",
-        "migration",
-        "readme",
-        "changelog",
-        "docstring",
-        "doc string",
-        "to disk",
-        "into ",
-        ".md",
-        ".py",
-        ".rs",
-        ".ts",
-        ".js",
-        ".json",
-        ".yml",
-        ".yaml",
-        ".txt",
-    ]
-    .iter()
-    .any(|c| lower.contains(c));
-    !targets_file_or_code
-}
-
 fn task_requires_tools(task: &str) -> bool {
-    if looks_like_info_request(task) || looks_like_prose_deliverable(task) {
+    if looks_like_info_request(task) {
         return false;
     }
     let lower = task.to_lowercase();
@@ -1355,13 +1079,11 @@ fn resolve_task_context(session: &Session, current: &str) -> TaskContext {
         current.to_string()
     };
     let requires_tools = task_requires_tools(&effective_task);
-    let prose_deliverable = looks_like_prose_deliverable(&effective_task);
     TaskContext {
         current_input: current.to_string(),
         effective_task,
         is_follow_up,
         requires_tools,
-        prose_deliverable,
     }
 }
 
@@ -1980,10 +1702,7 @@ async fn execute_tool_calls(
         });
 
         let result_str = serde_json::to_string(&result).unwrap_or_default();
-        session.push_message(ToolMessage::tool_result(
-            &call.id,
-            cap_tool_result_for_history(result_str),
-        ));
+        session.push_message(ToolMessage::tool_result(&call.id, result_str));
     }
 }
 
@@ -2088,31 +1807,6 @@ mod task_context_tests {
     }
 
     #[test]
-    fn small_tool_results_are_untouched() {
-        let s = "small output".to_string();
-        assert_eq!(cap_tool_result_for_history(s.clone()), s);
-    }
-
-    #[test]
-    fn large_tool_results_are_clipped_with_marker() {
-        let big = "x".repeat(MAX_TOOL_RESULT_CHARS + 50_000);
-        let out = cap_tool_result_for_history(big.clone());
-        assert!(out.len() < big.len());
-        assert!(out.contains("characters truncated"));
-        // Head and tail are preserved.
-        assert!(out.starts_with(&"x".repeat(100)));
-        assert!(out.ends_with(&"x".repeat(100)));
-    }
-
-    #[test]
-    fn clipping_respects_utf8_boundaries() {
-        // Multi-byte chars must not be split mid-codepoint (would panic on slice).
-        let big = "é".repeat(MAX_TOOL_RESULT_CHARS);
-        let out = cap_tool_result_for_history(big);
-        assert!(out.contains("characters truncated"));
-    }
-
-    #[test]
     fn completion_verdict_when_unverified() {
         let v = CompletionVerdict {
             done: false,
@@ -2124,14 +1818,12 @@ mod task_context_tests {
             effective_task: "x".into(),
             is_follow_up: false,
             requires_tools: true,
-            prose_deliverable: false,
         }));
         let ctx = TaskContext {
             current_input: "commit".into(),
             effective_task: "commit and push".into(),
             is_follow_up: false,
             requires_tools: true,
-            prose_deliverable: false,
         };
         assert!(completion_accepted(&v, 1, &Session::new("getaibd", "test", std::path::PathBuf::from("/tmp")), &ctx));
     }
@@ -2147,94 +1839,5 @@ mod task_context_tests {
     #[test]
     fn commit_tasks_require_tools() {
         assert!(task_requires_tools("commit and push staged files"));
-    }
-
-    #[test]
-    fn prose_deliverables_do_not_require_tools() {
-        // The reported bug: "write a brief PR description" is prose, not a file edit,
-        // so it must not be force-continued by the diff-aware completion reviewer.
-        assert!(looks_like_prose_deliverable("write a brief PR description"));
-        assert!(looks_like_prose_deliverable("draft a PR desc for this change"));
-        assert!(looks_like_prose_deliverable("write the commit message"));
-        assert!(looks_like_prose_deliverable("generate release notes"));
-        assert!(!task_requires_tools("write a brief PR description"));
-        assert!(!task_requires_tools("write the commit message"));
-
-        // Real tool work is still classified as needing tools.
-        assert!(!looks_like_prose_deliverable("write a config file"));
-        assert!(task_requires_tools("write the auth middleware"));
-        assert!(task_requires_tools("write unit tests for the parser"));
-    }
-
-    #[test]
-    fn resolve_marks_prose_deliverable() {
-        let session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
-        let ctx = resolve_task_context(&session, "write a brief PR description");
-        assert!(ctx.prose_deliverable);
-        assert!(!ctx.requires_tools);
-    }
-
-    #[test]
-    fn broadened_prose_matcher() {
-        // Generic prose deliverables now match.
-        assert!(looks_like_prose_deliverable("write a short summary of the changes"));
-        assert!(looks_like_prose_deliverable("draft a reply to this issue"));
-        assert!(looks_like_prose_deliverable("compose a release email"));
-        // …but not when the object is clearly a file or code (those need tools).
-        assert!(!looks_like_prose_deliverable("write a description into the README file"));
-        assert!(!looks_like_prose_deliverable("write the error message in utils.py"));
-        assert!(!looks_like_prose_deliverable("write a docstring for this function"));
-        // No prose noun → not a prose deliverable.
-        assert!(!looks_like_prose_deliverable("write the login handler"));
-    }
-
-    fn tool_call(name: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall {
-            id: "1".into(),
-            name: name.into(),
-            arguments: args,
-            extra: None,
-        }
-    }
-
-    fn resp(content: Option<&str>, calls: Vec<ToolCall>) -> ToolChatResponse {
-        ToolChatResponse {
-            content: content.map(str::to_string),
-            tool_calls: calls,
-            usage: None,
-        }
-    }
-
-    #[test]
-    fn identical_tool_turns_share_a_signature() {
-        let a = resp(
-            Some("writing the file"),
-            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "x"}))],
-        );
-        let b = resp(
-            Some("different narration, same action"),
-            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "x"}))],
-        );
-        // Narration differs but the action is identical → same signature.
-        assert_eq!(iteration_signature(&a), iteration_signature(&b));
-
-        let c = resp(
-            None,
-            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "DIFFERENT"}))],
-        );
-        assert_ne!(iteration_signature(&a), iteration_signature(&c));
-    }
-
-    #[test]
-    fn text_signature_ignores_whitespace_and_case() {
-        let a = resp(Some("Here is the answer."), vec![]);
-        let b = resp(Some("here   is the   ANSWER."), vec![]);
-        assert_eq!(iteration_signature(&a), iteration_signature(&b));
-    }
-
-    #[test]
-    fn empty_turn_has_no_signature() {
-        assert!(iteration_signature(&resp(None, vec![])).is_none());
-        assert!(iteration_signature(&resp(Some("   "), vec![])).is_none());
     }
 }
