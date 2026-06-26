@@ -4,6 +4,14 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.6.1]
+
+- **Fix: agent no longer repeats a finished answer** — for prose deliverables (a PR/MR
+  description, commit message, release notes, etc.) the model's text *is* the result, so the
+  agent now accepts it and stops. Previously these tasks were misread as needing file changes,
+  so the completion reviewer — which trusts workspace diffs — kept force-continuing and
+  re-emitting the same answer over and over.
+
 ## [0.6.0]
 
 - **Big token-usage reduction** — large tool outputs (full-file `read_file`, noisy

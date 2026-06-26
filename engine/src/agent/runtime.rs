@@ -615,6 +615,28 @@ async fn agent_loop(
         if response.tool_calls.is_empty() {
             let content_txt = response.content.as_deref().unwrap_or("");
 
+            // Prose deliverable (PR description, commit message, release notes, …): the
+            // answer IS the text the model just wrote — there are no workspace changes to
+            // verify. If it produced a substantive reply and made no edits, accept it and
+            // STOP. Running the strict diff-aware reviewer here would never see a file
+            // change, so it would force-continue and re-emit the same text over and over.
+            if auto_complete
+                && task_ctx.prose_deliverable
+                && work_total == 0
+                && !content_txt.trim().is_empty()
+                && !looks_like_user_question(content_txt)
+            {
+                return finish_agent(
+                    session,
+                    response.content,
+                    memory,
+                    provider,
+                    iterations,
+                    on_event,
+                )
+                .await;
+            }
+
             // Auto-complete: the worker stopped calling tools, so it is implicitly claiming the
             // task is done. A strict, diff-aware reviewer independently checks the result against
             // the ORIGINAL task AND the real workspace changes. If genuinely complete the agent
@@ -983,6 +1005,10 @@ struct TaskContext {
     is_follow_up: bool,
     /// True when the effective task expects file/shell mutations (not explain-only).
     requires_tools: bool,
+    /// True when the deliverable is prose the user reads/copies (PR description,
+    /// commit message, etc.) — satisfied by the text itself, with no workspace
+    /// changes to verify, so it must not be force-continued by the diff reviewer.
+    prose_deliverable: bool,
 }
 
 /// Ask the same model, acting as a strict completion reviewer ("manager"), whether the active
@@ -1092,8 +1118,31 @@ fn last_substantive_user_task(messages: &[ToolMessage]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Requests whose deliverable is prose the user will read or copy — a PR/MR
+/// description, commit message, release notes, etc. These are satisfied by the
+/// text the model writes; there are NO file or shell changes to make, so the
+/// diff-aware completion reviewer must not force them to keep going. Distinct
+/// from "write a file/function/test", which genuinely needs tools.
+fn looks_like_prose_deliverable(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    [
+        "pr description",
+        "pr desc",
+        "pr message",
+        "pr summary",
+        "pull request description",
+        "pull-request description",
+        "merge request description",
+        "mr description",
+        "commit message",
+        "release notes",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+}
+
 fn task_requires_tools(task: &str) -> bool {
-    if looks_like_info_request(task) {
+    if looks_like_info_request(task) || looks_like_prose_deliverable(task) {
         return false;
     }
     let lower = task.to_lowercase();
@@ -1134,11 +1183,13 @@ fn resolve_task_context(session: &Session, current: &str) -> TaskContext {
         current.to_string()
     };
     let requires_tools = task_requires_tools(&effective_task);
+    let prose_deliverable = looks_like_prose_deliverable(&effective_task);
     TaskContext {
         current_input: current.to_string(),
         effective_task,
         is_follow_up,
         requires_tools,
+        prose_deliverable,
     }
 }
 
@@ -1901,12 +1952,14 @@ mod task_context_tests {
             effective_task: "x".into(),
             is_follow_up: false,
             requires_tools: true,
+            prose_deliverable: false,
         }));
         let ctx = TaskContext {
             current_input: "commit".into(),
             effective_task: "commit and push".into(),
             is_follow_up: false,
             requires_tools: true,
+            prose_deliverable: false,
         };
         assert!(completion_accepted(&v, 1, &Session::new("getaibd", "test", std::path::PathBuf::from("/tmp")), &ctx));
     }
@@ -1922,5 +1975,30 @@ mod task_context_tests {
     #[test]
     fn commit_tasks_require_tools() {
         assert!(task_requires_tools("commit and push staged files"));
+    }
+
+    #[test]
+    fn prose_deliverables_do_not_require_tools() {
+        // The reported bug: "write a brief PR description" is prose, not a file edit,
+        // so it must not be force-continued by the diff-aware completion reviewer.
+        assert!(looks_like_prose_deliverable("write a brief PR description"));
+        assert!(looks_like_prose_deliverable("draft a PR desc for this change"));
+        assert!(looks_like_prose_deliverable("write the commit message"));
+        assert!(looks_like_prose_deliverable("generate release notes"));
+        assert!(!task_requires_tools("write a brief PR description"));
+        assert!(!task_requires_tools("write the commit message"));
+
+        // Real tool work is still classified as needing tools.
+        assert!(!looks_like_prose_deliverable("write a config file"));
+        assert!(task_requires_tools("write the auth middleware"));
+        assert!(task_requires_tools("write unit tests for the parser"));
+    }
+
+    #[test]
+    fn resolve_marks_prose_deliverable() {
+        let session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        let ctx = resolve_task_context(&session, "write a brief PR description");
+        assert!(ctx.prose_deliverable);
+        assert!(!ctx.requires_tools);
     }
 }
