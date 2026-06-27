@@ -249,11 +249,36 @@ struct CompatToolCallFunction {
     arguments: String,
 }
 
+/// OpenAI chat `content`: either a plain string or an array of typed parts
+/// (`text` + `image_url`) for multimodal/vision requests. Untagged so it
+/// serializes to exactly the OpenAI wire shape and deserializes string replies.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum CompatContent {
+    Text(String),
+    Parts(Vec<serde_json::Value>),
+}
+
+impl CompatContent {
+    /// The textual portion. Model replies are plain strings; for a parts array
+    /// (only sent on our side) concatenate the text blocks.
+    fn into_text(self) -> String {
+        match self {
+            CompatContent::Text(s) => s,
+            CompatContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct CompatMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<CompatContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<CompatToolCallResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +300,13 @@ struct CompatChoice {
 #[derive(Deserialize)]
 struct CompatDelta {
     content: Option<String>,
+    // Thinking models stream chain-of-thought in a separate field rather than inside
+    // the visible content. Capture both common spellings so it can be routed to the
+    // reasoning channel instead of being dropped (or worse, leaking into the answer).
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<CompatStreamToolCall>>,
 }
@@ -325,18 +357,38 @@ impl From<&Message> for CompatMessage {
     fn from(m: &Message) -> Self {
         Self {
             role: m.role.clone(),
-            content: Some(m.content.clone()),
+            content: Some(CompatContent::Text(m.content.clone())),
             tool_calls: None,
             tool_call_id: None,
         }
     }
 }
 
+/// Build OpenAI multimodal content from a user turn's text + attached images.
+/// Returns a plain `Text` when there are no images so non-vision turns keep the
+/// simple string shape (and stay cacheable).
+fn tool_message_content(m: &ToolMessage) -> Option<CompatContent> {
+    if m.images.is_empty() {
+        return m.content.clone().map(CompatContent::Text);
+    }
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    if let Some(text) = m.content.as_deref().filter(|t| !t.is_empty()) {
+        parts.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for url in &m.images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": url },
+        }));
+    }
+    Some(CompatContent::Parts(parts))
+}
+
 impl From<&ToolMessage> for CompatMessage {
     fn from(m: &ToolMessage) -> Self {
         Self {
             role: m.role.clone(),
-            content: m.content.clone(),
+            content: tool_message_content(m),
             tool_calls: m.tool_calls.as_ref().map(|v| {
                 v.iter()
                     .map(|tc| CompatToolCallResponse {
@@ -404,6 +456,12 @@ impl Provider for OpenAiCompatProvider {
         #[derive(Deserialize)]
         struct ModelEntry {
             id: String,
+            /// Friendly catalog display name (e.g. the family name); falls back to id.
+            #[serde(default)]
+            name: Option<String>,
+            /// True for the platform's free / "Auto" model.
+            #[serde(default)]
+            free: bool,
             #[serde(default)]
             capabilities: Vec<String>,
             /// Real context window (tokens) from the catalog; 0/absent when unknown.
@@ -428,10 +486,12 @@ impl Provider for OpenAiCompatProvider {
                 // Cache the catalog's real context window so the agent loop can use
                 // it instead of guessing from the model name.
                 crate::context::record_model_window(&m.id, m.context_window);
+                let name = m.name.filter(|s| !s.is_empty()).unwrap_or_else(|| m.id.clone());
                 ModelInfo {
-                    name: m.id.clone(),
                     id: m.id,
+                    name,
                     capabilities: m.capabilities,
+                    free: m.free,
                 }
             })
             .collect();
@@ -482,6 +542,7 @@ impl Provider for OpenAiCompatProvider {
             .first()
             .and_then(|c| c.message.as_ref())
             .and_then(|m| m.content.clone())
+            .map(CompatContent::into_text)
             .unwrap_or_default();
 
         Ok(ChatResponse {
@@ -652,7 +713,8 @@ impl Provider for OpenAiCompatProvider {
         let choice = resp.choices.first();
         let content = choice
             .and_then(|c| c.message.as_ref())
-            .and_then(|m| m.content.clone());
+            .and_then(|m| m.content.clone())
+            .map(CompatContent::into_text);
         let tool_calls: Vec<ToolCall> = choice
             .and_then(|c| c.message.as_ref())
             .and_then(|m| m.tool_calls.as_ref())
@@ -802,6 +864,11 @@ impl Provider for OpenAiCompatProvider {
                     if let Ok(chunk) = serde_json::from_str::<CompatStreamChunk>(data) {
                         if let Some(choice) = chunk.choices.first() {
                             if let Some(delta) = &choice.delta {
+                                if let Some(reasoning) = delta.reasoning_content.as_ref().or(delta.reasoning.as_ref()) {
+                                    if !reasoning.is_empty() {
+                                        yield ToolStreamDelta::Reasoning(reasoning.clone());
+                                    }
+                                }
                                 if let Some(content) = &delta.content {
                                     if !content.is_empty() {
                                         yield ToolStreamDelta::Token(content.clone());
@@ -875,6 +942,45 @@ mod compat_tests {
             compress: false,
             cache_session_id: None,
         }
+    }
+
+    #[test]
+    fn user_turn_without_images_serializes_as_plain_string() {
+        let msg = ToolMessage::user("hello");
+        let v = serde_json::to_value(CompatMessage::from(&msg)).unwrap();
+        assert_eq!(v["content"], serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn user_turn_with_images_serializes_as_multimodal_parts() {
+        let msg = ToolMessage::user_with_images(
+            "what is this?",
+            vec!["data:image/png;base64,AAAA".into()],
+        );
+        let v = serde_json::to_value(CompatMessage::from(&msg)).unwrap();
+        let parts = v["content"].as_array().expect("content must be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn image_only_turn_omits_empty_text_part() {
+        let msg = ToolMessage::user_with_images("", vec!["data:image/png;base64,AAAA".into()]);
+        let v = serde_json::to_value(CompatMessage::from(&msg)).unwrap();
+        let parts = v["content"].as_array().expect("content must be an array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn string_response_content_parses_back_to_text() {
+        // The model replies with a plain string; CompatContent must round-trip it.
+        let raw = serde_json::json!({"role": "assistant", "content": "done"});
+        let m: CompatMessage = serde_json::from_value(raw).unwrap();
+        assert_eq!(m.content.map(CompatContent::into_text).as_deref(), Some("done"));
     }
 
     #[test]

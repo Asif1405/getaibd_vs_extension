@@ -1,6 +1,23 @@
 import { getServerUrl, getBaseUrl, authHeaders } from "./util/config";
 import { describeEnvironment } from "./util/environment";
 
+/** fetch() with a hard timeout so a stalled request can never hang the caller
+ * (a plain fetch only rejects when the socket itself gives up, which may be
+ * minutes — long enough to freeze the boot overlay on "Getting ready…"). */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 10000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface AccountStatus {
   free: boolean;
   creditsBalance: number | null;
@@ -13,7 +30,7 @@ export interface AccountStatus {
 /** Fetches the GetAIBD balance (or free-tier usage) straight from the platform. */
 export async function fetchAccountStatus(apiKey: string): Promise<AccountStatus | null> {
   try {
-    const resp = await fetch(`${getBaseUrl()}/balance`, {
+    const resp = await fetchWithTimeout(`${getBaseUrl()}/balance`, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
     if (!resp.ok) {
@@ -49,6 +66,8 @@ export interface ModelInfo {
   id: string;
   name: string;
   capabilities?: string[];
+  /** True for the platform's free / "Auto" model (from the catalog `free` flag). */
+  free?: boolean;
 }
 
 export interface ChatMessage {
@@ -68,7 +87,7 @@ export interface ChatResponse {
 }
 
 export async function fetchProviders(): Promise<ProviderInfo[]> {
-  const resp = await fetch(`${getServerUrl()}/providers`, { headers: authHeaders() });
+  const resp = await fetchWithTimeout(`${getServerUrl()}/providers`, { headers: authHeaders() });
   if (!resp.ok) {
     throw new Error(`Failed to fetch providers: ${resp.status}`);
   }
@@ -76,7 +95,9 @@ export async function fetchProviders(): Promise<ProviderInfo[]> {
 }
 
 export async function fetchModels(providerId: string): Promise<ModelInfo[]> {
-  const resp = await fetch(`${getServerUrl()}/providers/${providerId}/models`, { headers: authHeaders() });
+  const resp = await fetchWithTimeout(`${getServerUrl()}/providers/${providerId}/models`, {
+    headers: authHeaders(),
+  });
   if (!resp.ok) {
     throw new Error(`Failed to fetch models: ${resp.status}`);
   }
@@ -317,6 +338,8 @@ export function streamAgent(
     workspaceCwd?: string;
     /** Per-workspace chat id for GetAIBD prompt-cache sticky routing. */
     cacheSessionId?: string;
+    /** Base64 `data:` image URLs attached to this turn (vision-capable models). */
+    images?: string[];
   },
 ): AbortController {
   const controller = new AbortController();
@@ -337,6 +360,7 @@ export function streamAgent(
       if (options?.userRules?.trim()) {body.user_rules = options.userRules.trim();}
       if (options?.workspaceCwd?.trim()) {body.workspace_cwd = options.workspaceCwd.trim();}
       if (options?.cacheSessionId?.trim()) {body.cache_session_id = options.cacheSessionId.trim();}
+      if (options?.images?.length) {body.images = options.images;}
 
       const resp = await fetch(`${getServerUrl()}/agent/run`, {
         method: "POST",
@@ -537,6 +561,8 @@ export function streamOrchestrated(
     workspaceCwd?: string;
     /** Per-workspace chat id for GetAIBD prompt-cache sticky routing. */
     cacheSessionId?: string;
+    /** Base64 `data:` image URLs attached to this turn (vision-capable models). */
+    images?: string[];
   },
 ): AbortController {
   const controller = new AbortController();
@@ -563,6 +589,7 @@ export function streamOrchestrated(
       if (options?.userRules?.trim()) {body.user_rules = options.userRules.trim();}
       if (options?.workspaceCwd?.trim()) {body.workspace_cwd = options.workspaceCwd.trim();}
       if (options?.cacheSessionId?.trim()) {body.cache_session_id = options.cacheSessionId.trim();}
+      if (options?.images?.length) {body.images = options.images;}
 
       const resp = await fetch(`${getServerUrl()}/agent/orchestrated`, {
         method: "POST",

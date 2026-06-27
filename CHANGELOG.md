@@ -4,14 +4,181 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
-## [0.6.3]
+## [0.7.0]
 
-- **Revert to the v0.5.0 agent runtime** — the v0.6.0 per-turn token cuts (clipping
-  `read_file`/`run_command` results before they entered history) destroyed the agent's
-  working memory of what it had already inspected, so on multi-step tasks it re-explored
-  and re-emitted the same plan repeatedly. The v0.6.1/0.6.2 loop guards only caught
-  byte-identical repeats and didn't cover this case. This release restores the known-good
-  v0.5.0 behavior verbatim; the cost work will be redone without breaking the loop.
+- **Fix the panel hanging on "Getting ready…" / dead webview.** A stray raw
+  newline inside a generated webview string literal (`createTextNode("\n\n")`)
+  made the *entire* inline webview script fail to parse, so nothing ran — the boot
+  overlay never cleared and attach/send/drag-drop were all dead. Now emitted as a
+  valid `"\n\n"`.
+- **Drag-and-drop restored and widened to the whole panel.** Dropping an image or
+  file anywhere in the panel (not just the small composer box) attaches it; OS/
+  Finder drops and VS Code Explorer drags are both handled.
+- **Clear guidance for image-incapable models.** Attaching an image and sending to
+  a text-only model (e.g. DeepSeek) used to fail with an opaque provider `404`.
+  The extension now detects models without image input and asks you to remove the
+  attachment or pick a vision-capable model — your staged images are kept.
+
+## [0.6.14]
+
+- **Drag-and-drop now works across the whole panel.** With the webview script
+  finally executing (see 0.6.13), drag-and-drop is restored and the drop zone is
+  widened from the small composer box to the entire panel — dropping an image or
+  file anywhere (including over the message list) now attaches it. OS/Finder drops
+  (real `File` objects) and VS Code Explorer drags (`text/uri-list` forwarded to
+  the extension host) are both handled.
+
+## [0.6.13]
+
+- **Real root-cause fix for the panel stuck on "Getting ready…".** The webview's
+  entire inline `<script>` was failing to parse with `Uncaught SyntaxError:
+  Invalid or unexpected token` (`index.html:1442`), so *no* webview JS ran at all
+  — no message listener, no `ready` post, no boot watchdog — leaving the spinner
+  up forever (and image attach / send dead too). Cause: the collapsible "thinking"
+  block used `document.createTextNode("\n\n")`, but because the whole page is built
+  from an outer template literal, the `\n` escapes were consumed by the *outer*
+  template and emitted as **raw newlines inside a JS string literal** in the
+  generated webview, which is a hard syntax error. Double-escaped to `"\\n\\n"` so
+  the rendered webview gets a valid `"\n\n"`. The 0.6.9–0.6.12 boot-overlay
+  watchdog work is retained as a safety net, but this parse error was the actual
+  blocker.
+
+## [0.6.12]
+
+- **Actually fix the panel stuck on "Getting ready…" (one-time overlay).** The
+  0.6.11 watchdog was defeated by a webview reload/re-resolve loop: each fresh
+  webview re-ran `onReady`, which re-posted `bootStatus: loading` and *re-armed*
+  the watchdog, so it never fired and the spinner stayed up even though the
+  engine was healthy. The boot overlay is now strictly **one-time**: the watchdog
+  arms once on load and runs to completion (no re-arming), and once the overlay
+  clears (engine ready or watchdog) it is never shown again — subsequent
+  `loading` posts are ignored, and `onReady` goes straight to `ready` after the
+  first boot. Net: a reload loop, a lost `ready` post, or a slow engine can no
+  longer trap the panel.
+
+## [0.6.11]
+
+- **Fix panel permanently stuck on "Getting ready…"** — the engine starts and
+  becomes healthy extension-side, but the overlay was cleared by a single
+  `bootStatus: ready` post. If the Secondary Side Bar webview was swapped or
+  momentarily detached while the engine was still starting (the health check can
+  take ~15s), that one message was lost and the spinner span forever even though
+  the engine was up. The overlay is now **fail-open**: a webview watchdog
+  force-clears it after a grace window beyond the engine's own 30s health
+  timeout, and the extension re-asserts "ready" whenever the panel becomes
+  visible again — so a lost post can no longer trap the panel.
+
+## [0.6.10]
+
+- **Fix extension failing to start on Cursor / VS Code 1.105** — 0.6.9 declared a
+  minimum engine of `^1.106.0` (pulled in when the chat view moved to the Secondary
+  Side Bar, a 1.106-stable contribution point), so editors on the 1.105 base refused
+  to load it ("not compatible with VS Code 1.105.1"). Lowered the required engine
+  back to `^1.105.0` — the same floor as the last known-good build — which still
+  renders the Secondary Side Bar container on those editors.
+
+## [0.6.9]
+
+- **Fix chat stuck on "Getting ready…"** — the boot overlay was gated on network
+  `fetch()` calls (provider list, account status) that had no timeout, so a single
+  stalled request froze the panel on the loading spinner indefinitely. The overlay
+  now clears as soon as the (already time-bounded) engine start and local restores
+  finish; provider/auth loading runs in the background and can no longer block boot.
+  The boot-path fetches also got a hard 10s timeout as a backstop.
+
+## [0.6.8]
+
+- **Fix: a down completion reviewer no longer ends runs with "completion check
+  unavailable — verify work was finished"** — when the lightweight completion-review
+  call fails (e.g. the review model is unavailable for the selected provider), the
+  agent has no independent signal, so it now trusts the model's decision to stop
+  instead of fabricating outstanding items and bailing. Only a *verified* reviewer can
+  force the agent to keep going; an unavailable one no longer traps genuine
+  completions (Q&A/analysis answers, prose deliverables, or runs that already changed
+  the workspace), and an action task that did nothing still gets the normal nudge to
+  actually act.
+- **Fix: the agent stops grepping the whole repo for the file you have open** — in
+  agent mode the currently-open file was excluded from context unless you @-mentioned
+  it, so the agent had to search the repository to rediscover what was already on your
+  screen (often your in-progress attempt). The active file is now handed to the agent
+  up front (skipped only when you've already @-mentioned it), so it starts there.
+- **Fix: model reasoning no longer leaks into the answer** — chain-of-thought (whether
+  emitted as inline `<thinking>`/`<think>`/`<plan>`/`<reflection>` tags or in a separate
+  `reasoning_content` stream field) is now separated from the reply during streaming and
+  shown in a dedicated, collapsible "Thinking" block you can expand and scroll. This is
+  robust to tags that span tokens and to malformed/unclosed tags (which previously leaked
+  raw reasoning, e.g. a stray `</thinking`).
+
+## [0.6.7]
+
+- **Fix: agent no longer hangs forever mid-task ("Agent working…")** — the HTTP client's
+  read timeout only fires when *no bytes* arrive, but a gateway that emits SSE
+  keepalive/heartbeat bytes during a stalled generation kept resetting it while the
+  model produced no real output, so the run could hang indefinitely. The streaming
+  reader now has a delta-level idle watchdog: if no token or tool-call data arrives for
+  300s the turn is treated as a stalled stream and retried once (draft discarded) before
+  surfacing a clean error — instead of spinning at "Agent working…" with no end.
+
+## [0.6.6]
+
+- **Fix: image attachments no longer fail with HTTP 413** — the local engine used
+  Axum's default 2 MB request-body limit, but a base64-encoded image easily exceeds
+  that, so attaching one returned "Failed to buffer the request body: length limit
+  exceeded". The engine now accepts request bodies up to 64 MB.
+- **Fix: drag-and-drop from the VS Code Explorer now works** — Explorer drags carry a
+  URI list rather than real file objects, which the composer's drop handler ignored.
+  It now reads the dropped URIs on the extension host (images become attachments, text
+  files become @context), and OS/Finder file drops keep working as before.
+
+## [0.6.5]
+
+- **Fix: agent no longer loops at the end of long runs** — the stall detector that
+  decides when to stop force-continuing required the completion reviewer's
+  outstanding-items list to be *byte-identical* between reviews. Because that list is
+  free-form text the reviewer re-words every round, the check almost never matched, so
+  on long runs the agent would finish the work and then keep re-investigating up to the
+  hard cap instead of stopping. Stall detection now triggers on the reliable signals —
+  no new substantive work since the last review, or the reviewer reporting *roughly the
+  same* gaps (fuzzy token match, robust to re-wording) — so a run ends promptly once it's
+  genuinely done or stuck.
+
+## [0.6.2]
+
+- **Fix: agent no longer redoes the same step (even file writes)** — a general loop
+  guard now fingerprints each turn and stops the agent when it repeats the identical
+  action (re-running the same tool call / re-writing the same file) or re-emits the
+  same answer. Previously a repeated write counted as "progress" and reset stall
+  detection, so the agent could redo finished work many times. Identical repeats no
+  longer count as progress; the agent gets one corrective nudge, then stops cleanly.
+- **Broader prose-deliverable detection** — "write/draft/compose a description,
+  summary, reply, email, …" is recognized as prose (answered once, not force-continued),
+  while requests that target a file or code (`README`, `.py`, docstring, etc.) still
+  correctly require tools.
+
+## [0.6.1]
+
+- **Fix: agent no longer repeats a finished answer** — for prose deliverables (a PR/MR
+  description, commit message, release notes, etc.) the model's text *is* the result, so the
+  agent now accepts it and stops. Previously these tasks were misread as needing file changes,
+  so the completion reviewer — which trusts workspace diffs — kept force-continuing and
+  re-emitting the same answer over and over.
+
+## [0.6.0]
+
+- **Big token-usage reduction** — large tool outputs (full-file `read_file`, noisy
+  `run_command` dumps) are now clipped (head + tail, with a marker) before they enter the
+  conversation history, so one big result no longer gets re-sent on every later turn. The
+  full output is still shown in the UI.
+- **Context compaction on large-window models** — the agent now compacts once a conversation
+  crosses an absolute token budget, not just 85% of the model window, so million-token-window
+  models (e.g. Gemini) stop quietly resending the whole transcript each turn.
+- **Model picker "Auto" search (real fix)** — the free model is now identified by the
+  catalog's `free` flag rather than a hardcoded id, so searching "Auto" reliably finds it even
+  when the engine serves it under a different name; other model names also display properly.
+- **Queue** — pressing Enter on an empty composer releases the first queued message (runs it
+  now), so a follow-up Enter starts the next in line.
+- Pairs with gateway-side prompt-cache improvements (full static-prefix caching) for further
+  per-turn input savings on multi-step runs.
 
 ## [0.5.0]
 

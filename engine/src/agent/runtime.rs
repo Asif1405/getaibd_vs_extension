@@ -42,6 +42,57 @@ fn completion_model() -> String {
         .unwrap_or_else(|| DEFAULT_COMPLETION_MODEL.to_string())
 }
 
+/// Even on million-token-window models, resending the whole transcript every turn
+/// is the dominant token cost of a long agent run. Compact once the conversation
+/// crosses this absolute budget regardless of how large the model's window is, so
+/// Gemini (1M window) doesn't quietly resend ~850k tokens per turn before its 85%
+/// threshold kicks in.
+const MAX_CONTEXT_TOKENS_BEFORE_COMPACT: usize = 200_000;
+
+/// A single tool result kept verbatim in history is re-sent on every subsequent
+/// turn, so one giant `read_file`/`run_command` dump inflates every later request.
+/// Clip oversized results (head + tail, with a marker) before they enter history;
+/// the FULL output is still streamed to the UI via the `ToolResult` event.
+const MAX_TOOL_RESULT_CHARS: usize = 16_000;
+const TOOL_RESULT_HEAD_CHARS: usize = 12_000;
+const TOOL_RESULT_TAIL_CHARS: usize = 2_000;
+
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Clip an oversized serialized tool result for the model's context, keeping the
+/// head and tail (the most useful parts) and noting how much was elided.
+fn cap_tool_result_for_history(s: String) -> String {
+    if s.len() <= MAX_TOOL_RESULT_CHARS {
+        return s;
+    }
+    let head_end = floor_char_boundary(&s, TOOL_RESULT_HEAD_CHARS);
+    let tail_start = ceil_char_boundary(&s, s.len().saturating_sub(TOOL_RESULT_TAIL_CHARS));
+    if tail_start <= head_end {
+        return s;
+    }
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n\n…[{omitted} characters truncated to save context; the full output is shown in the UI]…\n\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
 pub struct AgentEvent {
     pub kind: AgentEventKind,
     pub content: Option<String>,
@@ -158,7 +209,12 @@ pub async fn run_agent_with_memory(
     }
 
     inject_context(session, task, memory).await;
-    session.push_message(ToolMessage::user(task));
+    let images = std::mem::take(&mut session.pending_user_images);
+    if images.is_empty() {
+        session.push_message(ToolMessage::user(task));
+    } else {
+        session.push_message(ToolMessage::user_with_images(task, images));
+    }
     agent_loop(session, task, provider, registry, memory, options, on_event).await
 }
 
@@ -337,6 +393,9 @@ async fn agent_loop(
     const ABSOLUTE_MAX_ITERATIONS: u32 = 200;
     const MAX_STALL_ROUNDS: u32 = 3;
     const STEP_EXTENSION: u32 = 40;
+    // Loop/repeat guard thresholds (see `last_iter_sig` below).
+    const REPEAT_STOP_TOOLS: u32 = 2; // stop on the 3rd identical tool turn in a row
+    const REPEAT_STOP_TEXT: u32 = 1; // stop on the 2nd identical no-tool answer
     let task_ctx = resolve_task_context(session, task);
     let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
     let mut force_continue = 0u32;
@@ -349,6 +408,15 @@ async fn agent_loop(
     // instead of forcing forever.
     let mut stall_rounds = 0u32;
     let mut last_missing: Vec<String> = Vec::new();
+    // Loop/repeat guard. Catches the model emitting a byte-identical action on
+    // consecutive turns — re-running the SAME tool call (e.g. re-writing the same
+    // file) or re-emitting the SAME answer text. Without this, a repeated write
+    // bumps `work_total`, which resets stall detection, so the agent can redo
+    // finished work up to MAX_FORCE_CONTINUE times. We (a) never count an identical
+    // repeat as progress, (b) nudge once to break the loop, and (c) hard-stop after
+    // a couple of identical turns (thresholds REPEAT_STOP_* declared above).
+    let mut last_iter_sig: Option<u64> = None;
+    let mut repeat_rounds = 0u32;
 
     if enable_thinking && iterations == 0 {
         session.push_message(ToolMessage::system(thinking::PLANNING_PROMPT.to_string()));
@@ -487,7 +555,11 @@ async fn agent_loop(
         let ctx_limit = crate::context::context_window_for(&session.model);
         let tool_tokens = crate::context::count_tool_definition_tokens(&tool_defs);
         #[allow(clippy::cast_precision_loss)]
-        let summarize_threshold = (ctx_limit as f32 * 0.85) as usize;
+        // Compact at 85% of the model's window OR an absolute budget, whichever is
+        // smaller — so huge-window models (Gemini = 1M) don't resend a giant
+        // transcript every turn before their percentage threshold would trigger.
+        let summarize_threshold =
+            ((ctx_limit as f32 * 0.85) as usize).min(MAX_CONTEXT_TOKENS_BEFORE_COMPACT);
         // Summarize-and-refeed: never trim. Keep compressing the older middle until
         // we're back under 85% of the model's real window, or a pass can no longer
         // compress anything (guarantees termination even if the recent tail alone
@@ -538,7 +610,24 @@ async fn agent_loop(
         };
 
         let response = if use_streaming {
-            collect_streaming_response(provider, request, on_event).await?
+            // A stalled stream (idle watchdog tripped) is transient — retry the same
+            // turn once with the draft discarded, rather than failing the whole task.
+            // The non-streaming path already retries internally via the helper.
+            match collect_streaming_response(provider, request.clone(), on_event).await {
+                Ok(r) => r,
+                Err(AppError::ProviderTimeout(_)) => {
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::DiscardDraft,
+                        content: None,
+                    });
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::Reflecting,
+                        content: Some("The model stream stalled — retrying this step…".into()),
+                    });
+                    collect_streaming_response(provider, request, on_event).await?
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             let cb = options.and_then(|o| o.circuit_breaker.as_deref());
             chat_with_tools_retry_cb(provider, &request, cb).await?
@@ -551,6 +640,38 @@ async fn agent_loop(
             }
         }
 
+        // Loop guard: detect an action byte-identical to the previous turn.
+        let iter_sig = iteration_signature(&response);
+        let is_repeat = iter_sig.is_some() && iter_sig == last_iter_sig;
+        if is_repeat {
+            repeat_rounds += 1;
+        } else {
+            repeat_rounds = 0;
+        }
+        if iter_sig.is_some() {
+            last_iter_sig = iter_sig;
+        }
+        let repeat_limit = if response.tool_calls.is_empty() {
+            REPEAT_STOP_TEXT
+        } else {
+            REPEAT_STOP_TOOLS
+        };
+        if repeat_rounds >= repeat_limit {
+            // The model is spinning on the same step. Drop the superseded draft and
+            // finish with the last substantive thing it said.
+            on_event(AgentEvent {
+                kind: AgentEventKind::DiscardDraft,
+                content: None,
+            });
+            let msg = if last_text.trim().is_empty() {
+                "I stopped because I was repeating the same step without making new progress."
+                    .to_string()
+            } else {
+                last_text.clone()
+            };
+            return finish_agent(session, Some(msg), memory, provider, iterations, on_event).await;
+        }
+
         if enable_thinking {
             if let Some(text) = &response.content {
                 emit_thinking_events(text, on_event);
@@ -559,6 +680,28 @@ async fn agent_loop(
 
         if response.tool_calls.is_empty() {
             let content_txt = response.content.as_deref().unwrap_or("");
+
+            // Prose deliverable (PR description, commit message, release notes, …): the
+            // answer IS the text the model just wrote — there are no workspace changes to
+            // verify. If it produced a substantive reply and made no edits, accept it and
+            // STOP. Running the strict diff-aware reviewer here would never see a file
+            // change, so it would force-continue and re-emit the same text over and over.
+            if auto_complete
+                && task_ctx.prose_deliverable
+                && work_total == 0
+                && !content_txt.trim().is_empty()
+                && !looks_like_user_question(content_txt)
+            {
+                return finish_agent(
+                    session,
+                    response.content,
+                    memory,
+                    provider,
+                    iterations,
+                    on_event,
+                )
+                .await;
+            }
 
             // Auto-complete: the worker stopped calling tools, so it is implicitly claiming the
             // task is done. A strict, diff-aware reviewer independently checks the result against
@@ -581,7 +724,13 @@ async fn agent_loop(
                     verify_task_complete(session, &task_ctx, final_text, &workspace, provider)
                         .await;
                 let done = completion_accepted(&verdict, work_total, session, &task_ctx);
-                if !done {
+                // Only a VERIFIED reviewer may override the model's decision to stop. If
+                // the reviewer call itself failed (`verified == false`) and we still did
+                // not accept (action task, nothing done yet), fall through to the
+                // narration nudge instead of force-continuing on fabricated "outstanding
+                // items" — otherwise a provider whose review endpoint is down would end
+                // every run with the confusing "completion check unavailable" message.
+                if !done && verdict.verified {
                     let progressed = work_total > work_at_last_force;
                     let stalled = is_stalled(
                         progressed,
@@ -641,15 +790,20 @@ async fn agent_loop(
                     )));
                     continue;
                 }
-                return finish_agent(
-                    session,
-                    response.content,
-                    memory,
-                    provider,
-                    iterations,
-                    on_event,
-                )
-                .await;
+                // Accepted as complete (reviewer said done, or reviewer was down but this
+                // isn't an action task that did nothing). Otherwise fall through so the
+                // narration nudge below can push an action task that hasn't acted yet.
+                if done {
+                    return finish_agent(
+                        session,
+                        response.content,
+                        memory,
+                        provider,
+                        iterations,
+                        on_event,
+                    )
+                    .await;
+                }
             }
 
             // No reviewable progress yet. In action modes the model often narrates ("I'll write
@@ -699,17 +853,31 @@ async fn agent_loop(
 
         // The model is making progress (it called tools), so refill the nudge budget
         // and stop forcing tool calls: the limit is for consecutive empty replies,
-        // not the whole run.
+        // not the whole run. An identical repeat is NOT progress — counting it would
+        // reset stall detection and let the agent redo the same work indefinitely.
         nudge_count = 0;
-        work_total += response
-            .tool_calls
-            .iter()
-            .filter(|tc| counts_as_work_progress(&tc.name, &tc.arguments))
-            .count();
+        if !is_repeat {
+            work_total += response
+                .tool_calls
+                .iter()
+                .filter(|tc| counts_as_work_progress(&tc.name, &tc.arguments))
+                .count();
+        }
         session.push_message(ToolMessage::assistant_tool_calls(
             response.tool_calls.clone(),
         ));
         execute_tool_calls(&response.tool_calls, registry, options, session, on_event).await;
+
+        if is_repeat {
+            // One identical repeat (below the hard stop): tell the model plainly so it
+            // can break the loop on the next turn instead of redoing the same step.
+            session.push_message(ToolMessage::system(
+                "That step was identical to your previous one and has already taken effect. \
+                 Do NOT repeat it. Either perform the NEXT remaining step, or — if everything \
+                 the task asked for is done — stop and reply with a brief final summary."
+                    .to_string(),
+            ));
+        }
 
         if enable_thinking {
             session.push_message(ToolMessage::system(thinking::REFLECTION_PROMPT.to_string()));
@@ -823,9 +991,24 @@ fn truncate_brief(s: &str, max: usize) -> String {
 }
 
 /// Update stall tracking from a "not done" verdict. Returns true when the run is
-/// genuinely stuck: no new progress AND the same outstanding items repeated for
-/// `max_stall` consecutive reviews. This is what lets the agent run as long as
-/// it's productive while still terminating on a model that can't make headway.
+/// genuinely stuck for `max_stall` consecutive reviews. This is what lets the agent
+/// run as long as it's productive while still terminating on a model that can't make
+/// headway.
+///
+/// A review only ever runs when the model has *stopped calling tools* (it thinks it
+/// is done) or it hit the step ceiling. At that point there are two reliable signals
+/// that it's spinning rather than finishing:
+///   * NO NEW substantive work since the previous review — it just re-read / re-ran
+///     inspections and claimed done again (the classic "explored, fixed it, then kept
+///     re-investigating instead of stopping" loop), OR
+///   * the reviewer keeps reporting ROUGHLY THE SAME outstanding items — the agent and
+///     reviewer disagree and it isn't getting resolved.
+///
+/// Crucially we do NOT require the `missing` list to be byte-identical: it's
+/// free-form text from an LLM reviewer that re-words itself every round, so an exact
+/// match almost never holds and would let the run force-continue indefinitely. We
+/// compare it fuzzily (token overlap) instead. The counter only resets when the run
+/// made real progress AND moved on to genuinely different outstanding work.
 fn is_stalled(
     progressed: bool,
     missing: &[String],
@@ -833,13 +1016,89 @@ fn is_stalled(
     stall_rounds: &mut u32,
     max_stall: u32,
 ) -> bool {
-    if !progressed && missing == last_missing.as_slice() {
+    let same_gaps = missing_roughly_same(missing, last_missing);
+    if !progressed || same_gaps {
         *stall_rounds += 1;
     } else {
         *stall_rounds = 0;
     }
     *last_missing = missing.to_vec();
     *stall_rounds >= max_stall
+}
+
+/// Fuzzy comparison of two "outstanding items" lists from the completion reviewer.
+/// The reviewer is an LLM that re-words the same gaps every round, so exact equality
+/// is useless for detecting "stuck on the same thing". We reduce each list to a set
+/// of meaningful word tokens and treat them as the same when their Jaccard overlap is
+/// high. Two empty lists count as the same (no concrete gaps either time).
+fn missing_roughly_same(a: &[String], b: &[String]) -> bool {
+    let sa = normalize_missing_tokens(a);
+    let sb = normalize_missing_tokens(b);
+    if sa.is_empty() && sb.is_empty() {
+        return true;
+    }
+    if sa.is_empty() || sb.is_empty() {
+        return false;
+    }
+    let intersection = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    #[allow(clippy::cast_precision_loss)]
+    let jaccard = intersection as f32 / union as f32;
+    jaccard >= 0.6
+}
+
+/// Reduce a list of outstanding-item strings to a set of normalized word tokens
+/// (lowercased, punctuation-stripped, short/noise words dropped) for fuzzy matching.
+fn normalize_missing_tokens(items: &[String]) -> std::collections::HashSet<String> {
+    items
+        .iter()
+        .flat_map(|s| s.split_whitespace())
+        .map(|w| {
+            w.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|w| w.len() > 2)
+        .collect()
+}
+
+/// A stable fingerprint of one model turn, used to detect a spinning loop where
+/// the model redoes the identical action. When the turn has tool calls, only the
+/// calls matter (name + canonical args) — narration around them often varies even
+/// when the action is the same. With no tool calls, the normalized answer text is
+/// the fingerprint. Returns None for an empty turn (nothing to compare).
+fn iteration_signature(response: &ToolChatResponse) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if response.tool_calls.is_empty() {
+        let text = response.content.as_deref().unwrap_or("").trim();
+        if text.is_empty() {
+            return None;
+        }
+        "text".hash(&mut h);
+        normalize_for_sig(text).hash(&mut h);
+    } else {
+        "tools".hash(&mut h);
+        for c in &response.tool_calls {
+            c.name.hash(&mut h);
+            // serde_json sorts object keys by default, so this is canonical for
+            // identical argument sets.
+            serde_json::to_string(&c.arguments)
+                .unwrap_or_default()
+                .hash(&mut h);
+        }
+    }
+    Some(h.finish())
+}
+
+/// Normalize text for repeat comparison: collapse whitespace and lowercase, so
+/// trivial reformatting doesn't hide that the same answer was produced again.
+fn normalize_for_sig(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Render the reviewer's outstanding items as a short bullet list for prompts/events.
@@ -928,6 +1187,10 @@ struct TaskContext {
     is_follow_up: bool,
     /// True when the effective task expects file/shell mutations (not explain-only).
     requires_tools: bool,
+    /// True when the deliverable is prose the user reads/copies (PR description,
+    /// commit message, etc.) — satisfied by the text itself, with no workspace
+    /// changes to verify, so it must not be force-continued by the diff reviewer.
+    prose_deliverable: bool,
 }
 
 /// Ask the same model, acting as a strict completion reviewer ("manager"), whether the active
@@ -1037,8 +1300,107 @@ fn last_substantive_user_task(messages: &[ToolMessage]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Requests whose deliverable is prose the user will read or copy — a PR/MR
+/// description, commit message, release notes, etc. These are satisfied by the
+/// text the model writes; there are NO file or shell changes to make, so the
+/// diff-aware completion reviewer must not force them to keep going. Distinct
+/// from "write a file/function/test", which genuinely needs tools.
+fn looks_like_prose_deliverable(task: &str) -> bool {
+    let lower = task.to_lowercase();
+
+    // Unambiguous prose artifacts — always prose, whatever verb is used.
+    const STRONG: &[&str] = &[
+        "pr description",
+        "pr desc",
+        "pr message",
+        "pr summary",
+        "pull request description",
+        "pull-request description",
+        "merge request description",
+        "mr description",
+        "commit message",
+        "release notes",
+    ];
+    if STRONG.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
+    // "write / draft / compose / give me a <prose-noun>" — but NOT when the object
+    // is clearly a file, code, or something written to disk (those need tools).
+    let has_gen_verb = [
+        "write ",
+        "draft ",
+        "compose ",
+        "give me ",
+        "generate ",
+        "rewrite ",
+        "reword ",
+        "rephrase ",
+        "summarize ",
+        "summarise ",
+    ]
+    .iter()
+    .any(|v| lower.contains(v));
+    if !has_gen_verb {
+        return false;
+    }
+    let has_prose_noun = [
+        "description",
+        "message",
+        "summary",
+        "blurb",
+        "paragraph",
+        "reply",
+        "response",
+        "email",
+        "caption",
+        "tagline",
+        "headline",
+        "explanation",
+        "write-up",
+        "writeup",
+    ]
+    .iter()
+    .any(|n| lower.contains(n));
+    if !has_prose_noun {
+        return false;
+    }
+    let targets_file_or_code = [
+        "file",
+        "function",
+        "class",
+        "method",
+        "module",
+        "test",
+        "script",
+        "config",
+        "endpoint",
+        "component",
+        "schema",
+        "migration",
+        "readme",
+        "changelog",
+        "docstring",
+        "doc string",
+        "to disk",
+        "into ",
+        ".md",
+        ".py",
+        ".rs",
+        ".ts",
+        ".js",
+        ".json",
+        ".yml",
+        ".yaml",
+        ".txt",
+    ]
+    .iter()
+    .any(|c| lower.contains(c));
+    !targets_file_or_code
+}
+
 fn task_requires_tools(task: &str) -> bool {
-    if looks_like_info_request(task) {
+    if looks_like_info_request(task) || looks_like_prose_deliverable(task) {
         return false;
     }
     let lower = task.to_lowercase();
@@ -1079,11 +1441,13 @@ fn resolve_task_context(session: &Session, current: &str) -> TaskContext {
         current.to_string()
     };
     let requires_tools = task_requires_tools(&effective_task);
+    let prose_deliverable = looks_like_prose_deliverable(&effective_task);
     TaskContext {
         current_input: current.to_string(),
         effective_task,
         is_follow_up,
         requires_tools,
+        prose_deliverable,
     }
 }
 
@@ -1153,7 +1517,7 @@ fn completion_accepted(
     verdict: &CompletionVerdict,
     work_total: usize,
     _session: &Session,
-    _ctx: &TaskContext,
+    ctx: &TaskContext,
 ) -> bool {
     if verdict.verified {
         if verdict.done {
@@ -1165,7 +1529,13 @@ fn completion_accepted(
         }
         return false;
     }
-    work_total > 0
+    // Reviewer UNAVAILABLE (the check call itself failed): we have no independent
+    // signal, so trust the model's decision to stop in every case EXCEPT an action
+    // task where it did literally nothing — that one is likely just narration, and the
+    // separate narration nudge will push it to actually act. Crucially we must never
+    // trap a genuine completion (a Q&A/analysis answer, a prose deliverable, or work
+    // that actually changed the workspace) behind a down reviewer.
+    work_total > 0 || !ctx.requires_tools || ctx.prose_deliverable
 }
 
 /// True when the model's text is a genuine question/confirmation for the user (so we
@@ -1228,6 +1598,12 @@ fn emit_thinking_events(text: &str, on_event: &mut impl FnMut(AgentEvent)) {
     }
 }
 
+/// Max time to wait for the NEXT meaningful streaming delta (token or tool-call
+/// data) before treating the turn as a stalled stream. Generous enough for a slow
+/// first token under heavy reasoning, but bounded so a heartbeat-only/black-holed
+/// stream can't hang the agent forever.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 async fn collect_streaming_response(
     provider: &Arc<dyn Provider>,
     request: ToolChatRequest,
@@ -1242,15 +1618,54 @@ async fn collect_streaming_response(
     let mut current_tool_name = String::new();
     let mut current_tool_args = String::new();
     let mut current_tool_extra: Option<serde_json::Value> = None;
+    // Separates inline reasoning (<thinking>/<think>/<plan>/<reflection> tags some
+    // models emit in their content stream) from the visible answer, so chain-of-thought
+    // goes to the collapsible thinking block instead of leaking into the reply. Returns
+    // only the NEW clean / reasoning text on each push so streaming stays incremental.
+    let mut router = ReasoningRouter::default();
 
-    while let Some(delta) = stream.next().await {
+    // Idle watchdog at the *delta* level. reqwest's read_timeout only fires when no
+    // BYTES arrive, but a gateway that emits SSE keepalive/heartbeat bytes during a
+    // stalled generation keeps resetting it while producing no real output — so the
+    // model can silently black-hole and the agent hangs forever at "Agent working…".
+    // Those keepalives yield no ToolStreamDelta, so bounding the wait for the NEXT
+    // delta turns an infinite stall into a clean, recoverable timeout. The window is
+    // generous so a slow first token on heavy-reasoning models is never cut off.
+    loop {
+        let delta = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(delta)) => delta,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(AppError::ProviderTimeout(format!(
+                    "stream stalled: no model output for {}s",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                )));
+            }
+        };
         match delta? {
             ToolStreamDelta::Token(token) => {
-                content.push_str(&token);
-                on_event(AgentEvent {
-                    kind: AgentEventKind::Response,
-                    content: Some(token),
-                });
+                let (visible, reasoning) = router.push(&token);
+                if !reasoning.is_empty() {
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::Thinking,
+                        content: Some(reasoning),
+                    });
+                }
+                if !visible.is_empty() {
+                    content.push_str(&visible);
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::Response,
+                        content: Some(visible),
+                    });
+                }
+            }
+            ToolStreamDelta::Reasoning(reasoning) => {
+                if !reasoning.trim().is_empty() {
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::Thinking,
+                        content: Some(reasoning),
+                    });
+                }
             }
             ToolStreamDelta::ToolCallStart { id, name, extra } => {
                 if !current_tool_id.is_empty() {
@@ -1287,8 +1702,25 @@ async fn collect_streaming_response(
         }
     }
 
+    // Flush anything the router withheld as a possible-but-incomplete tag (e.g. a
+    // trailing bare "<"): the stream ended, so it can only be literal answer text.
+    let (visible, reasoning) = router.flush();
+    if !reasoning.is_empty() {
+        on_event(AgentEvent {
+            kind: AgentEventKind::Thinking,
+            content: Some(reasoning),
+        });
+    }
+    if !visible.is_empty() {
+        content.push_str(&visible);
+        on_event(AgentEvent {
+            kind: AgentEventKind::Response,
+            content: Some(visible),
+        });
+    }
+
     Ok(ToolChatResponse {
-        content: if content.is_empty() {
+        content: if content.trim().is_empty() {
             None
         } else {
             Some(content)
@@ -1296,6 +1728,133 @@ async fn collect_streaming_response(
         tool_calls,
         usage: None,
     })
+}
+
+/// Incrementally separates inline chain-of-thought (wrapped in `<thinking>`,
+/// `<think>`, `<plan>`, or `<reflection>` tags, as several models emit when asked to
+/// reason) from the visible answer in a token stream. Each `push` returns only the
+/// NEW `(visible, reasoning)` text produced by that token, so the caller can forward
+/// the answer and the reasoning to different UI channels live. Robust to tags that
+/// span multiple tokens and to malformed/half-written tags — reasoning is never
+/// leaked into the answer, and a partial tag at the tail is withheld until it
+/// resolves (then flushed by `flush` when the stream ends).
+#[derive(Default)]
+struct ReasoningRouter {
+    /// Raw content accumulated so far (every Token concatenated).
+    acc: String,
+    /// Bytes of clean visible text already returned to the caller.
+    visible_emitted: usize,
+    /// Bytes of reasoning text already returned to the caller.
+    reasoning_emitted: usize,
+}
+
+const REASONING_TAGS: &[&str] = &["thinking", "reflection", "plan", "think"];
+
+impl ReasoningRouter {
+    fn push(&mut self, token: &str) -> (String, String) {
+        self.acc.push_str(token);
+        self.emit_new(false)
+    }
+
+    fn flush(&mut self) -> (String, String) {
+        self.emit_new(true)
+    }
+
+    /// Re-split the full accumulator and return the portion not yet emitted on each
+    /// channel. `final_pass` treats a trailing partial tag as literal answer text.
+    fn emit_new(&mut self, final_pass: bool) -> (String, String) {
+        let (visible, reasoning) = split_reasoning(&self.acc, final_pass);
+        let vis_new = visible.get(self.visible_emitted..).unwrap_or("").to_string();
+        let rea_new = reasoning.get(self.reasoning_emitted..).unwrap_or("").to_string();
+        self.visible_emitted = visible.len();
+        self.reasoning_emitted = reasoning.len();
+        (vis_new, rea_new)
+    }
+}
+
+enum TagMatch {
+    Open(usize),
+    Close(usize),
+    /// `<` begins a recognized tag but the rest hasn't arrived yet.
+    Partial,
+    /// `<` is literal text, not the start of a reasoning tag.
+    NotTag,
+}
+
+/// Classify the `<...` at the start of `s` (which must begin with `<`).
+fn identify_tag(s: &str) -> TagMatch {
+    for tag in REASONING_TAGS {
+        let open = format!("<{tag}>");
+        if s.starts_with(&open) {
+            return TagMatch::Open(open.len());
+        }
+        let close = format!("</{tag}>");
+        if s.starts_with(&close) {
+            return TagMatch::Close(close.len());
+        }
+    }
+    // Could this still become a tag once more bytes arrive?
+    for tag in REASONING_TAGS {
+        if format!("<{tag}>").starts_with(s) || format!("</{tag}>").starts_with(s) {
+            return TagMatch::Partial;
+        }
+    }
+    TagMatch::NotTag
+}
+
+/// Split accumulated content into `(visible_answer, reasoning)`, dropping the tag
+/// markers themselves. Withholds a trailing partial tag unless `final_pass` is set.
+fn split_reasoning(acc: &str, final_pass: bool) -> (String, String) {
+    let mut visible = String::new();
+    let mut reasoning = String::new();
+    let mut inside = false;
+    let mut rest = acc;
+    while !rest.is_empty() {
+        let Some(lt) = rest.find('<') else {
+            if inside {
+                reasoning.push_str(rest);
+            } else {
+                visible.push_str(rest);
+            }
+            break;
+        };
+        let (before, from_lt) = rest.split_at(lt);
+        if inside {
+            reasoning.push_str(before);
+        } else {
+            visible.push_str(before);
+        }
+        match identify_tag(from_lt) {
+            TagMatch::Open(len) => {
+                inside = true;
+                rest = &from_lt[len..];
+            }
+            TagMatch::Close(len) => {
+                inside = false;
+                rest = &from_lt[len..];
+            }
+            TagMatch::Partial => {
+                if final_pass {
+                    // No more tokens coming — treat the leftover as literal text.
+                    if inside {
+                        reasoning.push_str(from_lt);
+                    } else {
+                        visible.push_str(from_lt);
+                    }
+                }
+                break;
+            }
+            TagMatch::NotTag => {
+                if inside {
+                    reasoning.push('<');
+                } else {
+                    visible.push('<');
+                }
+                rest = &from_lt[1..];
+            }
+        }
+    }
+    (visible, reasoning)
 }
 
 /// Leading messages that compression must never touch: the system prefix
@@ -1702,7 +2261,10 @@ async fn execute_tool_calls(
         });
 
         let result_str = serde_json::to_string(&result).unwrap_or_default();
-        session.push_message(ToolMessage::tool_result(&call.id, result_str));
+        session.push_message(ToolMessage::tool_result(
+            &call.id,
+            cap_tool_result_for_history(result_str),
+        ));
     }
 }
 
@@ -1807,6 +2369,31 @@ mod task_context_tests {
     }
 
     #[test]
+    fn small_tool_results_are_untouched() {
+        let s = "small output".to_string();
+        assert_eq!(cap_tool_result_for_history(s.clone()), s);
+    }
+
+    #[test]
+    fn large_tool_results_are_clipped_with_marker() {
+        let big = "x".repeat(MAX_TOOL_RESULT_CHARS + 50_000);
+        let out = cap_tool_result_for_history(big.clone());
+        assert!(out.len() < big.len());
+        assert!(out.contains("characters truncated"));
+        // Head and tail are preserved.
+        assert!(out.starts_with(&"x".repeat(100)));
+        assert!(out.ends_with(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn clipping_respects_utf8_boundaries() {
+        // Multi-byte chars must not be split mid-codepoint (would panic on slice).
+        let big = "é".repeat(MAX_TOOL_RESULT_CHARS);
+        let out = cap_tool_result_for_history(big);
+        assert!(out.contains("characters truncated"));
+    }
+
+    #[test]
     fn completion_verdict_when_unverified() {
         let v = CompletionVerdict {
             done: false,
@@ -1818,14 +2405,50 @@ mod task_context_tests {
             effective_task: "x".into(),
             is_follow_up: false,
             requires_tools: true,
+            prose_deliverable: false,
         }));
         let ctx = TaskContext {
             current_input: "commit".into(),
             effective_task: "commit and push".into(),
             is_follow_up: false,
             requires_tools: true,
+            prose_deliverable: false,
         };
         assert!(completion_accepted(&v, 1, &Session::new("getaibd", "test", std::path::PathBuf::from("/tmp")), &ctx));
+    }
+
+    #[test]
+    fn unavailable_reviewer_does_not_trap_non_action_tasks() {
+        // Reviewer call failed (verified=false). A Q&A/analysis task does no workspace
+        // mutations, so work_total stays 0 — but it must still be accepted rather than
+        // looped forever with the "completion check unavailable" message.
+        let down = CompletionVerdict {
+            done: false,
+            missing: vec!["completion check unavailable — verify work was finished".into()],
+            verified: false,
+        };
+        let session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        let qa = TaskContext {
+            current_input: "explain the repo".into(),
+            effective_task: "explain the repo".into(),
+            is_follow_up: false,
+            requires_tools: false,
+            prose_deliverable: false,
+        };
+        assert!(completion_accepted(&down, 0, &session, &qa));
+
+        // An action task that did literally nothing is NOT accepted (so the narration
+        // nudge can push it to actually act).
+        let action = TaskContext {
+            current_input: "implement login".into(),
+            effective_task: "implement login".into(),
+            is_follow_up: false,
+            requires_tools: true,
+            prose_deliverable: false,
+        };
+        assert!(!completion_accepted(&down, 0, &session, &action));
+        // …but once it has done real work, accept even with the reviewer down.
+        assert!(completion_accepted(&down, 2, &session, &action));
     }
 
     #[test]
@@ -1839,5 +2462,203 @@ mod task_context_tests {
     #[test]
     fn commit_tasks_require_tools() {
         assert!(task_requires_tools("commit and push staged files"));
+    }
+
+    #[test]
+    fn prose_deliverables_do_not_require_tools() {
+        // The reported bug: "write a brief PR description" is prose, not a file edit,
+        // so it must not be force-continued by the diff-aware completion reviewer.
+        assert!(looks_like_prose_deliverable("write a brief PR description"));
+        assert!(looks_like_prose_deliverable("draft a PR desc for this change"));
+        assert!(looks_like_prose_deliverable("write the commit message"));
+        assert!(looks_like_prose_deliverable("generate release notes"));
+        assert!(!task_requires_tools("write a brief PR description"));
+        assert!(!task_requires_tools("write the commit message"));
+
+        // Real tool work is still classified as needing tools.
+        assert!(!looks_like_prose_deliverable("write a config file"));
+        assert!(task_requires_tools("write the auth middleware"));
+        assert!(task_requires_tools("write unit tests for the parser"));
+    }
+
+    #[test]
+    fn resolve_marks_prose_deliverable() {
+        let session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        let ctx = resolve_task_context(&session, "write a brief PR description");
+        assert!(ctx.prose_deliverable);
+        assert!(!ctx.requires_tools);
+    }
+
+    #[test]
+    fn broadened_prose_matcher() {
+        // Generic prose deliverables now match.
+        assert!(looks_like_prose_deliverable("write a short summary of the changes"));
+        assert!(looks_like_prose_deliverable("draft a reply to this issue"));
+        assert!(looks_like_prose_deliverable("compose a release email"));
+        // …but not when the object is clearly a file or code (those need tools).
+        assert!(!looks_like_prose_deliverable("write a description into the README file"));
+        assert!(!looks_like_prose_deliverable("write the error message in utils.py"));
+        assert!(!looks_like_prose_deliverable("write a docstring for this function"));
+        // No prose noun → not a prose deliverable.
+        assert!(!looks_like_prose_deliverable("write the login handler"));
+    }
+
+    fn tool_call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments: args,
+            extra: None,
+        }
+    }
+
+    fn resp(content: Option<&str>, calls: Vec<ToolCall>) -> ToolChatResponse {
+        ToolChatResponse {
+            content: content.map(str::to_string),
+            tool_calls: calls,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn identical_tool_turns_share_a_signature() {
+        let a = resp(
+            Some("writing the file"),
+            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "x"}))],
+        );
+        let b = resp(
+            Some("different narration, same action"),
+            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "x"}))],
+        );
+        // Narration differs but the action is identical → same signature.
+        assert_eq!(iteration_signature(&a), iteration_signature(&b));
+
+        let c = resp(
+            None,
+            vec![tool_call("write_file", serde_json::json!({"path": "a.txt", "content": "DIFFERENT"}))],
+        );
+        assert_ne!(iteration_signature(&a), iteration_signature(&c));
+    }
+
+    #[test]
+    fn text_signature_ignores_whitespace_and_case() {
+        let a = resp(Some("Here is the answer."), vec![]);
+        let b = resp(Some("here   is the   ANSWER."), vec![]);
+        assert_eq!(iteration_signature(&a), iteration_signature(&b));
+    }
+
+    #[test]
+    fn empty_turn_has_no_signature() {
+        assert!(iteration_signature(&resp(None, vec![])).is_none());
+        assert!(iteration_signature(&resp(Some("   "), vec![])).is_none());
+    }
+
+    #[test]
+    fn reasoning_router_keeps_thinking_out_of_the_answer() {
+        let mut r = ReasoningRouter::default();
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        // Feed it one char at a time to prove tags spanning tokens are handled.
+        for ch in "<thinking>secret plan</thinking>Hello world".chars() {
+            let (v, t) = r.push(&ch.to_string());
+            visible.push_str(&v);
+            reasoning.push_str(&t);
+        }
+        let (v, t) = r.flush();
+        visible.push_str(&v);
+        reasoning.push_str(&t);
+        assert_eq!(visible, "Hello world");
+        assert_eq!(reasoning, "secret plan");
+    }
+
+    #[test]
+    fn reasoning_router_handles_malformed_unclosed_tag() {
+        // Kimi's leak: an opening tag and a malformed close (no '>'). All of it must be
+        // treated as reasoning, never surfaced as the answer.
+        let mut r = ReasoningRouter::default();
+        let (mut v, mut t) = r.push("<thinking>I am reasoning</thinking");
+        let (vf, tf) = r.flush();
+        v.push_str(&vf);
+        t.push_str(&tf);
+        assert_eq!(v.trim(), "");
+        assert!(t.contains("I am reasoning"));
+    }
+
+    #[test]
+    fn reasoning_router_passes_literal_angle_brackets() {
+        // A real "<" in the answer (e.g. code) must not be eaten as a tag.
+        let mut r = ReasoningRouter::default();
+        let (v, t) = r.push("if a < b and c > d");
+        let (vf, _) = r.flush();
+        assert_eq!(format!("{v}{vf}"), "if a < b and c > d");
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn reasoning_router_is_incremental_and_monotonic() {
+        // Each push returns only the NEW visible text; concatenation equals the answer.
+        let mut r = ReasoningRouter::default();
+        let chunks = ["Hel", "lo <think>", "noise", "</think> wor", "ld"];
+        let mut visible = String::new();
+        for c in chunks {
+            let (v, _) = r.push(c);
+            visible.push_str(&v);
+        }
+        let (v, _) = r.flush();
+        visible.push_str(&v);
+        assert_eq!(visible, "Hello  world");
+    }
+
+    #[test]
+    fn no_progress_stalls_even_when_reviewer_rewords_each_round() {
+        // The exact end-condition bug: after the agent fixed the issue it kept
+        // re-investigating (no new substantive work), while the LLM reviewer re-worded
+        // the SAME complaint every round. The old exact-equality check reset the stall
+        // counter forever, so the agent force-continued up to the hard cap. With fuzzy
+        // matching + no-progress, three such reviews must stall.
+        let max_stall = 3;
+        let mut last_missing: Vec<String> = Vec::new();
+        let mut stall_rounds = 0u32;
+        let rounds = [
+            vec!["The whitespace-pre-wrap class is not in the compiled CSS".to_string()],
+            vec!["Compiled stylesheet is missing the whitespace-pre-wrap utility".to_string()],
+            vec!["whitespace-pre-wrap rule still absent from the compiled CSS file".to_string()],
+        ];
+        let mut stalled = false;
+        for missing in &rounds {
+            // progressed=false every round (re-investigation only).
+            stalled = is_stalled(false, missing, &mut last_missing, &mut stall_rounds, max_stall);
+        }
+        assert!(stalled, "re-worded same gap with no progress must stall");
+    }
+
+    #[test]
+    fn real_progress_on_new_gaps_resets_stall() {
+        let max_stall = 3;
+        let mut last_missing: Vec<String> = Vec::new();
+        let mut stall_rounds = 0u32;
+        // First a no-progress round bumps the counter.
+        assert!(!is_stalled(false, &["need to add the migration".to_string()], &mut last_missing, &mut stall_rounds, max_stall));
+        assert_eq!(stall_rounds, 1);
+        // Then the agent makes real progress AND the outstanding work genuinely changes
+        // to a different item → counter resets, the run keeps going.
+        let progressed = true;
+        let next = vec!["wire the new endpoint into the router".to_string()];
+        assert!(!is_stalled(progressed, &next, &mut last_missing, &mut stall_rounds, max_stall));
+        assert_eq!(stall_rounds, 0);
+    }
+
+    #[test]
+    fn missing_roughly_same_is_fuzzy() {
+        let a = vec!["The whitespace-pre-wrap class is missing from compiled CSS".to_string()];
+        let b = vec!["compiled CSS is missing the whitespace-pre-wrap class".to_string()];
+        assert!(missing_roughly_same(&a, &b), "reordered/reworded same gap should match");
+
+        let c = vec!["add a database migration for the new column".to_string()];
+        assert!(!missing_roughly_same(&a, &c), "unrelated gaps should not match");
+
+        // Two empty lists are "the same" (no concrete gap either time).
+        assert!(missing_roughly_same(&[], &[]));
+        assert!(!missing_roughly_same(&a, &[]));
     }
 }

@@ -52,6 +52,10 @@ pub struct ModelInfo {
     /// Empty when the upstream `/models` endpoint does not report them.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// True when this is the platform's free / "Auto" model. Lets the UI surface
+    /// and search it by its friendly label without hardcoding its engine id.
+    #[serde(default)]
+    pub free: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +127,11 @@ pub struct ToolMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Base64 `data:` image URLs attached to a user turn. Kept separate from the
+    /// text `content` so the provider adapter can emit OpenAI multimodal content
+    /// (a `[{type:text},{type:image_url}]` array) only when images are present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl ToolMessage {
@@ -133,6 +142,19 @@ impl ToolMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// A user turn carrying attached images (base64 `data:` URLs) alongside text.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            images,
         }
     }
 
@@ -143,6 +165,7 @@ impl ToolMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -153,6 +176,7 @@ impl ToolMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -163,6 +187,7 @@ impl ToolMessage {
             tool_calls: Some(calls),
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
         }
     }
 
@@ -173,6 +198,7 @@ impl ToolMessage {
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
             name: None,
+            images: Vec::new(),
         }
     }
 }
@@ -185,6 +211,7 @@ impl From<&Message> for ToolMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            images: Vec::new(),
         }
     }
 }
@@ -224,6 +251,9 @@ pub struct ToolChatResponse {
 #[derive(Debug, Clone)]
 pub enum ToolStreamDelta {
     Token(String),
+    /// Chain-of-thought reasoning streamed in a dedicated field (e.g. DeepSeek-R1 /
+    /// Kimi `reasoning_content`). Routed to the thinking channel, never the answer.
+    Reasoning(String),
     ToolCallStart {
         id: String,
         name: String,

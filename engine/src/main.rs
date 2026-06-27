@@ -1,3 +1,4 @@
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 use axum::Router;
 use clap::Parser;
@@ -125,9 +126,15 @@ async fn main() {
             routes::auth::require_auth,
         ));
 
+    // Image attachments are sent inline as base64 data URLs, so the request body can
+    // be many MB (base64 inflates the raw bytes by ~33%). Axum's default 2 MB limit
+    // rejects these with HTTP 413, so raise it to comfortably fit several images.
+    const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
     let app = Router::new()
         .merge(protected)
         .route("/health", get(routes::health::health_check))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(cors)
         .with_state(state);
 

@@ -39,6 +39,9 @@ pub struct AgentRequest {
     /// Stable per-workspace chat id for GetAIBD prompt-cache sticky routing.
     #[serde(default)]
     pub cache_session_id: Option<String>,
+    /// Base64 `data:` image URLs attached to this turn (vision-capable models).
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -119,7 +122,7 @@ pub async fn agent_handler(
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_task(
     state: &AppState,
-    req: AgentRequest,
+    mut req: AgentRequest,
     provider: Arc<dyn crate::providers::Provider>,
     registry: crate::tools::ToolRegistry,
     max_iter: u32,
@@ -144,7 +147,8 @@ async fn run_agent_task(
         .with_environment(environment)
         .with_user_rules(req.user_rules.clone())
         .with_workspace_cwd(workspace_cwd)
-        .with_cache_session_id(req.cache_session_id.clone());
+        .with_cache_session_id(req.cache_session_id.clone())
+        .with_user_images(std::mem::take(&mut req.images));
 
     if let Some(sys) = req.system_prompt {
         session = session.with_system_prompt(sys);

@@ -33,6 +33,9 @@ pub struct Session {
     pub user_stopped: bool,
     /// Consecutive approval denials without an approved action between.
     pub approval_denials: u32,
+    /// Base64 `data:` image URLs attached to the FIRST user turn of this run.
+    /// Consumed when that turn is pushed so they ride along as multimodal content.
+    pub pending_user_images: Vec<String>,
 }
 
 impl Session {
@@ -59,6 +62,7 @@ impl Session {
             cache_session_id: None,
             user_stopped: false,
             approval_denials: 0,
+            pending_user_images: Vec::new(),
         }
     }
 
@@ -127,6 +131,13 @@ impl Session {
     #[must_use]
     pub fn with_cache_session_id(mut self, id: Option<String>) -> Self {
         self.cache_session_id = id.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Attach images (base64 `data:` URLs) to the first user turn of this run.
+    #[must_use]
+    pub fn with_user_images(mut self, images: Vec<String>) -> Self {
+        self.pending_user_images = images;
         self
     }
 

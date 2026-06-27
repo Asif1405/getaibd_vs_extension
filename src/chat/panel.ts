@@ -86,6 +86,11 @@ const REASONING_KEY = "getaibd.reasoningEffort";
 const ALWAYS_ALLOW_KEY = "getaibd.alwaysAllowTools";
 const MAX_RECONNECT = 3;
 
+/** Image file extensions we attach as base64 vision input (vs. text @context). */
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
+/** Cap a single attached image so we never post a multi-MB blob into a request. */
+const MAX_IMAGE_BYTES = 8_000_000;
+
 /**
  * A `Memento`-compatible store backed by a JSON file with **synchronous** writes.
  *
@@ -283,6 +288,14 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       this.view = undefined;
       this.ready = false;
     }, undefined, this.disposables);
+    // If the panel is re-shown after the engine already came up, re-assert the
+    // boot state so the overlay can't linger on a webview that missed (or lost)
+    // the one-shot "ready" post while it was hidden/being swapped.
+    view.onDidChangeVisibility(() => {
+      if (view.visible && this.ready) {
+        this.post({ type: "bootStatus", state: "ready" });
+      }
+    }, undefined, this.disposables);
   }
 
   private post(msg: unknown) {
@@ -302,6 +315,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private ready = false;
+  /** True once the first boot completed; gates the one-time blocking overlay. */
+  private booted = false;
   private pending: Array<() => void> = [];
 
   /** Runs an action now if the webview is ready, else queues it until it is. */
@@ -473,19 +488,22 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           await this.sendAgentTask(msg.provider as string, msg.model as string, msg.text as string);
         }
         break;
-      case "orchestratedSend":
-        if (msg.provider && msg.model && msg.text && msg.mode) {
+      case "orchestratedSend": {
+        const imgs = Array.isArray(msg.images) ? (msg.images as string[]) : undefined;
+        if (msg.provider && msg.model && (msg.text || imgs?.length)) {
           this.saveSelections(msg.provider as string, msg.model as string);
           await this.sendOrchestrated(
             msg.provider as string,
             msg.model as string,
-            msg.text as string,
-            msg.mode as string,
+            (msg.text as string) || "Describe the attached image(s).",
+            (msg.mode as string) || "agent",
             (msg.reasoningEffort as string | undefined) ?? undefined,
             !!msg.compress,
+            imgs,
           );
         }
         break;
+      }
       case "compressChanged":
         await this.globalState.update(COMPRESS_KEY, !!msg.compress);
         break;
@@ -570,6 +588,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "attachFile":
         await this.attachFileContext();
         break;
+      case "dropUris":
+        await this.handleDroppedUris((msg.uris as string[]) || []);
+        break;
       case "modeChanged":
         if (msg.mode) {this.globalState.update(MODE_KEY, msg.mode as string);}
         break;
@@ -633,19 +654,29 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private async onReady() {
-    this.post({ type: "bootStatus", state: "loading", text: "Getting ready…" });
+    // The blocking "Getting ready…" overlay is only ever shown on the FIRST boot
+    // of a session. If the sidebar webview is reloaded/re-resolved afterwards
+    // (which re-fires this handler), we go straight to "ready" so a reload loop
+    // can never re-trap the panel on the spinner while the engine is already up.
+    this.post(
+      this.booted
+        ? { type: "bootStatus", state: "ready" }
+        : { type: "bootStatus", state: "loading", text: "Getting ready…" },
+    );
     try {
       try {
         await ensureEngine(this.context);
       } catch {
         /* engine errors are surfaced when the user sends */
       }
-      await this.loadProviders();
+      // Only local, non-blocking restores gate the overlay. Network warmups
+      // (providers, auth) run in the background below so a stalled request can
+      // never freeze the boot overlay on "Getting ready…".
       this.sendSessions();
       this.restoreHistory();
       this.restoreSelections();
-      await this.refreshAuthMode();
     } finally {
+      this.booted = true;
       this.ready = true;
       this.post({ type: "bootStatus", state: "ready" });
       const queued = this.pending.splice(0);
@@ -653,6 +684,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         fn();
       }
     }
+    // Fire-and-forget: these post their own updates when they resolve (or time out).
+    void this.loadProviders().catch(() => undefined);
+    void this.refreshAuthMode().catch(() => undefined);
   }
 
   /** Ensures the engine is up, then reloads providers + models (dropdown self-heal). */
@@ -918,13 +952,90 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private async attachFileContext() {
-    const uris = await vscode.window.showOpenDialog({ canSelectMany: true, openLabel: "Attach" });
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: true,
+      openLabel: "Attach",
+      filters: {
+        Images: ["png", "jpg", "jpeg", "gif", "webp"],
+        Text: ["txt", "md", "ts", "js", "py", "go", "rs", "json", "yaml", "yml", "html", "css"],
+        "All files": ["*"],
+      },
+    });
     if (!uris?.length) {return;}
     for (const uri of uris) {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      const content = doc.getText();
-      const name = vscode.workspace.asRelativePath(uri);
-      this.addContext(`@${name}`, content);
+      const ext = path.extname(uri.fsPath).toLowerCase();
+      if (IMAGE_EXTS.has(ext)) {
+        await this.attachImage(uri);
+        continue;
+      }
+      // Text file → inject as @context. Wrap so a binary file picked by mistake
+      // can never throw (which previously crashed the engine and broke auth).
+      try {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const content = doc.getText();
+        if (content.includes("\u0000")) {
+          this.post({ type: "attachError", message: `${path.basename(uri.fsPath)} looks binary — skipped. Only images and text files are supported.` });
+          continue;
+        }
+        this.addContext(`@${vscode.workspace.asRelativePath(uri)}`, content);
+      } catch {
+        this.post({ type: "attachError", message: `Could not read ${path.basename(uri.fsPath)} as text — skipped.` });
+      }
+    }
+  }
+
+  /**
+   * Handle files dragged from the VS Code Explorer onto the composer. Unlike an OS
+   * file drop (which arrives as real `File` objects in the webview), an Explorer drag
+   * only carries a `text/uri-list`, so the webview forwards the URIs here and we read
+   * them on the extension host — images become attachments, text files become @context.
+   */
+  private async handleDroppedUris(uris: string[]) {
+    for (const raw of uris) {
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed.startsWith("#")) {continue;}
+      let uri: vscode.Uri;
+      try {
+        uri = trimmed.includes("://") ? vscode.Uri.parse(trimmed) : vscode.Uri.file(trimmed);
+      } catch {
+        continue;
+      }
+      const ext = path.extname(uri.fsPath).toLowerCase();
+      if (IMAGE_EXTS.has(ext)) {
+        await this.attachImage(uri);
+        continue;
+      }
+      try {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const content = doc.getText();
+        if (content.includes("\u0000")) {
+          this.post({ type: "attachError", message: `${path.basename(uri.fsPath)} looks binary — skipped. Only images and text files are supported.` });
+          continue;
+        }
+        this.addContext(`@${vscode.workspace.asRelativePath(uri)}`, content);
+      } catch {
+        this.post({ type: "attachError", message: `Could not read ${path.basename(uri.fsPath)} — skipped.` });
+      }
+    }
+  }
+
+  /** Reads an image file as a base64 data URL and hands it to the webview. */
+  private async attachImage(uri: vscode.Uri) {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      if (bytes.byteLength > MAX_IMAGE_BYTES) {
+        this.post({ type: "attachError", message: `${path.basename(uri.fsPath)} is too large (max ${Math.round(MAX_IMAGE_BYTES / 1_000_000)}MB).` });
+        return;
+      }
+      const ext = path.extname(uri.fsPath).toLowerCase();
+      const mime =
+        ext === ".png" ? "image/png" :
+        ext === ".gif" ? "image/gif" :
+        ext === ".webp" ? "image/webp" : "image/jpeg";
+      const dataUrl = `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`;
+      this.post({ type: "addImageAttachment", name: path.basename(uri.fsPath), dataUrl });
+    } catch {
+      this.post({ type: "attachError", message: `Could not read image ${path.basename(uri.fsPath)}.` });
     }
   }
 
@@ -1009,12 +1120,51 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     return messages;
   }
 
-  /** Agent path: @mentions only when the user typed them — no open file or attachment replay. */
+  /**
+   * Agent path: the file the user is actively viewing/editing, plus any @mentions they
+   * typed. The open file is the single most important piece of context — without it the
+   * agent greps the whole repo to rediscover what's already on the user's screen (often
+   * their in-progress attempt), which is exactly the wasted-exploration we want to avoid.
+   */
   private async buildAgentContext(userText: string): Promise<ChatMessage[]> {
-    if (!/@\S+/.test(userText)) {
-      return [];
+    const mentionCtx = /@\S+/.test(userText) ? await this.resolveAtMentions(userText) : [];
+    const skip = new Set<string>();
+    for (const m of mentionCtx) {
+      const match = /^\[File: ([^\]]+)\]/.exec(m.content);
+      if (match) {skip.add(match[1]);}
     }
-    return this.resolveAtMentions(userText);
+    return [...this.openFileContextForAgent(skip), ...mentionCtx];
+  }
+
+  /**
+   * The file the user is actively viewing/editing, handed to the agent up front so it
+   * starts there instead of searching the repo. Injected once per user message (not per
+   * engine iteration), and skips anything already covered by an @mention.
+   */
+  private openFileContextForAgent(skip: Set<string>): ChatMessage[] {
+    const config = vscode.workspace.getConfiguration("getaibd");
+    if (!config.get<boolean>("fileContext.enabled", true)) {return [];}
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.scheme !== "file") {return [];}
+    const name = vscode.workspace.asRelativePath(editor.document.uri);
+    if (skip.has(name)) {return [];}
+    const content = editor.document.getText();
+    if (!content.trim()) {return [];}
+    const snippet = truncateFileContent(content);
+    this.post({
+      type: "addContext",
+      label: `@${name}`,
+      code: content.slice(0, 500) + (content.length > 500 ? "\n..." : ""),
+    });
+    return [
+      {
+        role: "user",
+        content:
+          `The user is currently looking at this file in their editor; it may contain ` +
+          `their in-progress attempt at the change. Read and build on it before ` +
+          `searching the repository:\n[Currently open file: ${name}]\n\`\`\`\n${snippet}\n\`\`\``,
+      },
+    ];
   }
 
   /** Simple chat: optional open file + attachments + @mentions. */
@@ -1172,6 +1322,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     mode: string,
     reasoningEffort?: string,
     compress = false,
+    images?: string[],
   ) {
     if (!(await this.checkSecrets(text))) {return;}
     if (provider === "getaibd" && !(await this.ensureCreditsAllowance(model))) {return;}
@@ -1259,7 +1410,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.resetAgentRunState();
         this.maybeHandlePaymentError(error);
       },
-    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress, useMemory: agentUseMemory, userRules: this.getAgentUserRules(), workspaceCwd: this.getWorkspaceCwd(), cacheSessionId: this.promptCacheSessionId() });
+    }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress, useMemory: agentUseMemory, userRules: this.getAgentUserRules(), workspaceCwd: this.getWorkspaceCwd(), cacheSessionId: this.promptCacheSessionId(), images: images?.length ? images : undefined });
   }
 
   private handleFileEdit(edit: FileEdit) {
@@ -2894,6 +3045,40 @@ body {
   flex-shrink: 0;
 }
 .composer:focus-within { border-color: var(--focus); }
+.composer.drag-over { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus) inset; }
+.attach-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 0;
+}
+.attach-thumb {
+  position: relative;
+  width: 46px;
+  height: 46px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--input-border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+.attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attach-thumb .attach-remove {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 11px;
+  line-height: 14px;
+  cursor: pointer;
+  padding: 0;
+}
+.attach-thumb .attach-remove:hover { background: var(--error-fg); }
 .composer textarea {
   width: 100%;
   background: transparent;
@@ -3435,7 +3620,8 @@ body {
 </div>
 
 <div class="composer">
-  <textarea id="input" rows="1" placeholder="Ask anything... (use @filename to reference files)"></textarea>
+  <div class="attach-strip" id="attachStrip" style="display:none"></div>
+  <textarea id="input" rows="1" placeholder="Ask anything... (use @filename to reference files, paste or drop images)"></textarea>
   <div class="composer-row">
     <button class="ctl-pill" id="modePill" title="Mode">
       <span class="ctl-icon" id="modePillIcon">&#8734;</span>
@@ -3468,6 +3654,26 @@ const vscode = acquireVsCodeApi();
 const messagesEl = document.getElementById("messages");
 const bootOverlay = document.getElementById("bootOverlay");
 const bootText = document.getElementById("bootText");
+let bootWatchdog;
+/* The boot overlay is strictly ONE-TIME. Once it clears (engine ready, or the
+ * watchdog fires) it must never block the panel again — otherwise a webview
+ * reload/re-resolve loop (each fresh webview re-runs onReady and re-posts
+ * "loading") would re-show the spinner and re-arm the watchdog forever, trapping
+ * the panel on "Getting ready…" even though the engine is healthy. */
+let bootDone = false;
+function clearBoot() {
+  bootDone = true;
+  if (bootWatchdog) { clearTimeout(bootWatchdog); bootWatchdog = undefined; }
+  if (bootOverlay) { bootOverlay.classList.add("hidden"); }
+}
+/* Fail-open watchdog: if the extension's "bootStatus: ready" post is ever lost
+ * (e.g. the sidebar webview was swapped while the engine was still starting),
+ * force the overlay off after a grace window longer than the engine's own 30s
+ * health timeout. Any real engine error still surfaces when the user sends. */
+function armBootWatchdog() {
+  if (bootDone || bootWatchdog) { return; }
+  bootWatchdog = setTimeout(clearBoot, 35000);
+}
 const spinnerEl = document.getElementById("spinner");
 const spinnerLabelEl = document.getElementById("spinnerLabel");
 const ctxEstimateEl = document.getElementById("ctxEstimate");
@@ -3500,7 +3706,56 @@ const newChatBtn = document.getElementById("newChatBtn");
 const sessionsBtn = document.getElementById("sessionsBtn");
 const sessionsPanel = document.getElementById("sessionsPanel");
 const attachBtn = document.getElementById("attachBtn");
+const attachStripEl = document.getElementById("attachStrip");
+const composerEl = document.querySelector(".composer");
 const upgradeBtn = document.getElementById("upgradeBtn");
+
+/** Images attached to the NEXT message: { name, dataUrl }. Cleared on send. */
+let pendingImages = [];
+
+function renderAttachStrip() {
+  if (!attachStripEl) { return; }
+  if (pendingImages.length === 0) {
+    attachStripEl.style.display = "none";
+    attachStripEl.innerHTML = "";
+    return;
+  }
+  attachStripEl.style.display = "flex";
+  attachStripEl.innerHTML = "";
+  pendingImages.forEach((img, i) => {
+    const cell = document.createElement("div");
+    cell.className = "attach-thumb";
+    cell.title = img.name || "image";
+    const el = document.createElement("img");
+    el.src = img.dataUrl;
+    cell.appendChild(el);
+    const rm = document.createElement("button");
+    rm.className = "attach-remove";
+    rm.type = "button";
+    rm.textContent = "\u2715";
+    rm.addEventListener("click", () => { pendingImages.splice(i, 1); renderAttachStrip(); });
+    cell.appendChild(rm);
+    attachStripEl.appendChild(cell);
+  });
+}
+
+function addPendingImage(name, dataUrl) {
+  if (!dataUrl) { return; }
+  if (pendingImages.length >= 8) { return; }
+  pendingImages.push({ name: name || "image", dataUrl });
+  renderAttachStrip();
+}
+
+/** Read image File objects (drop/paste) as base64 data URLs in the webview. */
+function ingestImageFiles(files) {
+  for (const file of files) {
+    if (!file || !file.type || file.type.indexOf("image/") !== 0) { continue; }
+    const reader = new FileReader();
+    reader.onload = () => { addPendingImage(file.name, String(reader.result || "")); };
+    reader.readAsDataURL(file);
+  }
+}
+
 const costModeSwitch = document.getElementById("costModeSwitch");
 const costNormalBtn = document.getElementById("costNormalBtn");
 const costReducedBtn = document.getElementById("costReducedBtn");
@@ -3652,14 +3907,21 @@ let needsPlan = false;
 let freeModelId = "qwen-flash";
 let freeModelLabel = "Auto";
 
-function modelDisplay(modelId, name) {
-  return modelId === freeModelId ? freeModelLabel : (name || modelId);
+// The free model is identified by the catalog free flag (robust) and, as a
+// fallback, the configured free id. The id alone is brittle: the engine may serve
+// it under a different name, which is exactly why searching Auto used to fail.
+function isFreeModel(modelId, free) {
+  return free === true || modelId === freeModelId;
 }
 
-// The free model is shown to users as "Auto" — search it by that label only,
-// so it surfaces for "Auto" and stays hidden behind its underlying engine name.
-function matchesModel(modelId, name, filter) {
-  if (modelId === freeModelId) {
+function modelDisplay(modelId, name, free) {
+  return isFreeModel(modelId, free) ? freeModelLabel : (name || modelId);
+}
+
+// The free model is shown to users as "Auto" — search it by that label only, so
+// it surfaces for "Auto" and stays hidden behind its underlying engine name.
+function matchesModel(modelId, name, filter, free) {
+  if (isFreeModel(modelId, free)) {
     return freeModelLabel.toLowerCase().includes(filter);
   }
   return (
@@ -3798,6 +4060,61 @@ function renderSessions() {
 
 attachBtn.addEventListener("click", () => vscode.postMessage({ type: "attachFile" }));
 
+// Drag-and-drop onto the composer. Two sources are supported:
+//   * OS file drops (Finder/Explorer) arrive as real File objects in dataTransfer.files
+//   * VS Code Explorer drags carry NO files — only a text/uri-list — so we forward the
+//     URIs to the extension host, which reads them (images → attachment, text → @context).
+// Listen on the whole document, not just the small composer box: users routinely
+// drop files onto the message list. We still highlight the composer for affordance.
+// Always preventDefault on dragover so the drop event actually fires on us (otherwise
+// the webview/workbench swallows it and our drop never runs).
+function handlePanelDrop(e) {
+  e.preventDefault();
+  if (composerEl) { composerEl.classList.remove("drag-over"); }
+  const dt = e.dataTransfer;
+  if (!dt) { return; }
+  if (dt.files && dt.files.length) {
+    ingestImageFiles(dt.files);
+    return;
+  }
+  // No File objects → likely a VS Code Explorer drag. Pull the URI list and let the
+  // extension host read those paths.
+  const uriList = dt.getData("text/uri-list") || dt.getData("resourceurls") || dt.getData("text/plain") || "";
+  let uris = [];
+  try {
+    // resourceurls is a JSON array of encoded URI strings; uri-list is newline-delimited.
+    uris = uriList.trim().startsWith("[") ? JSON.parse(uriList).map((u) => decodeURIComponent(u)) : uriList.split(/\\r?\\n/);
+  } catch (_) {
+    uris = uriList.split(/\\r?\\n/);
+  }
+  uris = uris.map((u) => String(u).trim()).filter(Boolean);
+  if (uris.length) { vscode.postMessage({ type: "dropUris", uris }); }
+}
+document.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  if (e.dataTransfer) { e.dataTransfer.dropEffect = "copy"; }
+  if (composerEl) { composerEl.classList.add("drag-over"); }
+});
+document.addEventListener("dragleave", (e) => {
+  // Only clear when the cursor actually leaves the window.
+  if (!e.relatedTarget && composerEl) { composerEl.classList.remove("drag-over"); }
+});
+document.addEventListener("drop", handlePanelDrop);
+
+// Paste images from the clipboard (e.g. a screenshot) into the composer.
+inputEl.addEventListener("paste", (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) { return; }
+  const files = [];
+  for (const it of items) {
+    if (it.kind === "file") {
+      const f = it.getAsFile();
+      if (f) { files.push(f); }
+    }
+  }
+  if (files.length) { e.preventDefault(); ingestImageFiles(files); }
+});
+
 /* ── Model Pill / Dropdown ── */
 function openModelDropdown() {
   closeModeMenu();
@@ -3902,13 +4219,13 @@ function renderModelList(filter) {
   for (const pid of providerIds) {
     const curated = (curatedModels[pid] || []).filter(m =>
       !filter ||
-      matchesModel(m.id, m.name, filter) ||
+      matchesModel(m.id, m.name, filter, m.free) ||
       getProviderLabel(pid).toLowerCase().includes(filter)
     );
 
     const apiModels = (allModels[pid] || []).filter(m =>
       !curated.find(c => c.id === m.id) &&
-      (!filter || matchesModel(m.id, m.name, filter))
+      (!filter || matchesModel(m.id, m.name, filter, m.free))
     );
 
     if (curated.length === 0 && apiModels.length === 0) continue;
@@ -3921,7 +4238,7 @@ function renderModelList(filter) {
     modelList.appendChild(header);
 
     for (const m of curated) {
-      modelList.appendChild(makeModelItem(pid, m.id, m.name, m.ctx, m.tags || [], m.capabilities || []));
+      modelList.appendChild(makeModelItem(pid, m.id, m.name, m.ctx, m.tags || [], m.capabilities || [], m.free));
       total++;
     }
 
@@ -3932,7 +4249,7 @@ function renderModelList(filter) {
         modelList.appendChild(div);
       }
       for (const m of apiModels) {
-        modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, [], m.capabilities || []));
+        modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, [], m.capabilities || [], m.free));
         total++;
       }
     }
@@ -3946,9 +4263,9 @@ function renderModelList(filter) {
   }
 }
 
-function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities) {
-  const isFreeModel = modelId === freeModelId;
-  const locked = needsPlan || (freeMode && !isFreeModel);
+function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities, free) {
+  const isFree = isFreeModel(modelId, free);
+  const locked = needsPlan || (freeMode && !isFree);
   const isSelected = modelId === currentModel && providerId === currentProvider;
   const item = document.createElement("div");
   item.className = "model-item" + (isSelected ? " selected" : "") + (locked ? " locked" : "");
@@ -3959,12 +4276,12 @@ function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities
 
   const name = document.createElement("span");
   name.className = "model-item-name";
-  name.textContent = modelDisplay(modelId, displayName);
+  name.textContent = modelDisplay(modelId, displayName, free);
 
   const badges = document.createElement("span");
   badges.className = "model-item-badges";
 
-  if (isFreeModel) {
+  if (isFree) {
     const freeBadge = document.createElement("span");
     freeBadge.className = "tag-badge free";
     freeBadge.textContent = "free";
@@ -4059,6 +4376,14 @@ function modelCaps(provider, modelId) {
 
 function currentModelSupportsThinking() {
   return modelCaps(currentProvider, currentModel).includes("thinking");
+}
+
+// Only block when we positively know the model's capabilities and "vision" is
+// absent — if caps are unknown (empty) we allow the send so we never wrongly
+// block a vision-capable model whose metadata didn't load.
+function currentModelSupportsVision() {
+  const caps = modelCaps(currentProvider, currentModel);
+  return caps.length === 0 || caps.includes("vision");
 }
 
 const reasoningRow = document.getElementById("reasoningRow");
@@ -4170,6 +4495,10 @@ function detectPlanIntent(text) {
 
 function buildQueueItem(text) {
   const reasoning = currentModelSupportsThinking() ? currentReasoning : "off";
+  // Capture and consume the attached images so the next message starts clean.
+  const images = pendingImages.map((i) => i.dataUrl);
+  pendingImages = [];
+  renderAttachStrip();
   return {
     id: "q" + (++queueSeq),
     text: text,
@@ -4178,6 +4507,7 @@ function buildQueueItem(text) {
     mode: currentMode,
     reasoningEffort: reasoning === "off" ? null : reasoning,
     compress: compressEnabled && currentProvider === "getaibd",
+    images: images,
   };
 }
 
@@ -4193,6 +4523,7 @@ function dispatchQueueItem(item) {
     mode: item.mode,
     reasoningEffort: item.reasoningEffort,
     compress: item.compress,
+    images: item.images && item.images.length ? item.images : undefined,
   });
 }
 
@@ -4315,11 +4646,23 @@ if (messageQueueEl) {
 
 function send() {
   const text = inputEl.value.trim();
-  if (!text) return;
+  if (!text && pendingImages.length === 0) return;
   if (!currentProvider || !currentModel) {
     modelDropdown.classList.add("open");
     modelSearch.value = "";
     renderModelList("");
+    return;
+  }
+  // Guard: don't ship images to a text-only model (e.g. DeepSeek) — the provider
+  // rejects them with an opaque 404. Tell the user and let them switch model or
+  // drop the attachment, keeping the images staged so nothing is lost.
+  if (pendingImages.length > 0 && !currentModelSupportsVision()) {
+    const note = document.createElement("div");
+    note.className = "context-compressed-msg";
+    note.textContent = modelDisplay(currentModel, currentModel) +
+      " can't read images. Remove the attachment or pick a model that supports image input, then send again.";
+    messagesEl.appendChild(note);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
     return;
   }
   const item = buildQueueItem(text);
@@ -4741,12 +5084,16 @@ function finalizeEdits(text) {
 }
 
 function appendThinkingBlock(cssClass, label, content) {
-  const text = (content || "").trim();
+  // Streamed reasoning arrives token-by-token, so DON'T trim (it would drop the spaces
+  // between tokens). Append into one continuous, scrollable text area rather than a div
+  // per event, so the thought reads as flowing prose the user can expand and scroll.
+  const text = content || "";
   if (!text) return;
   if (!thoughtEl) {
     thoughtStart = Date.now();
     thoughtEl = document.createElement("details");
     thoughtEl.className = "thinking-block thinking";
+    thoughtEl.open = true; // visible while thinking; collapses when finalized
     const summary = document.createElement("summary");
     summary.textContent = "Thinking\u2026";
     thoughtBodyEl = document.createElement("div");
@@ -4755,10 +5102,16 @@ function appendThinkingBlock(cssClass, label, content) {
     thoughtEl.appendChild(thoughtBodyEl);
     messagesEl.appendChild(thoughtEl);
   }
-  const line = document.createElement("div");
-  line.className = "thought-line";
-  line.textContent = label === "Thinking" ? text : label + ": " + text;
-  thoughtBodyEl.appendChild(line);
+  // Discrete whole-block events (plan/reflection from the non-streaming path) carry a
+  // label and full text; set them off on their own line. Streamed "Thinking" tokens
+  // just flow inline.
+  if (label && label !== "Thinking") {
+    if (thoughtBodyEl.textContent) { thoughtBodyEl.appendChild(document.createTextNode("\\n\\n")); }
+    thoughtBodyEl.appendChild(document.createTextNode(label + ": "));
+  }
+  thoughtBodyEl.appendChild(document.createTextNode(text));
+  // Keep the latest reasoning in view within the block while it streams.
+  thoughtBodyEl.scrollTop = thoughtBodyEl.scrollHeight;
   updateThoughtSummary();
   scrollToBottom();
 }
@@ -4771,6 +5124,7 @@ function updateThoughtSummary() {
 }
 
 function finalizeThought() {
+  if (thoughtEl) { thoughtEl.open = false; } // collapse once thinking is done
   updateThoughtSummary();
   thoughtEl = null;
   thoughtBodyEl = null;
@@ -4935,11 +5289,14 @@ window.addEventListener("message", (event) => {
     case "bootStatus":
       if (bootOverlay) {
         if (msg.state === "ready") {
-          bootOverlay.classList.add("hidden");
-        } else {
+          clearBoot();
+        } else if (!bootDone) {
+          // Only the very first boot may show the blocking overlay; after that
+          // a reload/re-resolve loop can never re-trap the panel on the spinner.
           bootOverlay.classList.remove("hidden");
           bootOverlay.classList.toggle("error", msg.state === "error");
           if (bootText && msg.text) { bootText.textContent = msg.text; }
+          armBootWatchdog();
         }
       }
       break;
@@ -5037,6 +5394,19 @@ window.addEventListener("message", (event) => {
       badge.className = "context-compressed-msg";
       badge.textContent = "Mode: " + detected;
       messagesEl.appendChild(badge);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      break;
+    }
+
+    case "addImageAttachment":
+      addPendingImage(msg.name, msg.dataUrl);
+      break;
+
+    case "attachError": {
+      const note = document.createElement("div");
+      note.className = "context-compressed-msg";
+      note.textContent = msg.message || "Attachment skipped.";
+      messagesEl.appendChild(note);
       messagesEl.scrollTop = messagesEl.scrollHeight;
       break;
     }
@@ -5508,6 +5878,7 @@ window.addEventListener("message", (event) => {
 });
 
 vscode.postMessage({ type: "ready" });
+armBootWatchdog();
 try { var __b = document.getElementById("brand"); if (__b) { __b.textContent = "GetAIBD"; } } catch (_) {}
 </script>
 </body>

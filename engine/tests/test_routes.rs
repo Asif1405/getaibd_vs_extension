@@ -41,6 +41,7 @@ impl Provider for MockProvider {
             id: "mock-model".into(),
             name: "Mock Model".into(),
             capabilities: vec![],
+            free: false,
         }])
     }
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, AppError> {

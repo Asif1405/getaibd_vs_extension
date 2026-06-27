@@ -61,6 +61,9 @@ pub struct OrchestratedRequest {
     /// Stable per-workspace chat id for GetAIBD prompt-cache sticky routing.
     #[serde(default)]
     pub cache_session_id: Option<String>,
+    /// Base64 `data:` image URLs attached to this turn (vision-capable models).
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,7 +150,7 @@ pub async fn orchestrated_agent_handler(
 #[allow(clippy::too_many_arguments)]
 async fn run_orchestrated_task(
     state: &AppState,
-    req: OrchestratedRequest,
+    mut req: OrchestratedRequest,
     provider: Arc<dyn crate::providers::Provider>,
     registry: ToolRegistry,
     gate: Option<crate::tools::approval::ApprovalGate>,
@@ -172,7 +175,8 @@ async fn run_orchestrated_task(
         .with_environment(environment)
         .with_user_rules(req.user_rules.clone())
         .with_workspace_cwd(workspace_cwd)
-        .with_cache_session_id(req.cache_session_id.clone());
+        .with_cache_session_id(req.cache_session_id.clone())
+        .with_user_images(std::mem::take(&mut req.images));
 
     for h in &req.history {
         let msg = match h.role.as_str() {
