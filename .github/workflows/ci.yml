@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Engine — Check, Lint, Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Advisory: the crate sets `clippy::pedantic = warn` on purpose, so we surface
+      # clippy on every PR without failing on the pre-existing pedantic/style backlog.
+      # Tighten to `-D warnings` once that backlog is burned down.
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets
+        continue-on-error: true
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+  extension:
+    name: Extension — Lint, Type-check, Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run check-types
+
+      - name: Build (esbuild, production)
+        run: node esbuild.js --production

@@ -107,9 +107,23 @@ pub async fn retrieve_context(
     top_k: usize,
 ) -> Result<Vec<RetrievedMemory>, AppError> {
     let query_emb = embedder.embed(query).await?;
-    let results = store.hybrid_search(&query_emb, query, top_k)?;
+    // hybrid_search scans the memory table and scores every row with cosine
+    // similarity — a synchronous, CPU/IO-bound rusqlite call. Run it on the blocking
+    // pool so it never stalls the async runtime that is simultaneously streaming the
+    // model response (H-3).
+    let results = {
+        let store = store.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || store.hybrid_search(&query_emb, &query, top_k))
+            .await
+            .map_err(|e| AppError::ProviderError(format!("memory search task join: {e}")))??
+    };
     let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
-    let _ = store.touch_many(&ids);
+    {
+        // Reinforcement write is best-effort and also synchronous; offload it too.
+        let store = store.clone();
+        let _ = tokio::task::spawn_blocking(move || store.touch_many(&ids)).await;
+    }
     Ok(results)
 }
 

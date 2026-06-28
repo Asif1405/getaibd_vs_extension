@@ -42,6 +42,7 @@ import {
   truncateFileContent,
   HISTORY_CHAR_BUDGET,
 } from "../util/contextBudget";
+import { msgString, msgBool, msgStringArray } from "../util/webviewMessage";
 
 interface WebviewMessage {
   type: string;
@@ -287,6 +288,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     view.onDidDispose(() => {
       this.view = undefined;
       this.ready = false;
+      this.dispose();
     }, undefined, this.disposables);
     // If the panel is re-shown after the engine already came up, re-assert the
     // boot state so the overlay can't linger on a webview that missed (or lost)
@@ -462,15 +464,21 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "ready":
         await this.onReady();
         break;
-      case "loadModels":
-        if (msg.provider) {await this.loadModels(msg.provider as string);}
+      case "loadModels": {
+        const provider = msgString(msg, "provider");
+        if (provider) {await this.loadModels(provider);}
         break;
-      case "send":
-        if (msg.provider && msg.model && msg.text) {
-          this.saveSelections(msg.provider as string, msg.model as string);
-          await this.sendUserMessage(msg.provider as string, msg.model as string, msg.text as string);
+      }
+      case "send": {
+        const provider = msgString(msg, "provider");
+        const model = msgString(msg, "model");
+        const text = msgString(msg, "text");
+        if (provider && model && text) {
+          this.saveSelections(provider, model);
+          await this.sendUserMessage(provider, model, text);
         }
         break;
+      }
       case "stop":
         if (this.reconnectTimer) {
           clearTimeout(this.reconnectTimer);
@@ -482,82 +490,105 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.currentStreamContent = "";
         this.post({ type: "streamEnd" });
         break;
-      case "agentSend":
-        if (msg.provider && msg.model && msg.text) {
-          this.saveSelections(msg.provider as string, msg.model as string);
-          await this.sendAgentTask(msg.provider as string, msg.model as string, msg.text as string);
+      case "agentSend": {
+        const provider = msgString(msg, "provider");
+        const model = msgString(msg, "model");
+        const text = msgString(msg, "text");
+        if (provider && model && text) {
+          this.saveSelections(provider, model);
+          await this.sendAgentTask(provider, model, text);
         }
         break;
+      }
       case "orchestratedSend": {
-        const imgs = Array.isArray(msg.images) ? (msg.images as string[]) : undefined;
-        if (msg.provider && msg.model && (msg.text || imgs?.length)) {
-          this.saveSelections(msg.provider as string, msg.model as string);
+        const provider = msgString(msg, "provider");
+        const model = msgString(msg, "model");
+        const text = msgString(msg, "text");
+        const imgs = msgStringArray(msg, "images");
+        if (provider && model && (text || imgs.length)) {
+          this.saveSelections(provider, model);
           await this.sendOrchestrated(
-            msg.provider as string,
-            msg.model as string,
-            (msg.text as string) || "Describe the attached image(s).",
-            (msg.mode as string) || "agent",
-            (msg.reasoningEffort as string | undefined) ?? undefined,
-            !!msg.compress,
-            imgs,
+            provider,
+            model,
+            text || "Describe the attached image(s).",
+            msgString(msg, "mode") || "agent",
+            msgString(msg, "reasoningEffort") ?? undefined,
+            msgBool(msg, "compress"),
+            imgs.length ? imgs : undefined,
           );
         }
         break;
       }
       case "compressChanged":
-        await this.globalState.update(COMPRESS_KEY, !!msg.compress);
+        await this.globalState.update(COMPRESS_KEY, msgBool(msg, "compress"));
         break;
       case "reasoningChanged": {
-        const effort = String(msg.reasoningEffort || "medium");
+        const effort = msgString(msg, "reasoningEffort") || "medium";
         await this.globalState.update(REASONING_KEY, effort);
         break;
       }
       case "useMemoryChanged":
-        await this.globalState.update(MEMORY_KEY, !!msg.useMemory);
+        await this.globalState.update(MEMORY_KEY, msgBool(msg, "useMemory"));
         break;
-      case "openDiff":
-        if (msg.path) {await this.openDiff(msg.path as string);}
+      case "openDiff": {
+        const p = msgString(msg, "path");
+        if (p) {await this.openDiff(p);}
         break;
+      }
       case "openReview":
         await this.openReview();
         break;
-      case "restoreCheckpoint":
-        if (msg.turnId) {await this.restoreCheckpoint(msg.turnId as string);}
+      case "restoreCheckpoint": {
+        const turnId = msgString(msg, "turnId");
+        if (turnId) {await this.restoreCheckpoint(turnId);}
         break;
-      case "editUserMessage":
-        if (msg.text) {
+      }
+      case "editUserMessage": {
+        const text = msgString(msg, "text");
+        if (text) {
           await this.editUserMessage(
-            msg.turnId as string | undefined,
+            msgString(msg, "turnId"),
             typeof msg.historyPos === "number" ? msg.historyPos : undefined,
-            msg.text as string,
+            text,
           );
         }
         break;
+      }
       case "keepEdits":
         this.keepEdits();
         break;
       case "undoEdits":
         await this.undoEdits();
         break;
-      case "keepEdit":
-        if (msg.path) {this.keepEdit(msg.path as string);}
+      case "keepEdit": {
+        const p = msgString(msg, "path");
+        if (p) {this.keepEdit(p);}
         break;
-      case "undoEdit":
-        if (msg.path) {await this.undoEdit(msg.path as string);}
+      }
+      case "undoEdit": {
+        const p = msgString(msg, "path");
+        if (p) {await this.undoEdit(p);}
         break;
-      case "approvalResponse":
-        if (msg.requestId) {await this.resolveApproval(msg.requestId as string, !!msg.approved, !!msg.always);}
+      }
+      case "approvalResponse": {
+        const requestId = msgString(msg, "requestId");
+        if (requestId) {await this.resolveApproval(requestId, msgBool(msg, "approved"), msgBool(msg, "always"));}
         break;
-      case "askResponse":
-        if (msg.requestId) {await this.resolveAsk(msg.requestId as string, (msg.answer as string) ?? "");}
+      }
+      case "askResponse": {
+        const requestId = msgString(msg, "requestId");
+        if (requestId) {await this.resolveAsk(requestId, msgString(msg, "answer") ?? "");}
         break;
-      case "removeAlwaysAllow":
-        if (msg.tool) {
-          const list = this.getAlwaysAllow().filter((t) => t !== msg.tool);
+      }
+      case "removeAlwaysAllow": {
+        const tool = msgString(msg, "tool");
+        if (tool) {
+          const list = this.getAlwaysAllow().filter((t) => t !== tool);
           await this.globalState.update(ALWAYS_ALLOW_KEY, list);
           await this.sendSettings();
         }
         break;
+      }
       case "clearHistory":
         this.history = [];
         this.saveHistory();
@@ -565,38 +596,50 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "newSession":
         this.newSession();
         break;
-      case "switchSession":
-        if (msg.id) {this.switchSession(msg.id as string);}
+      case "switchSession": {
+        const id = msgString(msg, "id");
+        if (id) {this.switchSession(id);}
         break;
-      case "deleteSession":
-        if (msg.id) {this.deleteSession(msg.id as string);}
+      }
+      case "deleteSession": {
+        const id = msgString(msg, "id");
+        if (id) {this.deleteSession(id);}
         break;
-      case "copy":
-        if (msg.content) {await vscode.env.clipboard.writeText(msg.content as string);}
+      }
+      case "copy": {
+        const content = msgString(msg, "content");
+        if (content) {await vscode.env.clipboard.writeText(content);}
         break;
-      case "insertToEditor":
-        if (msg.content) {
+      }
+      case "insertToEditor": {
+        const content = msgString(msg, "content");
+        if (content) {
           const editor = vscode.window.activeTextEditor;
           if (editor) {
-            await editor.edit((b) => b.insert(editor.selection.active, msg.content as string));
+            await editor.edit((b) => b.insert(editor.selection.active, content));
           } else {
-            const doc = await vscode.workspace.openTextDocument({ content: msg.content as string });
+            const doc = await vscode.workspace.openTextDocument({ content });
             await vscode.window.showTextDocument(doc);
           }
         }
         break;
+      }
       case "attachFile":
         await this.attachFileContext();
         break;
       case "dropUris":
-        await this.handleDroppedUris((msg.uris as string[]) || []);
+        await this.handleDroppedUris(msgStringArray(msg, "uris"));
         break;
-      case "modeChanged":
-        if (msg.mode) {this.globalState.update(MODE_KEY, msg.mode as string);}
+      case "modeChanged": {
+        const mode = msgString(msg, "mode");
+        if (mode) {this.globalState.update(MODE_KEY, mode);}
         break;
-      case "previewPatch":
-        if (msg.content) {await this.previewPatch(msg.content as string);}
+      }
+      case "previewPatch": {
+        const content = msgString(msg, "content");
+        if (content) {await this.previewPatch(content);}
         break;
+      }
       case "needApiKey":
         await this.promptPaymentRequired();
         break;
@@ -615,15 +658,17 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "saveProviderConfig":
         await this.handleSaveProvider(msg);
         break;
-      case "saveApiKey":
+      case "saveApiKey": {
+        const key = msgString(msg, "key") ?? "";
         if (msg.providerId === "getaibd") {
-          await setApiKey(this.context.secrets, (msg.key as string) || "");
+          await setApiKey(this.context.secrets, key);
           await this.applyGetaibdKeyChange();
         } else {
-          await this.store.setApiKey(msg.providerId as string, msg.key as string);
+          await this.store.setApiKey(msgString(msg, "providerId") ?? "", key);
         }
         await this.sendSettings();
         break;
+      }
       case "removeApiKey":
         if (msg.providerId === "getaibd") {
           try {
@@ -634,7 +679,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
           }
           await this.applyGetaibdKeyChange();
         } else {
-          await this.store.setApiKey(msg.providerId as string, "");
+          await this.store.setApiKey(msgString(msg, "providerId") ?? "", "");
         }
         await this.sendSettings();
         break;
@@ -642,7 +687,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         await this.handleTestProvider(msg);
         break;
       case "updateServerUrl":
-        await vscode.workspace.getConfiguration("getaibd").update("serverUrl", msg.url as string, true);
+        await vscode.workspace.getConfiguration("getaibd").update("serverUrl", msgString(msg, "url") ?? "", true);
         break;
       case "updatePreference":
         await this.handleUpdatePreference(msg);
@@ -1075,27 +1120,57 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   private async resolveAtMentions(text: string, skipPaths?: Set<string>): Promise<ChatMessage[]> {
-    const mentionRe = /@([^\s]+)/g;
+    // Matches `@path`, optionally followed by a line range as `@path (12-40)` or
+    // `@path:12-40`. The path char-class stops before whitespace, `(`, and `:` so the
+    // range is parsed separately.
+    const mentionRe = /@([A-Za-z0-9._/\-]+)(?:\s*\((\d+)\s*-\s*(\d+)\)|:(\d+)-(\d+))?/g;
+    // Don't resolve mentions into dependency/build dirs.
+    const EXCLUDE = "**/{node_modules,.venv,venv,env,.git,dist,build,target,__pycache__,.next,.cache,vendor}/**";
     const messages: ChatMessage[] = [];
     let m: RegExpExecArray | null;
     const resolved = new Set<string>();
     while ((m = mentionRe.exec(text)) !== null) {
-      const ref = m[1];
-      if (resolved.has(ref)) {continue;}
+      const ref = m[1].replace(/[.,;]+$/, "");
+      if (!ref) {continue;}
+      const start = m[2] ? parseInt(m[2], 10) : m[4] ? parseInt(m[4], 10) : undefined;
+      const end = m[3] ? parseInt(m[3], 10) : m[5] ? parseInt(m[5], 10) : undefined;
+      const key = start ? `${ref}:${start}-${end}` : ref;
+      if (resolved.has(key)) {continue;}
       if (skipPaths?.has(ref) || skipPaths?.has(`@${ref}`)) {continue;}
-      resolved.add(ref);
-      const files = await vscode.workspace.findFiles(ref, null, 1);
-      if (files.length > 0) {
-        const doc = await vscode.workspace.openTextDocument(files[0]);
-        const full = doc.getText();
-        const snippet = truncateFileContent(full);
-        messages.push({ role: "user", content: `[File: ${ref}]\n\`\`\`\n${snippet}\n\`\`\`` });
-        this.post({
-          type: "addContext",
-          label: `@${ref}`,
-          code: full.slice(0, 500) + (full.length > 500 ? "\n..." : ""),
-        });
+      resolved.add(key);
+
+      // Resolve to a real file. A bare "@panel.ts" should find src/chat/panel.ts, so for
+      // a path without a slash search recursively by name; otherwise try the exact
+      // relative path first, then a recursive match as a fallback.
+      const globs = ref.includes("/") ? [ref, `**/${ref}`] : [`**/${ref}`];
+      let found: vscode.Uri | undefined;
+      for (const g of globs) {
+        const files = await vscode.workspace.findFiles(g, EXCLUDE, 1);
+        if (files.length > 0) { found = files[0]; break; }
       }
+      if (!found) {continue;}
+
+      const doc = await vscode.workspace.openTextDocument(found);
+      const fullText = doc.getText();
+      let content = fullText;
+      let header = `[File: ${ref}]`;
+      let label = `@${ref}`;
+      if (start && end) {
+        const lines = fullText.split("\n");
+        const s = Math.max(1, Math.min(start, lines.length));
+        const e = Math.max(s, Math.min(end, lines.length));
+        content = lines.slice(s - 1, e).join("\n");
+        // Keep the bracket as just the path so open-file dedupe still matches.
+        header = `[File: ${ref}] (lines ${s}-${e})`;
+        label = `@${ref} (${s}-${e})`;
+      }
+      const snippet = truncateFileContent(content);
+      messages.push({ role: "user", content: `${header}\n\`\`\`\n${snippet}\n\`\`\`` });
+      this.post({
+        type: "addContext",
+        label,
+        code: content.slice(0, 500) + (content.length > 500 ? "\n..." : ""),
+      });
     }
     return messages;
   }
@@ -2158,12 +2233,8 @@ function stripThinking(text: string): string {
 /* ───────────────────────────── WEBVIEW HTML ───────────────────────────── */
 
 function getNonce(): string {
-  let text = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 32; i++) {
-    text += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return text;
+  // Cryptographically strong nonce (Math.random is not suitable for a CSP nonce).
+  return crypto.randomBytes(16).toString("base64url");
 }
 
 function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): string {
@@ -2177,7 +2248,7 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} https: http: data: blob:; media-src ${cspSource} https: http: data: blob:; font-src ${cspSource} https: data:; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data: blob:; media-src ${cspSource} data: blob:; font-src ${cspSource} https: data:; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}';">
 <script nonce="${nonce}" src="${markdownUri}"></script>
 <title>GetAIBD</title>
 <style>
@@ -3621,7 +3692,7 @@ body {
 
 <div class="composer">
   <div class="attach-strip" id="attachStrip" style="display:none"></div>
-  <textarea id="input" rows="1" placeholder="Ask anything... (use @filename to reference files, paste or drop images)"></textarea>
+  <textarea id="input" rows="1" placeholder="Ask anything... (paste or drop images)"></textarea>
   <div class="composer-row">
     <button class="ctl-pill" id="modePill" title="Mode">
       <span class="ctl-icon" id="modePillIcon">&#8734;</span>
@@ -3843,6 +3914,8 @@ let agentDraftEl = null;
 let thoughtEl = null;
 let thoughtBodyEl = null;
 let thoughtStart = 0;
+let thoughtKind = "";
+let thoughtTimer = null;
 let currentMode = "agent";
 let settingsOpen = false;
 let editStats = {};
@@ -3933,7 +4006,7 @@ function matchesModel(modelId, name, filter, free) {
 const MODE_PLACEHOLDERS = {
   plan: "Describe what you want to plan...",
   ask: "Ask a question...",
-  agent: "Ask anything... (use @filename to reference files)",
+  agent: "Ask anything...",
   debug: "Describe the error or bug to debug...",
 };
 
@@ -5083,28 +5156,36 @@ function finalizeEdits(text) {
   editCardEls = {};
 }
 
+// One reasoning box per turn: a single collapsible, scrollable <details> that all of
+// the turn's reasoning (plan/thinking/reflection across every step) streams into. It
+// stays open while the agent thinks and collapses to "Thought for Ns" when the turn ends.
+// (Splitting per phase/step fragmented the stream into many one-line boxes.)
+function startThoughtBox(cssClass) {
+  thoughtKind = "thinking";
+  thoughtStart = Date.now();
+  thoughtEl = document.createElement("details");
+  thoughtEl.className = "thinking-block " + (cssClass || "thinking");
+  thoughtEl.open = true; // visible while thinking; collapses when finalized
+  const summary = document.createElement("summary");
+  summary.textContent = "Thinking\u2026";
+  thoughtBodyEl = document.createElement("div");
+  thoughtBodyEl.className = "thinking-content";
+  thoughtEl.appendChild(summary);
+  thoughtEl.appendChild(thoughtBodyEl);
+  messagesEl.appendChild(thoughtEl);
+  // Live-tick the summary so the elapsed time advances even between tokens.
+  if (thoughtTimer) { clearInterval(thoughtTimer); }
+  thoughtTimer = setInterval(updateThoughtSummary, 1000);
+}
+
 function appendThinkingBlock(cssClass, label, content) {
   // Streamed reasoning arrives token-by-token, so DON'T trim (it would drop the spaces
-  // between tokens). Append into one continuous, scrollable text area rather than a div
-  // per event, so the thought reads as flowing prose the user can expand and scroll.
+  // between tokens). Everything flows into the one open box for this turn.
   const text = content || "";
   if (!text) return;
-  if (!thoughtEl) {
-    thoughtStart = Date.now();
-    thoughtEl = document.createElement("details");
-    thoughtEl.className = "thinking-block thinking";
-    thoughtEl.open = true; // visible while thinking; collapses when finalized
-    const summary = document.createElement("summary");
-    summary.textContent = "Thinking\u2026";
-    thoughtBodyEl = document.createElement("div");
-    thoughtBodyEl.className = "thinking-content";
-    thoughtEl.appendChild(summary);
-    thoughtEl.appendChild(thoughtBodyEl);
-    messagesEl.appendChild(thoughtEl);
-  }
-  // Discrete whole-block events (plan/reflection from the non-streaming path) carry a
-  // label and full text; set them off on their own line. Streamed "Thinking" tokens
-  // just flow inline.
+  if (!thoughtEl) { startThoughtBox(cssClass); }
+  // Discrete whole-block events (plan/reflection) carry a label; set them off on their
+  // own line. Streamed "Thinking" tokens just flow inline.
   if (label && label !== "Thinking") {
     if (thoughtBodyEl.textContent) { thoughtBodyEl.appendChild(document.createTextNode("\\n\\n")); }
     thoughtBodyEl.appendChild(document.createTextNode(label + ": "));
@@ -5124,11 +5205,15 @@ function updateThoughtSummary() {
 }
 
 function finalizeThought() {
-  if (thoughtEl) { thoughtEl.open = false; } // collapse once thinking is done
-  updateThoughtSummary();
+  if (thoughtTimer) { clearInterval(thoughtTimer); thoughtTimer = null; }
+  if (thoughtEl) {
+    updateThoughtSummary();
+    thoughtEl.open = false; // collapse once thinking is done
+  }
   thoughtEl = null;
   thoughtBodyEl = null;
   thoughtStart = 0;
+  thoughtKind = "";
 }
 
 function stripThinkingTags(text) {
@@ -5471,6 +5556,7 @@ window.addEventListener("message", (event) => {
 
     case "streamEnd":
       streaming = false;
+      finalizeThought(); // never leave a reasoning box (or its timer) running
       if (streamEl && streamContent) appendActionBtns(streamEl, streamContent);
       streamEl = null;
       streamContent = "";
@@ -5513,9 +5599,7 @@ window.addEventListener("message", (event) => {
       agentDraftEl = null;
       agentTextContent = "";
       agentStreamedResponse = false;
-      thoughtEl = null;
-      thoughtBodyEl = null;
-      thoughtStart = 0;
+      finalizeThought();
       toolGroupEl = null;
       toolGroupBodyEl = null;
       toolGroupCount = 0;

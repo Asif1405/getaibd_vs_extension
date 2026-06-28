@@ -1,6 +1,9 @@
 import { getServerUrl, getBaseUrl, authHeaders } from "./util/config";
 import { describeEnvironment } from "./util/environment";
 
+/** Result of a fire-and-forget POST back to the local engine (approval/terminal/ask). */
+export type EnginePostResult = { ok: true } | { ok: false; error: string };
+
 /** fetch() with a hard timeout so a stalled request can never hang the caller
  * (a plain fetch only rejects when the socket itself gives up, which may be
  * minutes — long enough to freeze the boot overlay on "Getting ready…"). */
@@ -291,12 +294,28 @@ export interface FileEdit {
   too_large?: boolean;
 }
 
-export async function sendApproval(requestId: string, approved: boolean, sessionId?: string): Promise<void> {
-  await fetch(`${getServerUrl()}/agent/approve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify({ request_id: requestId, approved, session_id: sessionId }),
-  });
+export async function sendApproval(
+  requestId: string,
+  approved: boolean,
+  sessionId?: string,
+): Promise<EnginePostResult> {
+  try {
+    const resp = await fetchWithTimeout(`${getServerUrl()}/agent/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ request_id: requestId, approved, session_id: sessionId }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { ok: false, error: `HTTP ${resp.status}: ${text}` };
+    }
+    return { ok: true };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to send approval",
+    };
+  }
 }
 
 /** Posts a delegated terminal command's captured result back to the engine. */
@@ -304,12 +323,28 @@ export async function sendTerminalResult(
   requestId: string,
   result: { stdout: string; stderr: string; exit_code: number },
   sessionId?: string,
-): Promise<void> {
-  await fetch(`${getServerUrl()}/agent/terminal_result`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify({ request_id: requestId, session_id: sessionId, result: JSON.stringify(result) }),
-  });
+): Promise<EnginePostResult> {
+  try {
+    const resp = await fetchWithTimeout(`${getServerUrl()}/agent/terminal_result`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({
+        request_id: requestId,
+        session_id: sessionId,
+        result: JSON.stringify(result),
+      }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { ok: false, error: `HTTP ${resp.status}: ${text}` };
+    }
+    return { ok: true };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to send terminal result",
+    };
+  }
 }
 
 /** Posts the user's answer to a clarifying question back to the engine. */
@@ -317,12 +352,24 @@ export async function sendAskResult(
   requestId: string,
   answer: string,
   sessionId?: string,
-): Promise<void> {
-  await fetch(`${getServerUrl()}/agent/ask_result`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify({ request_id: requestId, session_id: sessionId, answer }),
-  });
+): Promise<EnginePostResult> {
+  try {
+    const resp = await fetchWithTimeout(`${getServerUrl()}/agent/ask_result`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ request_id: requestId, session_id: sessionId, answer }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { ok: false, error: `HTTP ${resp.status}: ${text}` };
+    }
+    return { ok: true };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to send ask result",
+    };
+  }
 }
 
 export function streamAgent(

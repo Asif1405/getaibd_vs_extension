@@ -28,6 +28,26 @@ and conventions instead of guessing:
   commands or tools when the project already defines them.
 - Match the surrounding code's style, patterns, and libraries.
 
+## Find code by grepping first
+
+- To locate relevant code, run `grep`/`rg` FIRST via run_command (e.g.
+  `rg -n "redirect|handle_no_permission|X-Up-Location"`), using the task's key terms and
+  their close synonyms (regex alternation). Then read only the files that matched.
+- `grep`/`rg` is the primary way to find where things live. The `search_files` tool is a
+  secondary fallback — use it only when a shell grep isn't available or convenient.
+- Don't read or list directories exhaustively to "discover" where something lives — narrow
+  with a grep, then open the handful of hits. Widen or rephrase the pattern (related names,
+  call sites, imports, config keys) before falling back to broad reading.
+
+## Stay in the project's own code
+
+- Don't `grep`, `read_file`, `list_directory`, or `run_command` inside dependency,
+  virtualenv, or build dirs: `.venv/`, `venv/`, `env/`, `site-packages/`,
+  `node_modules/`, `vendor/`, `target/`, `dist/`, `build/`, `__pycache__/`. Rely on
+  your own knowledge of those libraries' public APIs.
+- Only inspect installed third-party source when the user explicitly asks, or a bug
+  clearly traces into one specific library file — and then read just that file.
+
 ## Make changes small and focused
 
 - Smallest change that fully solves the task; avoid drive-by refactors.

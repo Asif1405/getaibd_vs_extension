@@ -19,7 +19,7 @@ fn edit_payload(path: &str, old_content: &str, new_content: &str) -> Value {
     })
 }
 
-fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
+pub(crate) fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
     let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let candidate = if Path::new(relative).is_absolute() {
         PathBuf::from(relative)
@@ -379,14 +379,18 @@ impl Tool for SearchFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for a pattern (plain text or regex)."
+        "Secondary code-search fallback: search file contents for a pattern (plain text or \
+         regex), returning matching file paths with line numbers. Prefer `grep`/`rg` via \
+         run_command to locate code; use this only when a shell grep isn't available or \
+         convenient. Search the task's key terms plus close synonyms via regex alternation \
+         (e.g. `login|signin|authenticate`), then read only the files that match."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Search pattern (text or regex)" },
+                "pattern": { "type": "string", "description": "Search pattern (text or regex). Use alternation to cover synonyms, e.g. 'redirect|handle_no_permission'" },
                 "path": { "type": "string", "description": "Directory to search (default: '.')" },
                 "glob": { "type": "string", "description": "File glob filter (e.g. '*.rs')" },
                 "max_results": { "type": "integer", "description": "Max matches to return (default: 50)" }

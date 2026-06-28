@@ -220,7 +220,11 @@ pub async fn incremental_index(
     for prev_path in &previous_paths {
         if !current_files.contains_key(prev_path) {
             let source_tag = format!("file:{prev_path}");
-            store.delete_by_source(&source_tag)?;
+            // Offload the blocking rusqlite delete off the async runtime (H-3).
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || store.delete_by_source(&source_tag))
+                .await
+                .map_err(|e| AppError::ProviderError(format!("memory delete join: {e}")))??;
             merkle.remove_file(prev_path)?;
             removed += 1;
         }

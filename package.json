@@ -291,6 +291,7 @@
     "engine:build": "cargo build --release --manifest-path engine/Cargo.toml"
   },
   "devDependencies": {
+    "@types/dompurify": "^3.0.5",
     "@types/node": "22.x",
     "@types/vscode": "^1.105.0",
     "esbuild": "^0.27.3",
@@ -300,6 +301,7 @@
     "typescript-eslint": "^8.56.1"
   },
   "dependencies": {
+    "dompurify": "^3.4.11",
     "marked": "^14.1.4"
   }
 }

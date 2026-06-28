@@ -2023,7 +2023,13 @@ async fn finish_agent(
             }
         }
 
-        let _ = mem.store.prune_oldest(mem.max_entries);
+        // Pruning is a synchronous rusqlite delete; offload it so it can't block the
+        // async runtime (H-3).
+        let _ = {
+            let store = mem.store.clone();
+            let max_entries = mem.max_entries;
+            tokio::task::spawn_blocking(move || store.prune_oldest(max_entries)).await
+        };
     }
 
     Ok(AgentResult {
@@ -2324,6 +2330,12 @@ async fn check_approval(
     on_event: &mut impl FnMut(AgentEvent),
 ) -> bool {
     if !tool.requires_approval() {
+        return true;
+    }
+
+    // Read-only inspection commands (grep/rg/find/ls/cat/…) run without prompting — they
+    // can't mutate the workspace, and network/shell launchers are hard-blocked elsewhere.
+    if call.name == "run_command" && crate::tools::command::is_auto_approved(&call.arguments) {
         return true;
     }
 

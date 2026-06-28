@@ -41,14 +41,40 @@ impl<'a> MemoryIndexer<'a> {
         self
     }
 
+    /// Runs the blocking `SQLite` writes (optional delete-by-source, then inserts) on
+    /// the blocking pool. `rusqlite` is synchronous, so doing this inline would stall
+    /// a tokio worker for the whole batch; `spawn_blocking` keeps the async runtime
+    /// responsive (matches the retrieval path and `workspace.rs`). Deleting alongside
+    /// the inserts (rather than up-front) also avoids wiping old entries when an
+    /// embedding call fails midway.
+    async fn write_entries(
+        &self,
+        delete_tag: Option<String>,
+        entries: Vec<MemoryEntry>,
+    ) -> Result<(), AppError> {
+        if delete_tag.is_none() && entries.is_empty() {
+            return Ok(());
+        }
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            if let Some(tag) = delete_tag {
+                store.delete_by_source(&tag)?;
+            }
+            for entry in &entries {
+                store.insert(entry)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AppError::ProviderError(format!("memory index join: {e}")))?
+    }
+
     pub async fn index_file(&self, path: &Path, content: &str) -> Result<usize, AppError> {
         let path_str = path.to_string_lossy().to_string();
-        self.store.delete_by_source(
-            &MemorySource::File {
-                path: path_str.clone(),
-            }
-            .to_tag(),
-        )?;
+        let delete_tag = MemorySource::File {
+            path: path_str.clone(),
+        }
+        .to_tag();
 
         let is_code = is_code_file(path);
         let chunks = if is_code {
@@ -58,6 +84,8 @@ impl<'a> MemoryIndexer<'a> {
         };
 
         if chunks.is_empty() {
+            // Still clear any stale entries for this file.
+            self.write_entries(Some(delete_tag), Vec::new()).await?;
             return Ok(0);
         }
 
@@ -65,8 +93,11 @@ impl<'a> MemoryIndexer<'a> {
         let embeddings = self.embedder.embed_batch(&chunk_refs).await?;
         let now = unix_timestamp();
 
-        for (i, (chunk, emb)) in chunks.iter().zip(embeddings).enumerate() {
-            let entry = MemoryEntry {
+        let entries: Vec<MemoryEntry> = chunks
+            .iter()
+            .zip(embeddings)
+            .enumerate()
+            .map(|(i, (chunk, emb))| MemoryEntry {
                 id: format!("file:{path_str}:{i}"),
                 content: chunk.clone(),
                 embedding: emb,
@@ -75,11 +106,11 @@ impl<'a> MemoryIndexer<'a> {
                 },
                 tier: MemoryTier::Medium,
                 timestamp: now,
-            };
-            self.store.insert(&entry)?;
-        }
-
-        Ok(chunks.len())
+            })
+            .collect();
+        let n = entries.len();
+        self.write_entries(Some(delete_tag), entries).await?;
+        Ok(n)
     }
 
     pub async fn index_session(
@@ -87,17 +118,16 @@ impl<'a> MemoryIndexer<'a> {
         session_id: &str,
         messages: &[ToolMessage],
     ) -> Result<usize, AppError> {
-        self.store.delete_by_source(
-            &MemorySource::Session {
-                session_id: session_id.to_string(),
-            }
-            .to_tag(),
-        )?;
+        let delete_tag = MemorySource::Session {
+            session_id: session_id.to_string(),
+        }
+        .to_tag();
 
         let text = summarize_session(messages);
         let chunks = chunk_text(&text, self.chunk_size, self.chunk_overlap);
 
         if chunks.is_empty() {
+            self.write_entries(Some(delete_tag), Vec::new()).await?;
             return Ok(0);
         }
 
@@ -105,8 +135,11 @@ impl<'a> MemoryIndexer<'a> {
         let embeddings = self.embedder.embed_batch(&chunk_refs).await?;
         let now = unix_timestamp();
 
-        for (i, (chunk, emb)) in chunks.iter().zip(embeddings).enumerate() {
-            let entry = MemoryEntry {
+        let entries: Vec<MemoryEntry> = chunks
+            .iter()
+            .zip(embeddings)
+            .enumerate()
+            .map(|(i, (chunk, emb))| MemoryEntry {
                 id: format!("session:{session_id}:{i}"),
                 content: chunk.clone(),
                 embedding: emb,
@@ -115,11 +148,11 @@ impl<'a> MemoryIndexer<'a> {
                 },
                 tier: MemoryTier::Short,
                 timestamp: now,
-            };
-            self.store.insert(&entry)?;
-        }
-
-        Ok(chunks.len())
+            })
+            .collect();
+        let n = entries.len();
+        self.write_entries(Some(delete_tag), entries).await?;
+        Ok(n)
     }
 
     pub async fn index_text(
@@ -138,35 +171,34 @@ impl<'a> MemoryIndexer<'a> {
         let embeddings = self.embedder.embed_batch(&chunk_refs).await?;
         let now = unix_timestamp();
 
-        for (i, (chunk, emb)) in chunks.iter().zip(embeddings).enumerate() {
-            let entry = MemoryEntry {
+        let entries: Vec<MemoryEntry> = chunks
+            .iter()
+            .zip(embeddings)
+            .enumerate()
+            .map(|(i, (chunk, emb))| MemoryEntry {
                 id: format!("{label}:{i}"),
                 content: chunk.clone(),
                 embedding: emb,
                 source: source.clone(),
                 tier: MemoryTier::Short,
                 timestamp: now,
-            };
-            self.store.insert(&entry)?;
-        }
-
-        Ok(chunks.len())
+            })
+            .collect();
+        let n = entries.len();
+        self.write_entries(None, entries).await?;
+        Ok(n)
     }
 
     /// Stores one distilled episodic memory for a completed task, replacing any
     /// prior record for the same session.
-    pub async fn index_episode(
-        &self,
-        session_id: &str,
-        episode: &str,
-    ) -> Result<(), AppError> {
+    pub async fn index_episode(&self, session_id: &str, episode: &str) -> Result<(), AppError> {
         let source = MemorySource::Session {
             session_id: session_id.to_string(),
         };
-        self.store.delete_by_source(&source.to_tag())?;
+        let delete_tag = source.to_tag();
 
         if episode.trim().is_empty() {
-            return Ok(());
+            return self.write_entries(Some(delete_tag), Vec::new()).await;
         }
 
         let emb = self.embedder.embed(episode).await?;
@@ -178,7 +210,7 @@ impl<'a> MemoryIndexer<'a> {
             tier: MemoryTier::Medium,
             timestamp: unix_timestamp(),
         };
-        self.store.insert(&entry)
+        self.write_entries(Some(delete_tag), vec![entry]).await
     }
 
     pub async fn index_persistent_fact(
@@ -195,7 +227,7 @@ impl<'a> MemoryIndexer<'a> {
             tier: MemoryTier::Long,
             timestamp: unix_timestamp(),
         };
-        self.store.insert(&entry)
+        self.write_entries(None, vec![entry]).await
     }
 }
 

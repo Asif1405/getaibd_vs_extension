@@ -44,7 +44,7 @@ impl OpenAiEmbedder {
         self
     }
 
-    /// Point the embedder at an OpenAI-compatible base URL (e.g. GetAIBD).
+    /// Point the embedder at an OpenAI-compatible base URL (e.g. `GetAIBD`).
     #[must_use]
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url.trim_end_matches('/').to_string();
@@ -245,14 +245,19 @@ impl EmbeddingProvider for GeminiEmbedder {
             "content": { "parts": [{ "text": text }] },
         });
 
+        // The key goes in the `x-goog-api-key` header, NOT the URL query string:
+        // `reqwest::Error`'s Display includes the request URL, so a key in the query
+        // would leak into `AppError::ProviderError` (and logs) on any connect/timeout
+        // error.
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={}",
-            self.model, self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent",
+            self.model
         );
 
         let resp: serde_json::Value = self
             .client
             .post(&url)
+            .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
             .await

@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as crypto from "crypto";
 import { getServerUrl, authHeaders } from "../util/config";
 
 export interface EditPreview {
@@ -162,14 +163,14 @@ export class PatchPreviewPanel {
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function getNonce(): string {
-  let text = "";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 32; i++) {
-    text += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return text;
+  return crypto.randomBytes(16).toString("base64url");
 }
