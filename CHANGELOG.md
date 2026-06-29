@@ -4,6 +4,14 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.7.7]
+
+- **Confirm a path exists before touching it.** Added guidance so the agent verifies a
+  file/directory actually exists (via a real grep/listing signal or a quick `ls`/`stat`)
+  before it reads, lists, patches, moves, or deletes it — and, when a path is missing,
+  greps for the real name or lists the parent instead of retrying blindly. Cuts down on
+  wasted "file not found" round-trips from guessed paths.
+
 ## [0.7.6]
 
 - **Faster, more efficient command use.** The agent now gets explicit guidance to pick

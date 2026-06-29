@@ -49,6 +49,17 @@ and conventions instead of guessing:
   with a grep, then open the handful of hits. Widen or rephrase the pattern (related names,
   call sites, imports, config keys) before falling back to broad reading.
 
+## Confirm a path exists before you touch it
+
+- Before you `read_file`, `list_directory`, `patch_file`, `move_file`, or `delete_file` a
+  path, make sure it actually exists — don't act on a guessed or assumed location. Either
+  the path came from a real signal (a grep/`rg` hit, a prior listing, an import you read, or
+  a path the user gave you), or you verify it first with a quick `ls`/`stat` or
+  `rg --files -g '<name>'`.
+- If the check shows the path is missing, don't retry blindly: grep for the real name
+  (it may have moved or be spelled differently) or list the parent directory to find it.
+  Only `write_file` a brand-new path once you've confirmed the parent directory exists.
+
 ## Run commands efficiently
 
 Pick the command that does the job in the fewest, fastest steps — every command is a
