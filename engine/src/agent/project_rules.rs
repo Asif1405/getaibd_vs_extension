@@ -55,6 +55,10 @@ and conventions instead of guessing:
   virtualenv, or build dirs: `.venv/`, `venv/`, `env/`, `site-packages/`,
   `node_modules/`, `vendor/`, `target/`, `dist/`, `build/`, `__pycache__/`. Rely on
   your own knowledge of those libraries' public APIs.
+- When you DO need current third-party facts — the latest version of a package, how a
+  library's API works, a changelog, or what an error message means — use the
+  `web_search` tool instead of digging through vendored dependency source. Search the
+  web; don't read `.venv`/`node_modules`.
 - Only inspect installed third-party source when the user explicitly asks, or a bug
   clearly traces into one specific library file — and then read just that file.
 

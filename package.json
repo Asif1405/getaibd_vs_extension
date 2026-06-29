@@ -3,7 +3,7 @@
   "publisher": "dmsbilas",
   "displayName": "GetAIBD",
   "description": "AI coding agent for VS Code — chat with your codebase, make multi-file edits, and run agentic tasks.",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "homepage": "https://getaibd.com",
   "bugs": {
     "url": "https://getaibd.com"

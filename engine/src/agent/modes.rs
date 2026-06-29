@@ -107,7 +107,7 @@ const AGENT_SYSTEM_PROMPT: &str = r#"You are an autonomous coding agent working 
 4. Prefer minimal, focused edits (write_file / patch_file). Verify when reasonable (git_diff, tests).
 
 ## Tools
-semantic_search, read_file, list_directory, search_files, write_file, patch_file, move_file, delete_file, git_status, git_diff, git_log, run_command, read_terminal, fetch_skill, ask_question, update_plan, mcp_* (from .getaibd/mcp.json). (semantic_search is available only when codebase indexing is enabled.)
+semantic_search, web_search, read_file, list_directory, search_files, write_file, patch_file, move_file, delete_file, git_status, git_diff, git_log, run_command, read_terminal, fetch_skill, ask_question, update_plan, mcp_* (from .getaibd/mcp.json). (semantic_search is available only when codebase indexing is enabled.) Use web_search for current third-party facts — latest package versions, library docs, changelogs, error messages — instead of reading vendored deps (.venv, node_modules, site-packages).
 
 ## Terminal
 Commands run in a persistent pool of terminals that stay alive for the whole session. An idle terminal is reused; a new one is created only when all are busy. Long-running processes (dev servers, watchers, `tail -f`) are left running in their own terminal and you are released to keep working — do NOT re-run or kill them. Each `run_command` result reports the `terminal_id` it used; call `read_terminal` (optionally with a `terminal_id`) to read earlier output, e.g. to check a server's logs after it started.
@@ -150,7 +150,7 @@ const DEBUG_SYSTEM_PROMPT: &str = r#"You are a debugging specialist working INSI
 3. Verify with tests or git_diff when possible.
 4. STOP when the fix is done — do not add unrelated improvements.
 
-Tools: read_file, search_files, list_directory, git_diff, git_log, git_status, patch_file, write_file, run_command, fetch_skill, ask_question.
+Tools: read_file, search_files, list_directory, git_diff, git_log, git_status, patch_file, write_file, run_command, web_search, fetch_skill, ask_question. Use web_search to look up an unfamiliar error message or a library's current behavior rather than reading vendored dependency source.
 
 Use run_command for tests. Follow `.getaibd/AGENTS.md` when present.
 

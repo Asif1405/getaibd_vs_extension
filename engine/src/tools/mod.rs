@@ -11,6 +11,7 @@ pub mod semantic;
 pub mod skill;
 pub mod terminal;
 pub mod terminal_gate;
+pub mod web_search;
 pub mod workspace;
 
 use async_trait::async_trait;
@@ -85,6 +86,22 @@ impl ToolRegistry {
         let mut registry = Self::new();
         Self::register_builtin(&mut registry, project_root);
         registry
+    }
+
+    /// Register session tools that need runtime `AppState` (codebase semantic search and
+    /// web search). Shared by every agent route so the basic and orchestrated paths expose
+    /// the same toolset. Each tool self-gates on the state it needs being configured.
+    pub fn register_session_state_tools(&mut self, state: &crate::state::AppState) {
+        if let (Some(store), Some(embedder)) = (&state.memory_store, &state.embedder) {
+            self.register(Arc::new(semantic::SemanticSearch::new(
+                store.clone(),
+                embedder.clone(),
+                state.memory_top_k,
+            )));
+        }
+        if let (Some(key), Some(base)) = (&state.getaibd_api_key, &state.getaibd_base_url) {
+            self.register(Arc::new(web_search::WebSearch::new(base.clone(), key.clone())));
+        }
     }
 
     /// Agent session registry: built-ins + optional MCP servers from `.getaibd/mcp.json`.

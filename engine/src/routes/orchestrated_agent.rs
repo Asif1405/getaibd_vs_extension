@@ -82,7 +82,10 @@ pub async fn orchestrated_agent_handler(
         .get_provider(&req.provider)
         .ok_or_else(|| AppError::UnknownProvider(req.provider.clone()))?;
 
-    let registry = ToolRegistry::build_for_session(&state.project_root).await;
+    let mut registry = ToolRegistry::build_for_session(&state.project_root).await;
+    // Expose state-backed session tools (semantic codebase search, web search) on the
+    // orchestrated path too, so chat-driven agent runs can search the web.
+    registry.register_session_state_tools(&state);
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
 

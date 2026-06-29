@@ -25,6 +25,10 @@ pub struct AppState {
     pub max_iterations: u32,
     pub memory_store: Option<MemoryStore>,
     pub embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// GetAIBD API key + base URL (from the `getaibd` provider), so session tools like
+    /// `web_search` can call the platform's developer API with the user's own key/billing.
+    pub getaibd_api_key: Option<String>,
+    pub getaibd_base_url: Option<String>,
     pub memory_top_k: usize,
     pub memory_max_entries: usize,
     /// Resolved path of the memory DB (used to site the sibling merkle index).
@@ -115,6 +119,16 @@ impl AppState {
             .map(|_| project_root.join(&config.memory.db_path));
         let memory_max_index_files = config.memory.max_index_files;
 
+        let getaibd_cfg = config
+            .providers
+            .openai_compat
+            .iter()
+            .find(|c| c.id == "getaibd");
+        let getaibd_api_key = getaibd_cfg
+            .and_then(|c| c.api_key.clone())
+            .filter(|k| !k.is_empty());
+        let getaibd_base_url = getaibd_cfg.map(|c| c.base_url.clone());
+
         Self {
             providers,
             public_url: config.server.public_url.clone(),
@@ -124,6 +138,8 @@ impl AppState {
             max_iterations: config.agent.max_iterations,
             memory_store,
             embedder,
+            getaibd_api_key,
+            getaibd_base_url,
             memory_top_k: config.memory.top_k,
             memory_max_entries: config.memory.max_entries,
             memory_db_path,
