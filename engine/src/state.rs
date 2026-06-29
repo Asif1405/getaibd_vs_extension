@@ -27,6 +27,10 @@ pub struct AppState {
     pub embedder: Option<Arc<dyn EmbeddingProvider>>,
     pub memory_top_k: usize,
     pub memory_max_entries: usize,
+    /// Resolved path of the memory DB (used to site the sibling merkle index).
+    pub memory_db_path: Option<PathBuf>,
+    /// Ceiling for the startup full-repo index pass.
+    pub memory_max_index_files: usize,
     pub rate_limiter: Arc<RateLimiter>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub task_queue: Arc<TaskQueue>,
@@ -106,6 +110,11 @@ impl AppState {
         let task_queue = Arc::new(TaskQueue::new());
         let analysis_cache = Arc::new(ProjectAnalysisCache::new());
 
+        let memory_db_path = memory_store
+            .as_ref()
+            .map(|_| project_root.join(&config.memory.db_path));
+        let memory_max_index_files = config.memory.max_index_files;
+
         Self {
             providers,
             public_url: config.server.public_url.clone(),
@@ -117,6 +126,8 @@ impl AppState {
             embedder,
             memory_top_k: config.memory.top_k,
             memory_max_entries: config.memory.max_entries,
+            memory_db_path,
+            memory_max_index_files,
             rate_limiter,
             circuit_breaker,
             task_queue,

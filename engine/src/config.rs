@@ -26,6 +26,11 @@ pub struct MemoryConfig {
     pub top_k: usize,
     #[serde(default = "default_memory_max_entries")]
     pub max_entries: usize,
+    /// Ceiling on how many files a single startup full-repo index pass will embed, so the
+    /// first pass on a large repo can't run away on (billed) embedding cost. 0 = no cap;
+    /// the on-change watcher backfills whatever the pass leaves out.
+    #[serde(default = "default_memory_max_index_files")]
+    pub max_index_files: usize,
     #[serde(default = "default_memory_chunk_size")]
     pub chunk_size: usize,
     #[serde(default = "default_memory_chunk_overlap")]
@@ -43,6 +48,7 @@ impl Default for MemoryConfig {
             db_path: default_memory_db_path(),
             top_k: default_memory_top_k(),
             max_entries: default_memory_max_entries(),
+            max_index_files: default_memory_max_index_files(),
             chunk_size: default_memory_chunk_size(),
             chunk_overlap: default_memory_chunk_overlap(),
             embedding_provider: default_memory_embedding_provider(),
@@ -59,6 +65,9 @@ fn default_memory_top_k() -> usize {
 }
 fn default_memory_max_entries() -> usize {
     10_000
+}
+fn default_memory_max_index_files() -> usize {
+    2_000
 }
 fn default_memory_chunk_size() -> usize {
     512

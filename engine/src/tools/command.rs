@@ -146,7 +146,11 @@ impl Tool for RunCommand {
         "Execute a shell command. Read-only inspection commands (grep, rg, find, ls, cat, \
          head, tail, wc) run WITHOUT an approval prompt — use them freely to locate and read \
          code. Prefer dedicated git_* tools for git operations (git_status, git_add, \
-         git_commit, git_push, git_reset). Only allowlisted commands are permitted."
+         git_commit, git_push, git_reset). Only allowlisted commands are permitted. \
+         Commands run in a persistent terminal pool: each result reports the `terminal_id` \
+         it ran in; long-running processes (dev servers/watchers) are left running in their \
+         own terminal and the agent is released to continue. Pass `terminal_id` to target a \
+         specific idle terminal, and use `read_terminal` to read earlier output."
     }
 
     fn input_schema(&self) -> Value {
@@ -160,7 +164,8 @@ impl Tool for RunCommand {
                     "description": "Command arguments"
                 },
                 "cwd": { "type": "string", "description": "Working directory (relative to project root)" },
-                "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default: 30)" }
+                "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default: 30)" },
+                "terminal_id": { "type": "string", "description": "Optional: reuse a specific terminal from a prior run's terminal_id. Ignored if that terminal is busy; a new one is used instead. Omit to auto-pick an idle terminal." }
             },
             "required": ["command"]
         })

@@ -42,9 +42,17 @@ function resolveEnginePath(context: vscode.ExtensionContext): string | undefined
   return candidates.find((p) => p && fs.existsSync(p));
 }
 
-/** Kills any stale process still bound to the engine port (e.g. an orphan from a
- * previous session whose auth token we no longer know). Best-effort, cross-platform. */
-async function freePort(port: string): Promise<void> {
+/** Frees the engine port. By default a *healthy* listener is SPARED — it's a live
+ * engine this or another window may still adopt, and killing it is exactly what
+ * SIGTERM'd in-flight runs (a slow `/health` made the probe fail → freePort killed
+ * the live engine mid-run). Pass `{ force: true }` to reclaim the port regardless
+ * (the restart path, or when we can't adopt the running engine). Best-effort,
+ * cross-platform. */
+async function freePort(port: string, opts: { force?: boolean } = {}): Promise<void> {
+  if (!opts.force && (await isHealthy(`http://127.0.0.1:${port}`, 800))) {
+    log(`Port ${port} already serves a healthy engine — leaving it running.`);
+    return;
+  }
   try {
     if (process.platform === "win32") {
       const { stdout } = await execFileAsync("netstat", ["-ano", "-p", "tcp"]);
@@ -100,6 +108,94 @@ async function isHealthy(url: string, timeoutMs: number): Promise<boolean> {
     await new Promise((r) => setTimeout(r, 300));
   }
   return false;
+}
+
+/** On-disk handle to a running engine so reloads / second windows can re-attach to
+ * it instead of killing + respawning (the per-spawn bearer token is otherwise lost
+ * across an extension-host reload). Stored in globalStorage, shared across windows. */
+interface EngineSession {
+  port: string;
+  token: string;
+  /** Project root the engine is bound to — adoption is only safe within the same root. */
+  root: string;
+  pid?: number;
+}
+
+function sessionFile(context: vscode.ExtensionContext): string {
+  return path.join(context.globalStoragePath, "engine-session.json");
+}
+
+function writeSession(context: vscode.ExtensionContext, session: EngineSession): void {
+  try {
+    fs.mkdirSync(context.globalStoragePath, { recursive: true });
+    fs.writeFileSync(sessionFile(context), JSON.stringify(session), "utf8");
+  } catch {
+    /* best effort — adoption simply won't be available next time */
+  }
+}
+
+function readSession(context: vscode.ExtensionContext): EngineSession | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(sessionFile(context), "utf8")) as Partial<EngineSession>;
+    if (
+      parsed &&
+      typeof parsed.port === "string" &&
+      typeof parsed.token === "string" &&
+      typeof parsed.root === "string"
+    ) {
+      return parsed as EngineSession;
+    }
+  } catch {
+    /* no/invalid session */
+  }
+  return undefined;
+}
+
+function clearSession(context: vscode.ExtensionContext): void {
+  try {
+    fs.rmSync(sessionFile(context), { force: true });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Verifies the engine at `url` accepts `token` on an authenticated endpoint, so we
+ * never adopt a stale process or one started with a different token. */
+async function tokenAuthenticates(url: string, token: string): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    const resp = await fetch(`${url}/providers`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Recovers the bearer token of an engine left running by a previous window / reload
+ * of THIS project, so it can be adopted instead of killed + respawned. Returns the
+ * token when a healthy, same-project engine answers to it, else undefined. */
+async function tryRecoverSessionToken(
+  context: vscode.ExtensionContext,
+  serverUrl: string,
+  port: string,
+  projectRoot: string,
+): Promise<string | undefined> {
+  const session = readSession(context);
+  if (!session || session.port !== port || session.root !== projectRoot) {
+    return undefined;
+  }
+  if (!(await isHealthy(serverUrl, 800))) {
+    return undefined;
+  }
+  if (!(await tokenAuthenticates(serverUrl, session.token))) {
+    return undefined;
+  }
+  return session.token;
 }
 
 /** Ignore files we extend when the project already uses them (never created). */
@@ -168,6 +264,19 @@ export async function ensureEngine(context: vscode.ExtensionContext): Promise<st
   if (engineProcess && engineProcess.exitCode === null) {
     return getConfiguredServerUrl();
   }
+  // Re-attach to an engine still running from a previous window / extension-host
+  // reload of this same project instead of killing and respawning it.
+  const serverUrl = getConfiguredServerUrl();
+  const port = new URL(serverUrl).port || "39377";
+  const projectRoot =
+    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? context.extensionPath;
+  const recovered = await tryRecoverSessionToken(context, serverUrl, port, projectRoot);
+  if (recovered) {
+    setAuthToken(recovered);
+    setEngineUrl(serverUrl);
+    log("Adopted already-running engine (recovered session token).");
+    return serverUrl;
+  }
   starting ??= startEngine(context).finally(() => {
     starting = undefined;
   });
@@ -227,7 +336,21 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
   ensureGetaibdIgnored(projectRoot);
   ensureGetaibdMemoryMigrated(projectRoot);
 
+  // Adoption already failed in ensureEngine, so clear the port. A non-forced
+  // freePort spares a healthy listener; if one still holds the port and we can't
+  // adopt it (a different project, or an unknown token), reclaim it by force so
+  // this window still gets a working engine.
   await freePort(port);
+  if (await isHealthy(serverUrl, 600)) {
+    const recovered = await tryRecoverSessionToken(context, serverUrl, port, projectRoot);
+    if (recovered) {
+      setAuthToken(recovered);
+      setEngineUrl(serverUrl);
+      log("Adopted engine that became healthy during startup.");
+      return serverUrl;
+    }
+    await freePort(port, { force: true });
+  }
 
   log(`Starting engine: ${enginePath} (port ${port}, root ${projectRoot})`);
   const child = spawn(enginePath, [], {
@@ -248,6 +371,7 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
     engineProcess = undefined;
     setAuthToken(undefined);
     setEngineUrl(undefined);
+    clearSession(context);
   });
 
   const healthy = await isHealthy(serverUrl, 30000);
@@ -264,6 +388,9 @@ async function startEngine(context: vscode.ExtensionContext): Promise<string> {
   log(`Engine healthy at ${serverUrl}`);
   setAuthToken(token);
   setEngineUrl(serverUrl);
+  // Persist the handle so a reload / second window of this project can adopt this
+  // engine instead of killing it.
+  writeSession(context, { port, token, root: projectRoot, pid: child.pid });
   return serverUrl;
 }
 
@@ -278,8 +405,13 @@ export function stopEngine(): void {
   setEngineUrl(undefined);
 }
 
-/** Restarts the engine (e.g. after the API key changes). */
+/** Restarts the engine (e.g. after the API key changes, or to recover from a dropped
+ * connection). Forces a fresh process: kills our child, reclaims the port even from a
+ * healthy listener, and drops the saved session so adoption can't resurrect the old one. */
 export async function restartEngine(context: vscode.ExtensionContext): Promise<string> {
   stopEngine();
+  clearSession(context);
+  const port = new URL(getConfiguredServerUrl()).port || "39377";
+  await freePort(port, { force: true });
   return ensureEngine(context);
 }

@@ -245,23 +245,39 @@ fn environment_note(env: Option<&str>) -> String {
     )
 }
 
-/// File paths referenced in context messages the extension injects, in the form
-/// `[Currently open file: path]` or `[File: path]`. Used as glob-rule hints and
-/// to seed RAG context.
-fn open_file_hints(messages: &[ToolMessage]) -> Vec<String> {
+/// File paths the user *deliberately* pointed at — explicit edit-target gestures, not
+/// ambient editor state. Picks up `@mention`s (`[File: path]`), deliberate selections
+/// (`[Editor selection: path ...]`), and the legacy full-content open-file form
+/// (`[Currently open file: path]`). Crucially it does NOT pick up `[Editor focus: path]`:
+/// merely having a file on screen is ambient context, not a signal to edit/seed RAG from
+/// it. Used as glob-rule hints and to seed RAG context.
+fn edit_target_hints(messages: &[ToolMessage]) -> Vec<String> {
+    // Markers carrying a path in `[<prefix>: path ...]` form that count as deliberate.
+    // `[Editor focus: ...]` is intentionally absent.
+    const EXPLICIT_PREFIXES: [&str; 3] =
+        ["[File: ", "[Editor selection: ", "[Currently open file: "];
     messages
         .iter()
         .filter_map(|msg| msg.content.as_deref())
         .flat_map(|content| {
             let mut files = Vec::new();
             for line in content.lines() {
-                if let Some(rest) = line.strip_prefix("[Currently open file: ") {
-                    if let Some(path) = rest.strip_suffix(']') {
-                        files.push(path.to_string());
-                    }
-                } else if let Some(rest) = line.strip_prefix("[File: ") {
-                    if let Some(path) = rest.strip_suffix(']') {
-                        files.push(path.to_string());
+                for prefix in EXPLICIT_PREFIXES {
+                    if let Some(rest) = line.strip_prefix(prefix) {
+                        // Path runs up to the first `]` or ` (` (range suffix), e.g.
+                        // `[Editor selection: src/a.ts (lines 3-9)]`.
+                        let path = rest
+                            .split_once(']')
+                            .map(|(p, _)| p)
+                            .unwrap_or(rest)
+                            .split(" (")
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !path.is_empty() {
+                            files.push(path.to_string());
+                        }
+                        break;
                     }
                 }
             }
@@ -283,7 +299,7 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
     // Project instructions: the built-in baseline merged with the project's own
     // .getaibd/AGENTS.md (user sections win, baseline fills the gaps), plus user
     // rules, nested AGENTS.md, matched glob rules, memory, and the skills catalog.
-    let hint_paths = open_file_hints(&session.messages);
+    let hint_paths = edit_target_hints(&session.messages);
     let instructions = project_rules::load_project_instructions(
         Path::new(&session.project_root),
         session.workspace_cwd.as_deref(),
@@ -1987,49 +2003,33 @@ async fn finish_agent(
     });
 
     if let Some(mem) = memory {
-        let reflection = reflect(session, provider).await;
-        let indexer = MemoryIndexer::new(mem.store, mem.embedder);
-        let _ = indexer.index_episode(&session.id, &reflection.episode).await;
-
-        for f in &reflection.facts {
-            let fact = f.fact.trim();
-            if fact.is_empty() {
-                continue;
-            }
-            let category = if f.category.trim().is_empty() {
-                "General"
-            } else {
-                f.category.trim()
-            };
-            let content = format!("Fact [{category}]: {fact}");
-            let id = format!("fact-{}", stable_hash(&content));
-            let _ = indexer.index_persistent_fact(&id, &content).await;
-        }
-
-        if let Some(pb) = &reflection.playbook {
-            let title = pb.title.trim();
-            if !title.is_empty() && !pb.steps.is_empty() {
-                let steps = pb
-                    .steps
-                    .iter()
-                    .filter(|s| !s.trim().is_empty())
-                    .enumerate()
-                    .map(|(i, s)| format!("{}. {}", i + 1, s.trim()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let content = format!("Playbook: {title}\n{steps}");
-                let id = format!("playbook-{}", stable_hash(title));
-                let _ = indexer.index_persistent_fact(&id, &content).await;
-            }
-        }
-
-        // Pruning is a synchronous rusqlite delete; offload it so it can't block the
-        // async runtime (H-3).
-        let _ = {
-            let store = mem.store.clone();
-            let max_entries = mem.max_entries;
-            tokio::task::spawn_blocking(move || store.prune_oldest(max_entries)).await
-        };
+        // Reflection is an extra LLM round-trip plus embedding writes. Running it inline
+        // kept the turn "working" for seconds AFTER the answer was already on screen, so
+        // run it detached: the user's turn finishes immediately and memory updates land in
+        // the background. Capture everything it needs as owned data first.
+        let transcript = build_transcript(session);
+        let provider = provider.clone();
+        let store = mem.store.clone();
+        let embedder = mem.embedder.clone_box();
+        let session_id = session.id.clone();
+        let provider_id = session.provider_id.clone();
+        let model = session.model.clone();
+        let cache_session_id = session.cache_session_id.clone();
+        let max_entries = mem.max_entries;
+        tokio::spawn(async move {
+            reflect_and_index(
+                transcript,
+                &provider,
+                store,
+                embedder,
+                &session_id,
+                &provider_id,
+                &model,
+                &cache_session_id,
+                max_entries,
+            )
+            .await;
+        });
     }
 
     Ok(AgentResult {
@@ -2037,6 +2037,62 @@ async fn finish_agent(
         iterations,
         mode: None,
     })
+}
+
+/// Background memory write-back: reflect on the finished task and index the episode,
+/// durable facts, and any playbook, then prune. Runs detached after the turn completes so
+/// it never delays the user-visible response.
+#[allow(clippy::too_many_arguments)]
+async fn reflect_and_index(
+    transcript: String,
+    provider: &Arc<dyn Provider>,
+    store: MemoryStore,
+    embedder: Box<dyn EmbeddingProvider>,
+    session_id: &str,
+    provider_id: &str,
+    model: &str,
+    cache_session_id: &Option<String>,
+    max_entries: usize,
+) {
+    let reflection = reflect(&transcript, provider, provider_id, model, cache_session_id).await;
+    let indexer = MemoryIndexer::new(&store, embedder.as_ref());
+    let _ = indexer.index_episode(session_id, &reflection.episode).await;
+
+    for f in &reflection.facts {
+        let fact = f.fact.trim();
+        if fact.is_empty() {
+            continue;
+        }
+        let category = if f.category.trim().is_empty() {
+            "General"
+        } else {
+            f.category.trim()
+        };
+        let content = format!("Fact [{category}]: {fact}");
+        let id = format!("fact-{}", stable_hash(&content));
+        let _ = indexer.index_persistent_fact(&id, &content).await;
+    }
+
+    if let Some(pb) = &reflection.playbook {
+        let title = pb.title.trim();
+        if !title.is_empty() && !pb.steps.is_empty() {
+            let steps = pb
+                .steps
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .enumerate()
+                .map(|(i, s)| format!("{}. {}", i + 1, s.trim()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let content = format!("Playbook: {title}\n{steps}");
+            let id = format!("playbook-{}", stable_hash(title));
+            let _ = indexer.index_persistent_fact(&id, &content).await;
+        }
+    }
+
+    // Pruning is a synchronous rusqlite delete; offload it so it can't block the
+    // async runtime (H-3).
+    let _ = tokio::task::spawn_blocking(move || store.prune_oldest(max_entries)).await;
 }
 
 #[derive(Default)]
@@ -2108,15 +2164,20 @@ fn parse_reflection(raw: &str) -> Option<ReflectionJson> {
 
 /// Single end-of-task reflection: distills an episode and extracts durable facts
 /// and an optional reusable playbook, all stored in the vector memory.
-async fn reflect(session: &Session, provider: &Arc<dyn Provider>) -> Reflection {
-    let transcript = build_transcript(session);
+async fn reflect(
+    transcript: &str,
+    provider: &Arc<dyn Provider>,
+    provider_id: &str,
+    model: &str,
+    cache_session_id: &Option<String>,
+) -> Reflection {
     if transcript.is_empty() {
         return Reflection::default();
     }
 
     let req = ChatRequest {
-        provider: session.provider_id.clone(),
-        model: session.model.clone(),
+        provider: provider_id.to_string(),
+        model: model.to_string(),
         messages: vec![
             Message {
                 role: "system".to_string(),
@@ -2133,14 +2194,14 @@ async fn reflect(session: &Session, provider: &Arc<dyn Provider>) -> Reflection 
             },
             Message {
                 role: "user".to_string(),
-                content: transcript.clone(),
+                content: transcript.to_string(),
             },
         ],
         temperature: Some(0.2),
         max_tokens: Some(800),
         reasoning_effort: None,
         api_key: None,
-        cache_session_id: session.cache_session_id.clone(),
+        cache_session_id: cache_session_id.clone(),
     };
 
     match provider.chat(&req).await {
@@ -2207,7 +2268,7 @@ async fn execute_tool_calls(
                         .filter(|_| call.name == "ask_question");
                     let terminal_gate = options
                         .and_then(|o| o.terminal_gate.as_ref())
-                        .filter(|_| call.name == "run_command");
+                        .filter(|_| matches!(call.name.as_str(), "run_command" | "read_terminal"));
                     if let Some(gate) = ask_gate {
                         delegate_ask(call, gate, on_event).await
                     } else if let Some(gate) = terminal_gate {
@@ -2274,18 +2335,27 @@ async fn execute_tool_calls(
     }
 }
 
-/// Hands a shell command to the client to run in a managed terminal, returning its result.
+/// Hands a terminal request to the client, returning its result. Covers both running a
+/// command (`run_command` -> action "exec") and reading prior terminal output in the
+/// session (`read_terminal` -> action "read"); the client's managed terminal pool keeps
+/// per-terminal scrollback so the agent can inspect earlier runs across all terminals.
 async fn delegate_terminal(
     call: &ToolCall,
     gate: &crate::tools::terminal_gate::TerminalGate,
     on_event: &mut impl FnMut(AgentEvent),
 ) -> serde_json::Value {
     let req_id = format!("{}_term", call.id);
+    let action = if call.name == "read_terminal" {
+        "read"
+    } else {
+        "exec"
+    };
     on_event(AgentEvent {
         kind: AgentEventKind::TerminalExec,
         content: Some(
             serde_json::json!({
                 "request_id": req_id,
+                "action": action,
                 "arguments": call.arguments,
             })
             .to_string(),

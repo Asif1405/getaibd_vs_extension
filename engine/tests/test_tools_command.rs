@@ -23,15 +23,6 @@ fn disallowed_tool() -> (RunCommand, TempDir) {
     (tool, temp_dir)
 }
 
-fn tool_with_sh() -> (RunCommand, TempDir) {
-    let temp_dir = TempDir::new().unwrap();
-    let root = Arc::new(temp_dir.path().to_path_buf());
-    let mut allowlist = default_allowlist();
-    allowlist.insert("sh".to_string());
-    let env_mgr = EnvManager::new(root.clone());
-    let tool = RunCommand::new(root, allowlist, env_mgr);
-    (tool, temp_dir)
-}
 
 #[tokio::test]
 async fn allowed_command_executes_successfully() {
@@ -81,41 +72,40 @@ async fn command_with_args_works() {
 
 #[tokio::test]
 async fn command_captures_stdout_and_stderr() {
-    let (tool, _temp) = tool_with_sh();
+    let (tool, _temp) = allowed_tool();
 
-    let result = tool
-        .execute(json!({
-            "command": "sh",
-            "args": ["-c", "echo out; echo err >&2"]
-        }))
+    // stdout via an allowed command. (Shell launchers like `sh -c` are hard-blocked, so
+    // we drive stdout/stderr with allowlisted binaries instead.)
+    let out = tool
+        .execute(json!({ "command": "echo", "args": ["out"] }))
         .await
         .unwrap();
+    assert!(out["stdout"].as_str().unwrap().contains("out"));
 
-    assert!(result["stdout"].as_str().unwrap().contains("out"));
-    assert!(result["stderr"].as_str().unwrap().contains("err"));
+    // stderr via a command that fails on a missing path.
+    let err = tool
+        .execute(json!({ "command": "cat", "args": ["no_such_file_xyz"] }))
+        .await
+        .unwrap();
+    assert!(!err["stderr"].as_str().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn command_returns_exit_code() {
-    let (tool, _temp) = tool_with_sh();
+    let (tool, _temp) = allowed_tool();
 
     let ok = tool
-        .execute(json!({
-            "command": "sh",
-            "args": ["-c", "exit 0"]
-        }))
+        .execute(json!({ "command": "echo", "args": ["ok"] }))
         .await
         .unwrap();
     assert_eq!(ok["exit_code"], 0);
 
+    // A missing file makes `cat` exit non-zero; the exact code is platform-dependent.
     let fail = tool
-        .execute(json!({
-            "command": "sh",
-            "args": ["-c", "exit 42"]
-        }))
+        .execute(json!({ "command": "cat", "args": ["no_such_file_xyz"] }))
         .await
         .unwrap();
-    assert_eq!(fail["exit_code"], 42);
+    assert_ne!(fail["exit_code"], 0);
 }
 
 #[tokio::test]

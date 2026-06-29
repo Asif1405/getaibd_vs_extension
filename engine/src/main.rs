@@ -179,6 +179,39 @@ async fn run_startup_indexing(state: &AppState) {
             tracing::warn!("Startup indexing failed: {e}");
         }
     }
+
+    // Full-repo incremental index for complete semantic coverage (the summary above only
+    // embeds the top "important" files). The merkle hash diff makes every later startup
+    // cheap — only changed files re-embed — and prunes deleted files. Bounded by
+    // `memory_max_index_files` so the first pass on a large repo can't run away on
+    // (billed) embedding cost; the watcher backfills the remainder as files change.
+    let Some(ref db_path) = state.memory_db_path else {
+        return;
+    };
+    let merkle_path = db_path.with_extension("merkle.db");
+    match mcp_universal::memory::merkle::MerkleIndex::open(&merkle_path) {
+        Ok(merkle) => {
+            match mcp_universal::memory::merkle::incremental_index(
+                &state.project_root,
+                &merkle,
+                store,
+                embedder.as_ref(),
+                state.memory_max_index_files,
+            )
+            .await
+            {
+                Ok(r) => tracing::info!(
+                    "Full index: {} embedded, {} unchanged, {} removed (cap {})",
+                    r.indexed,
+                    r.unchanged,
+                    r.removed,
+                    state.memory_max_index_files
+                ),
+                Err(e) => tracing::warn!("Full index failed: {e}"),
+            }
+        }
+        Err(e) => tracing::warn!("Merkle index open failed: {e}"),
+    }
 }
 
 fn start_file_watcher(state: &AppState) -> Option<notify::RecommendedWatcher> {

@@ -1,11 +1,13 @@
 import * as vscode from "vscode";
-import { exec } from "child_process";
+import { exec, type ChildProcess } from "child_process";
 import { detectShellKind, type ShellKind } from "../util/environment";
 
 export interface CommandResult {
   stdout: string;
   stderr: string;
   exit_code: number;
+  /** Id of the pooled terminal the command ran in (for follow-ups / read_terminal). */
+  terminal_id?: string;
 }
 
 const ANSI = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
@@ -25,10 +27,16 @@ const SERVER_MAX_MS = 12_000;
 const DEFAULT_IDLE_MS = 45_000;
 const DEFAULT_MAX_MS = 600_000;
 
-const BG_NOTE =
-  '\n\n[The command is still running in the background "GetAIBD Agent" terminal. ' +
-  "It started successfully and was released so you can continue — do NOT re-run it. " +
-  "The process was not stopped.]";
+// Cap how much scrollback we retain per run so a chatty server can't grow unbounded.
+const MAX_RUN_OUTPUT = 100_000;
+
+function bgNote(id: string): string {
+  return (
+    `\n\n[Still running in the background terminal "${id}". It started successfully and was ` +
+    `released so you can continue — do NOT re-run or kill it. Use read_terminal with ` +
+    `terminal_id "${id}" to read its latest output.]`
+  );
+}
 
 function stripAnsi(text: string): string {
   return text.replace(OSC, "").replace(ANSI, "");
@@ -62,12 +70,38 @@ function chainCd(dir: string, line: string, shell: ShellKind): string {
   return `cd ${d} && ${line}`;
 }
 
-/** Runs agent shell commands in a persistent, visible terminal with streamed output. */
+/** A single command run recorded against a pooled terminal. */
+interface RunRecord {
+  command: string;
+  cwd?: string;
+  output: string;
+  /** null while still running (released background process); otherwise the exit code. */
+  exitCode: number | null;
+  startedAt: number;
+}
+
+/** A persistent terminal in the pool, with its own run history. */
+interface PooledTerminal {
+  id: string;
+  terminal: vscode.Terminal;
+  /** A foreground command is currently executing in it. */
+  busy: boolean;
+  /** Holds a released long-running process (dev server/watcher) — alive, not reusable. */
+  running: boolean;
+  runs: RunRecord[];
+}
+
+/**
+ * Manages a Cursor-like pool of persistent, visible terminals for agent commands:
+ * idle terminals are reused, a new one is created only when every terminal is busy, and
+ * running processes are never interrupted or reused. Per-terminal scrollback is kept for
+ * the whole session so the agent can read earlier runs across all terminals.
+ */
 export class AgentTerminal {
-  private terminal: vscode.Terminal | undefined;
-  // Long-running commands (dev servers) that were released keep running here so a
-  // reused terminal never collides with a process holding the foreground.
-  private backgrounded: vscode.Terminal[] = [];
+  private pool: PooledTerminal[] = [];
+  private counter = 0;
+  /** Id of the terminal whose command is currently executing (cancel target). */
+  private activeId: string | undefined;
   private cancelled = false;
 
   constructor(private readonly root: vscode.Uri | undefined) {}
@@ -77,25 +111,51 @@ export class AgentTerminal {
     return typeof vscode.window.onDidStartTerminalShellExecution === "function";
   }
 
-  private ensureTerminal(): vscode.Terminal {
-    if (this.terminal && this.terminal.exitStatus === undefined) {
-      return this.terminal;
+  /** Drops terminals the user manually closed; keeps live ones (incl. running ones). */
+  private prune(): void {
+    this.pool = this.pool.filter((t) => t.terminal.exitStatus === undefined);
+  }
+
+  /** Picks an idle terminal to reuse, or creates a new one if all are busy/running. */
+  private pickTerminal(preferredId?: string): PooledTerminal {
+    this.prune();
+    const idle = (t: PooledTerminal) => !t.busy && !t.running;
+    if (preferredId) {
+      const wanted = this.pool.find((t) => t.id === preferredId && idle(t));
+      if (wanted) {
+        return wanted;
+      }
     }
-    this.terminal = vscode.window.createTerminal({
-      name: "GetAIBD Agent",
+    const free = this.pool.find(idle);
+    if (free) {
+      return free;
+    }
+    return this.createTerminal();
+  }
+
+  private createTerminal(): PooledTerminal {
+    this.counter += 1;
+    const id = `agent-${this.counter}`;
+    const terminal = vscode.window.createTerminal({
+      name: `GetAIBD Agent ${this.counter}`,
       cwd: this.root,
       iconPath: new vscode.ThemeIcon("robot"),
     });
-    return this.terminal;
+    const entry: PooledTerminal = { id, terminal, busy: false, running: false, runs: [] };
+    this.pool.push(entry);
+    return entry;
   }
 
+  /** Closes idle terminals; leaves running processes untouched (per the "never close
+   * a running terminal" contract). Called on panel teardown. */
   dispose(): void {
-    this.terminal?.dispose();
-    this.terminal = undefined;
-    for (const t of this.backgrounded) {
-      t.dispose();
+    for (const t of this.pool) {
+      if (!t.running && !t.busy) {
+        t.terminal.dispose();
+      }
     }
-    this.backgrounded = [];
+    this.pool = [];
+    this.activeId = undefined;
   }
 
   /** Resolves an absolute working directory so each command runs deterministically. */
@@ -109,7 +169,8 @@ export class AgentTerminal {
   /** Signals cancellation of the currently running command. */
   cancel(): void {
     this.cancelled = true;
-    this.terminal?.sendText("\u0003");
+    const active = this.pool.find((t) => t.id === this.activeId);
+    active?.terminal.sendText("\u0003");
   }
 
   async run(
@@ -117,17 +178,53 @@ export class AgentTerminal {
     args: string[],
     cwd: string | undefined,
     onChunk: (s: string) => void,
+    terminalId?: string,
   ): Promise<CommandResult> {
     this.cancelled = false;
     const line = buildLine(cmd, args);
     const targetDir = this.resolveDir(cwd);
     const full = targetDir ? chainCd(targetDir, line, detectShellKind()) : line;
-    const term = this.ensureTerminal();
-    term.show(true);
 
-    const si = await this.waitForShellIntegration(term, 6000);
+    const mt = this.pickTerminal(terminalId);
+    const record: RunRecord = {
+      command: line,
+      cwd,
+      output: "",
+      exitCode: null,
+      startedAt: Date.now(),
+    };
+    mt.runs.push(record);
+    mt.busy = true;
+    this.activeId = mt.id;
+    mt.terminal.show(true);
+
+    try {
+      return await this.runInTerminal(mt, record, line, full, cwd, onChunk);
+    } finally {
+      if (this.activeId === mt.id) {
+        this.activeId = undefined;
+      }
+    }
+  }
+
+  private append(record: RunRecord, text: string): void {
+    record.output += text;
+    if (record.output.length > MAX_RUN_OUTPUT) {
+      record.output = record.output.slice(record.output.length - MAX_RUN_OUTPUT);
+    }
+  }
+
+  private async runInTerminal(
+    mt: PooledTerminal,
+    record: RunRecord,
+    line: string,
+    full: string,
+    cwd: string | undefined,
+    onChunk: (s: string) => void,
+  ): Promise<CommandResult> {
+    const si = await this.waitForShellIntegration(mt.terminal, 6000);
     if (!si) {
-      return this.runFallback(line, cwd, onChunk);
+      return this.runFallback(mt, record, line, cwd, onChunk);
     }
     try {
       const execution = si.executeCommand(full);
@@ -150,6 +247,7 @@ export class AgentTerminal {
           for await (const chunk of execution.read()) {
             const clean = stripAnsi(chunk);
             out += clean;
+            this.append(record, clean);
             lastAt = Date.now();
             if (!this.cancelled) {
               onChunk(clean);
@@ -179,21 +277,31 @@ export class AgentTerminal {
       }
 
       if (exited) {
-        return { stdout: out, stderr: "", exit_code: this.cancelled ? 130 : exitCode };
+        const code = this.cancelled ? 130 : exitCode;
+        record.exitCode = code;
+        mt.busy = false;
+        mt.running = false;
+        return { stdout: out, stderr: "", exit_code: code, terminal_id: mt.id };
       }
       if (this.cancelled) {
-        return { stdout: out, stderr: "", exit_code: 130 };
+        record.exitCode = 130;
+        mt.busy = false;
+        mt.running = false;
+        return { stdout: out, stderr: "", exit_code: 130, terminal_id: mt.id };
       }
       if (released) {
-        // Keep the long-running process alive in its own terminal and start the next
-        // command in a fresh one so it doesn't get typed into the running process.
-        this.backgrounded.push(term);
-        this.terminal = undefined;
-        return { stdout: out + BG_NOTE, stderr: "", exit_code: 0 };
+        // Long-running process: leave it running in this terminal and mark the terminal
+        // as occupied so it's never reused or killed. The next command picks a fresh one.
+        mt.busy = false;
+        mt.running = true;
+        return { stdout: out + bgNote(mt.id), stderr: "", exit_code: 0, terminal_id: mt.id };
       }
-      return { stdout: out, stderr: "", exit_code: exitCode };
+      record.exitCode = exitCode;
+      mt.busy = false;
+      mt.running = false;
+      return { stdout: out, stderr: "", exit_code: exitCode, terminal_id: mt.id };
     } catch {
-      return this.runFallback(line, cwd, onChunk);
+      return this.runFallback(mt, record, line, cwd, onChunk);
     }
   }
 
@@ -233,6 +341,8 @@ export class AgentTerminal {
   /** Headless capture when shell integration is unavailable; output is not visible live.
    * Long-running commands are detached (left running) and released instead of hanging. */
   private runFallback(
+    mt: PooledTerminal,
+    record: RunRecord,
     line: string,
     cwd: string | undefined,
     onChunk: (s: string) => void,
@@ -250,24 +360,35 @@ export class AgentTerminal {
       let errOut = "";
       let lastAt = Date.now();
       let done = false;
-      const child = exec(line, { cwd: cwdAbs, shell, maxBuffer: 16 * 1024 * 1024 });
-      const finish = (code: number, note?: string) => {
+      let child: ChildProcess;
+      const finish = (code: number, released?: boolean) => {
         if (done) {
           return;
         }
         done = true;
         clearInterval(timer);
-        resolve({ stdout: out + (note ?? ""), stderr: errOut, exit_code: code });
+        record.exitCode = released ? null : code;
+        mt.busy = false;
+        mt.running = !!released;
+        resolve({
+          stdout: out + (released ? bgNote(mt.id) : ""),
+          stderr: errOut,
+          exit_code: released ? 0 : code,
+          terminal_id: mt.id,
+        });
       };
+      child = exec(line, { cwd: cwdAbs, shell, maxBuffer: 16 * 1024 * 1024 });
       child.stdout?.on("data", (d) => {
         const s = String(d);
         out += s;
+        this.append(record, s);
         lastAt = Date.now();
         onChunk(s);
       });
       child.stderr?.on("data", (d) => {
         const s = String(d);
         errOut += s;
+        this.append(record, s);
         lastAt = Date.now();
         onChunk(s);
       });
@@ -288,9 +409,60 @@ export class AgentTerminal {
         const idle = out.length + errOut.length > 0 && now - lastAt >= idleMs;
         if (idle || now - start >= maxMs) {
           child.unref();
-          finish(0, BG_NOTE);
+          finish(0, true);
         }
       }, 500);
     });
+  }
+
+  /** Renders earlier terminal output for the agent. With an id, returns that terminal's
+   * full scrollback; without, lists every terminal and the tail of its recent runs. */
+  readHistory(terminalId?: string): CommandResult {
+    this.prune();
+    if (this.pool.length === 0) {
+      return {
+        stdout: "No terminals have run commands in this session yet.",
+        stderr: "",
+        exit_code: 0,
+      };
+    }
+    if (terminalId) {
+      const mt = this.pool.find((t) => t.id === terminalId);
+      if (!mt) {
+        const ids = this.pool.map((t) => t.id).join(", ");
+        return {
+          stdout: `No terminal "${terminalId}" in this session. Active terminals: ${ids}.`,
+          stderr: "",
+          exit_code: 1,
+        };
+      }
+      return {
+        stdout: this.formatTerminal(mt, 12_000),
+        stderr: "",
+        exit_code: 0,
+        terminal_id: mt.id,
+      };
+    }
+    const blocks = this.pool.map((t) => this.formatTerminal(t, 2_000));
+    return { stdout: blocks.join("\n\n"), stderr: "", exit_code: 0 };
+  }
+
+  private formatTerminal(mt: PooledTerminal, perRunCap: number): string {
+    const status = mt.busy ? "busy" : mt.running ? "running (background process)" : "idle";
+    const header = `Terminal "${mt.id}" [${status}] — ${mt.runs.length} run(s)`;
+    if (mt.runs.length === 0) {
+      return header;
+    }
+    const runs = mt.runs.map((r, i) => {
+      const state =
+        r.exitCode === null ? "still running" : `exit ${r.exitCode}`;
+      let output = r.output.trimEnd();
+      if (output.length > perRunCap) {
+        output = "…(truncated)…\n" + output.slice(output.length - perRunCap);
+      }
+      const body = output ? `\n${output}` : "\n(no output)";
+      return `  [${i + 1}] $ ${r.command}  (${state})${body.replace(/\n/g, "\n  ")}`;
+    });
+    return `${header}\n${runs.join("\n")}`;
   }
 }

@@ -97,7 +97,19 @@ pub async fn agent_handler(
 
     let sid_for_task = session_id.clone();
     tokio::spawn(async move {
-        let registry = crate::tools::ToolRegistry::build_for_session(&project_root).await;
+        let mut registry = crate::tools::ToolRegistry::build_for_session(&project_root).await;
+        // Expose on-demand semantic (meaning-based) search only when codebase indexing is
+        // enabled (a memory store + embedder are configured); otherwise there's nothing to
+        // search and the tool would just fail.
+        if let (Some(store), Some(embedder)) = (&state.memory_store, &state.embedder) {
+            registry.register(std::sync::Arc::new(
+                crate::tools::semantic::SemanticSearch::new(
+                    store.clone(),
+                    embedder.clone(),
+                    state.memory_top_k,
+                ),
+            ));
+        }
         run_agent_task(
             &state,
             req,

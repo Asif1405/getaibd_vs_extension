@@ -13,6 +13,7 @@ import {
   sendTerminalResult,
   sendAskResult,
   testProviderConnection,
+  isEngineConnectionError,
   type ChatMessage,
   type FileEdit,
 } from "../client";
@@ -20,7 +21,7 @@ import { scanText, formatWarning } from "../safetype/detector";
 import { ensureEngine, restartEngine } from "../engine/manager";
 import { PatchPreviewPanel } from "./patchPreview";
 import { EditReviewManager } from "./editReview";
-import { AgentTerminal } from "./terminal";
+import { AgentTerminal, type CommandResult } from "./terminal";
 import { createFreeSession } from "../free";
 import {
   getServerUrl,
@@ -218,6 +219,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   /** Accumulated streamed agent prose for persistence when SSE `done` is truncated. */
   private agentStreamBuffer = "";
   private agentReplySaved = false;
+  /** One automatic engine-restart retry is allowed per agent run (reset each run). */
+  private engineRetryUsed = false;
 
   constructor(context: vscode.ExtensionContext) {
     this.globalState = context.globalState;
@@ -1212,9 +1215,17 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   }
 
   /**
-   * The file the user is actively viewing/editing, handed to the agent up front so it
-   * starts there instead of searching the repo. Injected once per user message (not per
-   * engine iteration), and skips anything already covered by an @mention.
+   * Editor state for the agent, scaled to how deliberate the user's gesture is. The open
+   * file is ambient IDE state, NOT automatically the edit target: we hand the agent only
+   * as much as the gesture justifies and let it resolve what to actually edit from the
+   * request (no keyword/filename heuristics).
+   *
+   * - selection (deliberate)  -> the selected snippet + its line range, with content.
+   * - ambient focus (just open) -> a `[Editor focus: path (line N)]` marker, NO content;
+   *   the agent reads the file itself only if the task calls for it.
+   *
+   * `@mention` (full content) is handled separately by resolveAtMentions; anything already
+   * covered there is in `skip` and omitted here. Injected once per user message.
    */
   private openFileContextForAgent(skip: Set<string>): ChatMessage[] {
     const config = vscode.workspace.getConfiguration("getaibd");
@@ -1223,21 +1234,43 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     if (!editor || editor.document.uri.scheme !== "file") {return [];}
     const name = vscode.workspace.asRelativePath(editor.document.uri);
     if (skip.has(name)) {return [];}
-    const content = editor.document.getText();
-    if (!content.trim()) {return [];}
-    const snippet = truncateFileContent(content);
-    this.post({
-      type: "addContext",
-      label: `@${name}`,
-      code: content.slice(0, 500) + (content.length > 500 ? "\n..." : ""),
-    });
+
+    const sel = editor.selection;
+    if (!sel.isEmpty) {
+      const selected = editor.document.getText(sel);
+      if (selected.trim()) {
+        const s = sel.start.line + 1;
+        const e = sel.end.line + 1;
+        const snippet = truncateFileContent(selected);
+        this.post({
+          type: "addContext",
+          label: `@${name} (${s}-${e})`,
+          code: selected.slice(0, 500) + (selected.length > 500 ? "\n..." : ""),
+        });
+        return [
+          {
+            role: "user",
+            content:
+              `The user deliberately selected this region of their open file; it is the ` +
+              `most likely subject of the request:\n[Editor selection: ${name} (lines ${s}-${e})]\n` +
+              `\`\`\`\n${snippet}\n\`\`\``,
+          },
+        ];
+      }
+    }
+
+    // Ambient focus: tell the agent which file is on screen and where the cursor is, but
+    // send NO content — it's not necessarily the edit target. The agent reads it only if
+    // the task points there.
+    const line = editor.selection.active.line + 1;
+    this.post({ type: "addContext", label: `@${name}` });
     return [
       {
         role: "user",
         content:
-          `The user is currently looking at this file in their editor; it may contain ` +
-          `their in-progress attempt at the change. Read and build on it before ` +
-          `searching the repository:\n[Currently open file: ${name}]\n\`\`\`\n${snippet}\n\`\`\``,
+          `[Editor focus: ${name} (line ${line})]\n` +
+          `This is the file the user currently has open (ambient context, not necessarily ` +
+          `the file to edit). Read it only if the request points here.`,
       },
     ];
   }
@@ -1295,6 +1328,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.post({ type: "agentStart" });
 
     const apiKey = await this.store.getApiKey(provider);
+    // `launch` is re-invokable so a dropped engine can be restarted and retried once
+    // (see retryAfterEngineDrop) without re-pushing the user message / history.
+    const launch = () => {
     this.abortController = streamAgent(provider, model, task, {
       onToolCall: (name, args) => {
         this.post({ type: "agentToolCall", name, arguments: args });
@@ -1305,8 +1341,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onApprovalRequired: (requestId, sessionId, toolName, args) => {
         this.handleApprovalRequest(requestId, sessionId, toolName, args);
       },
-      onTerminalExec: (requestId, sessionId, args) => {
-        void this.handleTerminalExec(requestId, sessionId, args);
+      onTerminalExec: (requestId, sessionId, args, action) => {
+        void this.handleTerminalExec(requestId, sessionId, args, action);
       },
       onAskRequired: (requestId, sessionId, question, options, multiple) => {
         this.handleAskRequest(requestId, sessionId, question, options, multiple);
@@ -1353,14 +1389,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.resetAgentRunState();
       },
       onError: (error) => {
-        this.persistAgentReply();
-        this.post({ type: "agentError", error });
-        this.abortController = undefined;
-        this.refreshCreditsBalance(provider);
-        this.resetAgentRunState();
-        this.maybeHandlePaymentError(error);
+        if (this.retryAfterEngineDrop(error, launch)) { return; }
+        this.finishAgentError(this.formatAgentError(error), provider);
       },
     }, { requireApproval: true, apiKey, userRules: this.getAgentUserRules(), workspaceCwd: this.getWorkspaceCwd(), cacheSessionId: this.promptCacheSessionId() });
+    };
+    launch();
   }
 
   private getAgentUserRules(): string | undefined {
@@ -1418,6 +1452,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const agentUseMemory =
       this.globalState.get<boolean>(MEMORY_KEY) ??
       vscode.workspace.getConfiguration("getaibd").get<boolean>("agent.useMemory", false);
+    // `launch` is re-invokable so a dropped engine can be restarted and retried once
+    // (see retryAfterEngineDrop) without re-pushing the user message / history.
+    const launch = () => {
     this.abortController = streamOrchestrated(provider, model, text, mode, {
       onModeSelected: (selectedMode) => {
         this.post({ type: "modeDetected", mode: selectedMode });
@@ -1431,8 +1468,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       onApprovalRequired: (requestId, sessionId, toolName, args) => {
         this.handleApprovalRequest(requestId, sessionId, toolName, args);
       },
-      onTerminalExec: (requestId, sessionId, args) => {
-        void this.handleTerminalExec(requestId, sessionId, args);
+      onTerminalExec: (requestId, sessionId, args, action) => {
+        void this.handleTerminalExec(requestId, sessionId, args, action);
       },
       onAskRequired: (requestId, sessionId, question, options, multiple) => {
         this.handleAskRequest(requestId, sessionId, question, options, multiple);
@@ -1478,14 +1515,13 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         this.resetAgentRunState();
       },
       onError: (error) => {
-        this.persistAgentReply();
-        this.post({ type: "agentError", error });
-        this.abortController = undefined;
-        this.refreshCreditsBalance(provider);
-        this.resetAgentRunState();
-        this.maybeHandlePaymentError(error);
+        if (this.retryAfterEngineDrop(error, launch)) { return; }
+        this.stepLimitHit = false;
+        this.finishAgentError(this.formatAgentError(error), provider);
       },
     }, { apiKey, history: priorHistory, requireApproval: true, clientTerminal: AgentTerminal.supported, reasoningEffort, compress: provider === "getaibd" && compress, useMemory: agentUseMemory, userRules: this.getAgentUserRules(), workspaceCwd: this.getWorkspaceCwd(), cacheSessionId: this.promptCacheSessionId(), images: images?.length ? images : undefined });
+    };
+    launch();
   }
 
   private handleFileEdit(edit: FileEdit) {
@@ -1879,21 +1915,32 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     await sendApproval(requestId, approved, sessionId);
   }
 
-  /** Runs an agent shell command in the managed terminal and returns the result to the engine. */
+  /** Handles a delegated terminal request from the engine: either runs a command in the
+   * managed terminal pool ("exec") or reads earlier output ("read"), returning the result. */
   private async handleTerminalExec(
     requestId: string,
     sessionId: string | undefined,
     args: Record<string, unknown>,
+    action?: string,
   ) {
+    const terminalId = typeof args.terminal_id === "string" ? args.terminal_id : undefined;
+
+    // read_terminal: return stored scrollback without running anything.
+    if (action === "read") {
+      const result = this.agentTerminal.readHistory(terminalId);
+      await sendTerminalResult(requestId, result, sessionId);
+      return;
+    }
+
     const command = typeof args.command === "string" ? args.command : "";
     const cmdArgs = Array.isArray(args.args)
       ? args.args.filter((a): a is string => typeof a === "string")
       : [];
     const cwd = typeof args.cwd === "string" ? args.cwd : undefined;
     this.activeTerminalReq = { requestId, sessionId };
-    let result = { stdout: "", stderr: "", exit_code: 0 };
+    let result: CommandResult = { stdout: "", stderr: "", exit_code: 0 };
     try {
-      result = await this.agentTerminal.run(command, cmdArgs, cwd, () => undefined);
+      result = await this.agentTerminal.run(command, cmdArgs, cwd, () => undefined, terminalId);
     } catch (err) {
       result = { stdout: "", stderr: err instanceof Error ? err.message : String(err), exit_code: 1 };
     }
@@ -1983,6 +2030,49 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private beginAgentRun() {
     this.agentStreamBuffer = "";
     this.agentReplySaved = false;
+    this.engineRetryUsed = false;
+  }
+
+  /** Turns a raw agent error into a user-facing message; connection drops get a
+   * friendlier, actionable note instead of a bare `fetch failed`. */
+  private formatAgentError(error: string): string {
+    if (isEngineConnectionError(error)) {
+      return "Lost connection to the local GetAIBD engine. It was restarted — please try again. (See the \"GetAIBD Engine\" output for details.)";
+    }
+    return error;
+  }
+
+  /** On a dropped-engine error, restart the engine and re-run `launch` exactly once.
+   * Returns true when a retry was kicked off (caller should NOT surface the error). */
+  private retryAfterEngineDrop(error: string, launch: () => void): boolean {
+    if (!isEngineConnectionError(error) || this.engineRetryUsed) {
+      return false;
+    }
+    this.engineRetryUsed = true;
+    this.post({ type: "reconnecting", text: "Engine reconnecting…" });
+    void (async () => {
+      try {
+        await restartEngine(this.context);
+      } catch {
+        this.finishAgentError(this.formatAgentError(error));
+        return;
+      }
+      this.post({ type: "reconnected" });
+      launch();
+    })();
+    return true;
+  }
+
+  /** Shared agent-run teardown for a terminal error (persist, surface, reset). */
+  private finishAgentError(error: string, provider?: string): void {
+    this.persistAgentReply();
+    this.post({ type: "agentError", error });
+    this.abortController = undefined;
+    if (provider) {
+      this.refreshCreditsBalance(provider);
+    }
+    this.resetAgentRunState();
+    this.maybeHandlePaymentError(error);
   }
 
   private resetAgentRunState() {
@@ -2943,6 +3033,20 @@ body {
 }
 .queue-item.dragging { opacity: 0.55; }
 .queue-item.drag-over { border-color: var(--focus); }
+.queue-item.editing { align-items: flex-start; }
+.queue-edit {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  font: inherit;
+  color: var(--fg);
+  background: var(--input-bg, var(--bg));
+  border: 1px solid var(--focus);
+  border-radius: 6px;
+  padding: 4px 6px;
+  line-height: 1.4;
+}
+.queue-edit:focus { outline: none; }
 .queue-grip {
   color: var(--muted);
   font-size: 12px;
@@ -3902,6 +4006,7 @@ let messageQueue = [];
 let forcedNext = null;
 let queueSeq = 0;
 let dragQueueId = null;
+let editingQueueId = null;
 let streamEl = null;
 let streamContent = "";
 let agentTextEl = null;
@@ -4611,6 +4716,16 @@ function renderQueue() {
   let html = '<div class="queue-header">Queued (' + messageQueue.length + ')</div>';
   for (let i = 0; i < messageQueue.length; i++) {
     const item = messageQueue[i];
+    if (item.id === editingQueueId) {
+      // Inline editor: a textarea prefilled with the queued text plus Save/Cancel.
+      html += '<div class="queue-item editing" data-id="' + item.id + '">'
+        + '<textarea class="queue-edit" data-id="' + item.id + '" rows="2">' + escapeHtml(item.text) + '</textarea>'
+        + '<span class="queue-item-actions">'
+        + '<button type="button" class="queue-btn" data-act="save" data-id="' + item.id + '" title="Save (Enter)">&#10003;</button>'
+        + '<button type="button" class="queue-btn" data-act="cancel" data-id="' + item.id + '" title="Cancel (Esc)">&#10005;</button>'
+        + '</span></div>';
+      continue;
+    }
     const preview = escapeHtml(item.text.length > 120 ? item.text.slice(0, 117) + "..." : item.text);
     html += '<div class="queue-item" draggable="true" data-id="' + item.id + '">'
       + '<span class="queue-grip" title="Drag to reorder">&#8942;&#8942;</span>'
@@ -4618,11 +4733,45 @@ function renderQueue() {
       + '<span class="queue-item-actions">'
       + '<button type="button" class="queue-btn" data-act="up" data-id="' + item.id + '" title="Move up"' + (i === 0 ? " disabled" : "") + '>&#9650;</button>'
       + '<button type="button" class="queue-btn" data-act="down" data-id="' + item.id + '" title="Move down"' + (i === messageQueue.length - 1 ? " disabled" : "") + '>&#9660;</button>'
+      + '<button type="button" class="queue-btn" data-act="edit" data-id="' + item.id + '" title="Edit">&#9998;</button>'
       + '<button type="button" class="queue-btn force" data-act="force" data-id="' + item.id + '" title="Send now (interrupts current)">&#9654;</button>'
       + '<button type="button" class="queue-btn" data-act="remove" data-id="' + item.id + '" title="Remove">&#10005;</button>'
       + '</span></div>';
   }
   messageQueueEl.innerHTML = html;
+  if (editingQueueId) {
+    const ta = messageQueueEl.querySelector('.queue-edit[data-id="' + editingQueueId + '"]');
+    if (ta) {
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+  }
+}
+
+function startEditQueueItem(id) {
+  editingQueueId = id;
+  renderQueue();
+}
+
+function saveEditQueueItem(id) {
+  const item = messageQueue.find(function (q) { return q.id === id; });
+  const ta = messageQueueEl && messageQueueEl.querySelector('.queue-edit[data-id="' + id + '"]');
+  if (item && ta) {
+    const next = ta.value.trim();
+    if (next) {
+      item.text = next;
+    } else {
+      // Emptied out: treat Save as a removal so we don't keep a blank queued message.
+      messageQueue = messageQueue.filter(function (q) { return q.id !== id; });
+    }
+  }
+  editingQueueId = null;
+  renderQueue();
+}
+
+function cancelEditQueueItem() {
+  editingQueueId = null;
+  renderQueue();
 }
 
 function moveQueueItem(id, delta) {
@@ -4678,6 +4827,21 @@ if (messageQueueEl) {
     else if (act === "down") { moveQueueItem(id, 1); }
     else if (act === "force") { forceQueueItem(id); }
     else if (act === "remove") { removeQueueItem(id); }
+    else if (act === "edit") { startEditQueueItem(id); }
+    else if (act === "save") { saveEditQueueItem(id); }
+    else if (act === "cancel") { cancelEditQueueItem(); }
+  });
+  messageQueueEl.addEventListener("keydown", function (e) {
+    const ta = e.target.closest(".queue-edit");
+    if (!ta) { return; }
+    const id = ta.getAttribute("data-id");
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      saveEditQueueItem(id);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEditQueueItem();
+    }
   });
   messageQueueEl.addEventListener("dragstart", function (e) {
     const row = e.target.closest(".queue-item");
@@ -5531,7 +5695,9 @@ window.addEventListener("message", (event) => {
     case "addContext": {
       const block = document.createElement("div");
       block.className = "context-block";
-      block.innerHTML = '<span class="label">' + escapeHtml(msg.label) + '</span><pre>' + escapeHtml(msg.code) + '</pre>';
+      // Ambient editor focus has no content — render just the chip, no empty code box.
+      const codeHtml = msg.code ? '<pre>' + escapeHtml(msg.code) + '</pre>' : '';
+      block.innerHTML = '<span class="label">' + escapeHtml(msg.label) + '</span>' + codeHtml;
       messagesEl.appendChild(block);
       scrollToBottom();
       break;
@@ -5581,9 +5747,16 @@ window.addEventListener("message", (event) => {
     }
 
     case "reconnecting":
-      reconnectBanner.textContent = "Reconnecting... (attempt " + msg.attempt + "/" + msg.max + ")";
+      reconnectBanner.textContent = msg.text
+        ? msg.text
+        : "Reconnecting... (attempt " + msg.attempt + "/" + msg.max + ")";
       reconnectBanner.classList.add("visible");
       spinnerEl.classList.remove("visible");
+      break;
+
+    case "reconnected":
+      reconnectBanner.classList.remove("visible");
+      spinnerEl.classList.add("visible");
       break;
 
     case "streamRetry":

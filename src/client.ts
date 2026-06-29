@@ -4,6 +4,22 @@ import { describeEnvironment } from "./util/environment";
 /** Result of a fire-and-forget POST back to the local engine (approval/terminal/ask). */
 export type EnginePostResult = { ok: true } | { ok: false; error: string };
 
+/** True when an error string looks like the LOCAL engine is down / unreachable (the
+ * socket was refused, reset or dropped) rather than a normal upstream/LLM error. The
+ * caller can react by restarting the engine and retrying once. HTTP status errors
+ * (`HTTP 4xx/5xx: …`) are NOT connection errors — the engine answered. */
+export function isEngineConnectionError(message: string | undefined | null): boolean {
+  if (!message) {
+    return false;
+  }
+  if (/^HTTP \d/i.test(message.trim())) {
+    return false;
+  }
+  return /econnrefused|connection refused|fetch failed|failed to fetch|socket hang up|econnreset|connection reset|other side closed|terminated|network ?error|connect(ion)? (timed out|timeout)|und_err|request to .* failed|the operation was aborted|load failed/i.test(
+    message,
+  );
+}
+
 /** fetch() with a hard timeout so a stalled request can never hang the caller
  * (a plain fetch only rejects when the socket itself gives up, which may be
  * minutes — long enough to freeze the boot overlay on "Getting ready…"). */
@@ -264,7 +280,7 @@ export interface AgentCallbacks {
   onToolCall: (name: string, args: Record<string, unknown>) => void;
   onToolResult: (name: string, result: unknown) => void;
   onApprovalRequired?: (requestId: string, sessionId: string | undefined, toolName: string, args: Record<string, unknown>) => void;
-  onTerminalExec?: (requestId: string, sessionId: string | undefined, args: Record<string, unknown>) => void;
+  onTerminalExec?: (requestId: string, sessionId: string | undefined, args: Record<string, unknown>, action?: string) => void;
   onAskRequired?: (
     requestId: string,
     sessionId: string | undefined,
@@ -523,7 +539,7 @@ function processAgentEvent(
       }
       case "terminal_exec": {
         const parsed = JSON.parse(data);
-        callbacks.onTerminalExec?.(parsed.request_id, parsed.session_id, parsed.arguments ?? {});
+        callbacks.onTerminalExec?.(parsed.request_id, parsed.session_id, parsed.arguments ?? {}, parsed.action);
         break;
       }
       case "ask_required": {

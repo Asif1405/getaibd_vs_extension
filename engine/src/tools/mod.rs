@@ -7,7 +7,9 @@ pub mod env_manager;
 pub mod git;
 pub mod mcp_proxy;
 pub mod plan;
+pub mod semantic;
 pub mod skill;
+pub mod terminal;
 pub mod terminal_gate;
 pub mod workspace;
 
@@ -126,6 +128,7 @@ impl ToolRegistry {
         registry.register(Arc::new(ask::AskQuestion::new()));
         registry.register(Arc::new(plan::UpdatePlan::new()));
         registry.register(Arc::new(skill::FetchSkill::new(root.clone())));
+        registry.register(Arc::new(terminal::ReadTerminal::new()));
     }
 }
 

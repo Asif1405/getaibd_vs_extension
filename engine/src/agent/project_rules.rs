@@ -30,9 +30,19 @@ and conventions instead of guessing:
 
 ## Find code by grepping first
 
-- To locate relevant code, run `grep`/`rg` FIRST via run_command (e.g.
-  `rg -n "redirect|handle_no_permission|X-Up-Location"`), using the task's key terms and
-  their close synonyms (regex alternation). Then read only the files that matched.
+- To locate relevant code, run `grep`/`rg` FIRST via run_command, then read only the files
+  that matched. Build the pattern as a case-insensitive regex alternation (`rg -ni "a|b|c"`)
+  that deliberately BROADENS coverage beyond the literal words in the request:
+    * the key terms / identifiers from the issue itself;
+    * synonyms and related domain words (e.g. for "auth": `auth|login|signin|session|
+      credential|token|permission`);
+    * antonyms / opposite-state words — paired behaviour almost always lives in the same
+      file, so a bug about one half is found by grepping the other: `disable`→also `enable`,
+      `hide`→`show`, `remove|delete`→`add|create|insert`, `expand`→`collapse`, `open`→`close`,
+      `start`→`stop`, `lock`→`unlock`, `mute`→`unmute`;
+    * naming variants of the same concept: camelCase / snake_case / kebab-case and
+      singular/plural (e.g. `userId|user_id|user-id|users`).
+  Example: `rg -ni "redirect|forward|handle_no_permission|X-Up-Location"`.
 - `grep`/`rg` is the primary way to find where things live. The `search_files` tool is a
   secondary fallback — use it only when a shell grep isn't available or convenient.
 - Don't read or list directories exhaustively to "discover" where something lives — narrow
@@ -47,6 +57,21 @@ and conventions instead of guessing:
   your own knowledge of those libraries' public APIs.
 - Only inspect installed third-party source when the user explicitly asks, or a bug
   clearly traces into one specific library file — and then read just that file.
+
+## Environment errors when running commands
+
+- If a command fails with an environment/config error (missing or unset variable,
+  "KeyError"/"undefined env", failed DB/service connection, missing API key, wrong
+  port/host, "command not found" for a project tool), check the project's env files
+  BEFORE guessing or asking: `.env`, `.env.local`, `.env.example`/`.env.sample`,
+  `.env.<environment>`, plus env sections in `docker-compose.yml`, `Makefile`, CI
+  config, and the runner scripts.
+- Compare what the failing command needs against what's defined. If a variable is only
+  in `.env.example`, the real `.env` is likely missing it — surface exactly which keys
+  are absent so the user can fill them. Prefer running the command through the project's
+  own loader (e.g. `dotenv`, `npm run`, `poetry run`, `make`) so the env is applied.
+- Read env files to understand required keys, but never print, log, or commit their
+  secret values.
 
 ## Make changes small and focused
 

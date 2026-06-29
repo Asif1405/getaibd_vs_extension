@@ -188,6 +188,7 @@ pub async fn incremental_index(
     merkle: &MerkleIndex,
     store: &MemoryStore,
     embedder: &dyn EmbeddingProvider,
+    max_files: usize,
 ) -> Result<IncrementalResult, AppError> {
     let mut current_files: HashMap<String, String> = HashMap::new();
     collect_files(root, root, &mut current_files)?;
@@ -204,6 +205,13 @@ pub async fn incremental_index(
         if prev_hash.as_deref() == Some(hash.as_str()) {
             unchanged += 1;
             continue;
+        }
+
+        // Bound the (billed) embedding cost of a single pass. Files left over this run
+        // keep their old/missing hash, so the next startup — or the on-change watcher —
+        // picks them up. 0 means "no cap".
+        if max_files > 0 && reindexed >= max_files {
+            break;
         }
 
         let abs_path = root.join(rel_path);
