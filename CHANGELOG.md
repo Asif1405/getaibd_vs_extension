@@ -4,6 +4,39 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.7.5]
+
+- **New `web_search` tool — the agent can look things up online.** It can now search
+  the web for the latest package/library versions, API docs, changelogs, and error
+  messages instead of digging through your vendored dependencies. Guidance steers it
+  to `web_search` rather than reading `.venv`, `node_modules`, or `site-packages`.
+  Searches use your GetAIBD account (paid plans) and cost a small per-search fee.
+- **Web search works in chat-driven agent runs too.** The orchestrated path now
+  registers the same on-demand tools as the basic agent, so semantic codebase search
+  and web search are available everywhere.
+
+## [0.7.4]
+
+- **Engine no longer gets killed mid-run.** A slow provider check on `/health` could
+  make the liveness probe time out, after which the extension killed the *live* engine
+  in the middle of a task. `/health` is now an instant local check (provider
+  connectivity moved behind `?providers=1`), a healthy engine is never force-killed,
+  and a window reload / second window now **re-attaches** to the running engine
+  instead of restarting it. If the connection does drop mid-turn you'll see "Engine
+  reconnecting…" and the turn is retried once automatically.
+- **Semantic codebase search + memory.** A `semantic_search` tool plus incremental
+  startup indexing let the agent find code by meaning, not just exact text.
+- **Reusable terminals + `read_terminal`.** Commands run in a persistent terminal pool;
+  long-running processes (dev servers, watchers) are left running while the agent keeps
+  working, and it can read earlier terminal output on demand.
+- **Editable queued messages.** You can edit (or remove) a queued chat message before
+  it's sent.
+- **Snappier completion.** Background reflection/indexing no longer delays the "done"
+  state — the run finishes as soon as the answer is ready.
+- **Smarter code search & environment handling.** The agent greps with broader patterns
+  (synonyms/antonyms/naming variants) to find the right code, and checks your `.env` /
+  compose / Makefile files when a command fails with an environment error.
+
 ## [0.7.0]
 
 - **Fix the panel hanging on "Getting ready…" / dead webview.** A stray raw
