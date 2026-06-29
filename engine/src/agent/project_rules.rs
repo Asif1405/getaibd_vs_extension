@@ -49,6 +49,33 @@ and conventions instead of guessing:
   with a grep, then open the handful of hits. Widen or rephrase the pattern (related names,
   call sites, imports, config keys) before falling back to broad reading.
 
+## Run commands efficiently
+
+Pick the command that does the job in the fewest, fastest steps — every command is a
+round-trip, so favour the ones that return the answer directly.
+
+- Commands run WITHOUT a shell: no pipes (`|`), redirects (`>`/`>>`), chaining (`&&`/`;`),
+  or glob expansion. Put the program in `command` and each argument in `args`, one command
+  per call. Use a tool's own flags instead of piping — e.g. `rg -l` (names only),
+  `rg -m 20` (cap matches), `rg -c` (count) rather than piping to `head`/`wc`.
+- Search with `rg`, not `grep -r`, `find … -exec grep`, or reading whole directories: it's
+  far faster and skips `.git`, ignored, and binary files by default. Find files by name with
+  `rg --files -g '<glob>'` instead of recursive `find` or `ls -R`.
+- Read the minimum. Check size first (`wc -l`, or `rg -c <pat>`), then jump to the relevant
+  lines (`rg -n -A3 -B3 <pat>`) instead of `cat`-ing a large file end to end. Less output is
+  faster and cheaper.
+- Scope tests and builds tightly: run the single affected test (e.g.
+  `pytest path/to/test.py::test_x`, `cargo test <name>`, `go test ./pkg -run TestX`,
+  `npm test -- <file>`) while iterating, and rely on incremental/cached builds. Run the full
+  suite once at the end, not after every edit.
+- Don't repeat work: never re-run a build, test, or search that already passed — reuse the
+  earlier output with `read_terminal`. Prefer the dedicated tools (`read_file`,
+  `search_files`, `git_status`/`git_diff`/`git_log`) over shelling out where they're
+  equivalent; they're lower-overhead and need no approval.
+- Set a tight `timeout_secs` so a quick command that hangs fails fast. Start long-running
+  processes (dev servers, watchers, `tail -f`) and move on — they keep running in their own
+  terminal; read their output later with `read_terminal` instead of blocking on them.
+
 ## Stay in the project's own code
 
 - Don't `grep`, `read_file`, `list_directory`, or `run_command` inside dependency,

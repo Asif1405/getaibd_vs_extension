@@ -4,6 +4,15 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.7.6]
+
+- **Faster, more efficient command use.** The agent now gets explicit guidance to pick
+  the quickest command for the job: search with `rg` (not `grep -r`/`find`), read only
+  the lines it needs, scope tests/builds to what changed (full suite once at the end),
+  reuse earlier output instead of re-running, and never block on long-running processes.
+  It's also reminded that commands run without a shell (no pipes, redirects, `&&`, or
+  globs), which avoids a common class of failed commands.
+
 ## [0.7.5]
 
 - **New `web_search` tool — the agent can look things up online.** It can now search
