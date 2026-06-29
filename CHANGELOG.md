@@ -4,6 +4,14 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.7.8]
+
+- **Self-correcting file/directory errors.** `read_file` on a directory now returns a clear
+  message ("X is a directory — use list_directory…") plus a preview of the folder's
+  contents, and `list_directory` on a file points back to `read_file`. Missing paths report
+  a clean "Cannot read/list X" instead of a raw OS error. Guidance reinforces using the
+  right tool for the path type so the agent stops wasting turns on wrong-tool round-trips.
+
 ## [0.7.7]
 
 - **Confirm a path exists before touching it.** Added guidance so the agent verifies a

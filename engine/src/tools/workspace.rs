@@ -98,6 +98,18 @@ impl Tool for ReadFile {
             .as_str()
             .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
         let path = resolve_path(&self.root, rel)?;
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.is_dir() => {
+                let hint = immediate_entries_hint(&path).await;
+                return Err(AppError::InvalidRequest(format!(
+                    "{rel} is a directory, not a file — use list_directory to view it, then read_file on a specific file inside{hint}"
+                )));
+            }
+            Err(e) => {
+                return Err(AppError::InvalidRequest(format!("Cannot read {rel}: {e}")));
+            }
+            _ => {}
+        }
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| AppError::InvalidRequest(format!("Cannot read {rel}: {e}")))?;
@@ -316,11 +328,53 @@ impl Tool for ListDirectory {
         let rel = input["path"].as_str().unwrap_or(".");
         let recursive = input["recursive"].as_bool().unwrap_or(false);
         let path = resolve_path(&self.root, rel)?;
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.is_file() => {
+                return Err(AppError::InvalidRequest(format!(
+                    "{rel} is a file, not a directory — use read_file to read it, or list_directory on its parent folder"
+                )));
+            }
+            Err(e) => {
+                return Err(AppError::InvalidRequest(format!("Cannot list {rel}: {e}")));
+            }
+            _ => {}
+        }
 
         let mut entries = Vec::new();
         collect_entries(&path, &path, recursive, &mut entries).await?;
         Ok(json!({ "entries": entries }))
     }
+}
+
+/// Short preview of a directory's immediate entries, used to make
+/// "you read a directory" errors self-correcting (so the agent can pick the
+/// right child file without an extra round-trip).
+async fn immediate_entries_hint(dir: &Path) -> String {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+        return String::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut truncated = false;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let is_dir = entry.metadata().await.map(|m| m.is_dir()).unwrap_or(false);
+        let mut name = entry.file_name().to_string_lossy().to_string();
+        if is_dir {
+            name.push('/');
+        }
+        names.push(name);
+        if names.len() >= 50 {
+            truncated = true;
+            break;
+        }
+    }
+    if names.is_empty() {
+        return " (the directory is empty)".to_string();
+    }
+    names.sort();
+    if truncated {
+        names.push("…".to_string());
+    }
+    format!(" — it contains: {}", names.join(", "))
 }
 
 async fn collect_entries(

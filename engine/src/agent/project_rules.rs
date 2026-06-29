@@ -56,9 +56,13 @@ and conventions instead of guessing:
   the path came from a real signal (a grep/`rg` hit, a prior listing, an import you read, or
   a path the user gave you), or you verify it first with a quick `ls`/`stat` or
   `rg --files -g '<name>'`.
-- If the check shows the path is missing, don't retry blindly: grep for the real name
-  (it may have moved or be spelled differently) or list the parent directory to find it.
-  Only `write_file` a brand-new path once you've confirmed the parent directory exists.
+- Use the right tool for the path type: `read_file` is for FILES, `list_directory` is for
+  DIRECTORIES. Don't `read_file` a folder or `list_directory` a file. When unsure whether a
+  path is a file or a directory, list its parent first and look at the entry type.
+- If a check shows the path is missing — or a tool tells you it's the wrong type — don't
+  retry blindly: grep for the real name (it may have moved or be spelled differently), or
+  list the parent directory to find it. Only `write_file` a brand-new path once you've
+  confirmed the parent directory exists.
 
 ## Run commands efficiently
 
