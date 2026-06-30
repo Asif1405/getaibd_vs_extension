@@ -326,6 +326,11 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
     }
 
     if let Some(mem) = memory {
+        // On continuation turns the conversation already holds prior exploration; re-running
+        // RAG/semantic retrieval for a short "fix it" message just re-injects unrelated files
+        // and encourages the model to re-read the whole repo.
+        let continuation = is_continuation_request(task, &session.messages);
+        if !continuation {
         // Reuse the file paths the extension referenced in prior context messages.
         let current_files = hint_paths.clone();
 
@@ -370,6 +375,18 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
                 }
             }
         }
+        }
+    }
+
+    if is_continuation_request(task, &session.messages) {
+        prefix.push(ToolMessage::system(
+            "CONTINUATION TURN: This thread already contains your prior exploration and \
+             recommendations. The user's latest message is asking you to ACT on that work — \
+             not to re-investigate. Do NOT re-run semantic_search, search_files, or read_file \
+             on files you already discussed unless you need one specific missing detail. \
+             Implement only the fixes you already identified in your previous assistant \
+             message; use git_diff to verify, then stop. Do not re-summarize unrelated files.",
+        ));
     }
 
     if !prefix.is_empty() {
@@ -439,15 +456,29 @@ async fn agent_loop(
     }
 
     if task_ctx.is_follow_up {
-        session.push_message(ToolMessage::system(format!(
-            "The user's latest message is a short follow-up (\"{}\"). The active task from \
-             this conversation is: \"{}\". Read the full history: if that task was already \
-             fully completed in a prior assistant reply, answer the follow-up briefly only — \
-             do NOT redo, re-summarize, or re-explore work you already finished. If the task is \
-             genuinely unfinished, continue from where you left off and finish only what remains \
-             — never restart from the beginning.",
-            task_ctx.current_input, task_ctx.effective_task
-        )));
+        let continuation = is_continuation_request(&task_ctx.current_input, &session.messages);
+        let note = if continuation && !is_short_follow_up(&task_ctx.current_input) {
+            format!(
+                "The user's latest message (\"{}\") is a CONTINUATION — they want you to \
+                 implement what you already found and recommended in your previous reply, \
+                 not re-explore the codebase. The original task was: \"{}\". Read your prior \
+                 assistant message in this thread. Make only the targeted edits you already \
+                 proposed; do not re-summarize unrelated files or grep vendored dependencies \
+                 (.venv, site-packages).",
+                task_ctx.current_input, task_ctx.effective_task
+            )
+        } else {
+            format!(
+                "The user's latest message is a short follow-up (\"{}\"). The active task from \
+                 this conversation is: \"{}\". Read the full history: if that task was already \
+                 fully completed in a prior assistant reply, answer the follow-up briefly only — \
+                 do NOT redo, re-summarize, or re-explore work you already finished. If the task is \
+                 genuinely unfinished, continue from where you left off and finish only what remains \
+                 — never restart from the beginning.",
+                task_ctx.current_input, task_ctx.effective_task
+            )
+        };
+        session.push_message(ToolMessage::system(note));
     }
 
     // Seed a structured plan up front for any task that can use tools. The model
@@ -1277,6 +1308,81 @@ async fn verify_task_complete(
     }
 }
 
+/// True when the thread already has a substantive assistant reply the user may be
+/// building on (exploration, findings, proposed fixes).
+fn has_prior_assistant_turn(messages: &[ToolMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.role == "assistant"
+            && m.content.as_deref().is_some_and(|c| c.trim().len() > 120)
+    })
+}
+
+/// Continuation directives: the user wants the agent to act on prior findings, not
+/// re-explore ("fix those issues", "apply your suggestions", "go ahead", …).
+fn is_continuation_request(text: &str, messages: &[ToolMessage]) -> bool {
+    if !has_prior_assistant_turn(messages) {
+        return false;
+    }
+    if is_short_follow_up(text) {
+        return true;
+    }
+    let lower = text.trim().to_lowercase();
+    const PHRASES: &[&str] = &[
+        "fix it",
+        "fix that",
+        "fix those",
+        "fix this",
+        "fix them",
+        "apply",
+        "implement",
+        "go ahead",
+        "do it",
+        "do that",
+        "do those",
+        "make the change",
+        "make those",
+        "make that",
+        "yes fix",
+        "yes please",
+        "please fix",
+        "please apply",
+        "address those",
+        "address the",
+        "apply your",
+        "apply the",
+        "implement your",
+        "implement the",
+        "implement those",
+        "proceed",
+        "carry out",
+        "go for it",
+        "those issues",
+        "those fixes",
+        "your suggestion",
+        "your suggestions",
+        "what you suggested",
+        "what you found",
+        "what you identified",
+        "the issues you",
+        "the fix you",
+        "the changes you",
+        "ship it",
+    ];
+    if PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // Short directive after a long assistant reply (e.g. "fix them" / "apply now").
+    if lower.len() <= 80 && lower.split_whitespace().count() <= 12 {
+        const VERBS: &[&str] = &[
+            "fix", "apply", "implement", "change", "update", "patch", "ship", "commit",
+        ];
+        if VERBS.iter().any(|v| lower.contains(v)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Short follow-ups that refer to the prior substantive turn, not a new task.
 fn is_short_follow_up(text: &str) -> bool {
     let t = text.trim();
@@ -1448,7 +1554,8 @@ fn task_requires_tools(task: &str) -> bool {
 }
 
 fn resolve_task_context(session: &Session, current: &str) -> TaskContext {
-    let is_follow_up = is_short_follow_up(current);
+    let is_continuation = is_continuation_request(current, &session.messages);
+    let is_follow_up = is_short_follow_up(current) || is_continuation;
     let effective_task = if is_follow_up {
         last_substantive_user_task(&session.messages)
             .filter(|t| t.trim() != current.trim())
@@ -2432,6 +2539,31 @@ async fn check_approval(
 mod task_context_tests {
     use super::*;
     use crate::models::ToolMessage;
+
+    #[test]
+    fn continuation_detects_fix_those_issues() {
+        let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        session.push_message(ToolMessage::user(
+            "Login view should redirect when session expires",
+        ));
+        session.push_message(ToolMessage::assistant(
+            "I found the issue in notifications/views.py — My Work uses X-Up-Location but \
+             notification_row.html opens a modal. Fix: update notification_row.html to match \
+             tasks/views.py redirect pattern…",
+        ));
+        let ctx = resolve_task_context(&session, "fix those issues");
+        assert!(ctx.is_follow_up);
+        assert_eq!(
+            ctx.effective_task,
+            "Login view should redirect when session expires"
+        );
+        assert!(is_continuation_request("fix those issues", &session.messages));
+        assert!(is_continuation_request("go ahead and apply", &session.messages));
+        assert!(!is_continuation_request(
+            "fix those issues",
+            &[ToolMessage::user("only message")]
+        ));
+    }
 
     #[test]
     fn follow_up_resolves_effective_task() {

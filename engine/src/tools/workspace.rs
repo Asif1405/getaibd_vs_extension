@@ -61,6 +61,31 @@ pub(crate) fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, AppEr
     Ok(candidate)
 }
 
+/// True when `path` points inside a vendored dependency tree the agent must not read
+/// (`.venv`, `node_modules`, `site-packages`, …). Project source lives outside these.
+pub fn is_vendored_dependency_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_lowercase();
+    const SEGMENTS: &[&str] = &[
+        "/.venv/",
+        "/venv/",
+        "/node_modules/",
+        "/site-packages/",
+        "/vendor/",
+        "/.tox/",
+        "/__pycache__/",
+        "/dist-packages/",
+    ];
+    if SEGMENTS.iter().any(|s| p.contains(s)) {
+        return true;
+    }
+    p.starts_with(".venv/")
+        || p.starts_with("venv/")
+        || p.starts_with("node_modules/")
+        || p == ".venv"
+        || p == "venv"
+        || p == "node_modules"
+}
+
 pub struct ReadFile {
     root: Arc<PathBuf>,
 }
@@ -97,6 +122,13 @@ impl Tool for ReadFile {
         let rel = input["path"]
             .as_str()
             .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
+        if is_vendored_dependency_path(rel) {
+            return Err(AppError::InvalidRequest(format!(
+                "{rel} is inside a vendored dependency tree (.venv/node_modules/site-packages). \
+                 Read project source instead — use search_files/semantic_search on the repo, or \
+                 web_search for third-party library docs."
+            )));
+        }
         let path = resolve_path(&self.root, rel)?;
         match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.is_dir() => {
@@ -620,7 +652,12 @@ async fn search_recursive(
 
         if meta.as_ref().is_some_and(std::fs::Metadata::is_dir) {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
+            if name.starts_with('.')
+                || matches!(
+                    name.as_ref(),
+                    "node_modules" | "target" | "venv" | "site-packages" | "vendor" | "__pycache__"
+                )
+            {
                 continue;
             }
             Box::pin(search_recursive(base, &path, pattern, max, out)).await?;
@@ -631,6 +668,9 @@ async fn search_recursive(
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .to_string();
+                if is_vendored_dependency_path(&rel) {
+                    continue;
+                }
                 for (i, line) in content.lines().enumerate() {
                     if out.len() >= max {
                         break;

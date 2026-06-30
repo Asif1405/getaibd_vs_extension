@@ -4,6 +4,17 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.7.9]
+
+- **Continuation turns no longer re-explore the codebase.** When you follow up with
+  "fix those issues", "go ahead", or similar after the agent already investigated,
+  it now recognizes the continuation, skips redundant RAG/semantic re-injection, and
+  is instructed to implement its prior recommendations instead of re-reading files.
+- **Block reads inside vendored dependency trees.** `read_file`, `search_files`, and
+  shell inspection commands (`grep`, `cat`, etc.) now reject paths under `.venv`,
+  `node_modules`, `site-packages`, and similar — steering the agent toward project
+  source and `web_search` for library docs.
+
 ## [0.7.8]
 
 - **Self-correcting file/directory errors.** `read_file` on a directory now returns a clear

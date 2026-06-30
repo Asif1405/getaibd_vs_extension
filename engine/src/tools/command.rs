@@ -120,6 +120,35 @@ fn is_inline_eval_flag(arg: &str) -> bool {
     )
 }
 
+/// Read-only shell commands that inspect file contents/paths.
+fn is_read_inspection_command(base: &str) -> bool {
+    matches!(
+        base,
+        "grep" | "rg" | "cat" | "head" | "tail" | "less" | "more" | "sed" | "awk" | "find"
+    )
+}
+
+/// Reject grep/cat/etc. aimed at vendored dependency trees — the model should search
+/// project source or use web_search for library docs, not read site-packages.
+fn command_targets_vendored_deps(program: &str, args: &[String]) -> bool {
+    if !is_read_inspection_command(
+        program
+            .split('/')
+            .next_back()
+            .unwrap_or(program)
+            .split_whitespace()
+            .next()
+            .unwrap_or(program),
+    ) {
+        return false;
+    }
+    let mut tokens: Vec<&str> = program.split_whitespace().skip(1).collect();
+    tokens.extend(args.iter().map(String::as_str));
+    tokens
+        .iter()
+        .any(|t| super::workspace::is_vendored_dependency_path(t))
+}
+
 pub struct RunCommand {
     root: Arc<PathBuf>,
     allowlist: HashSet<String>,
@@ -221,10 +250,16 @@ impl Tool for RunCommand {
             )));
         }
 
-        // Resolve `cwd` strictly inside the project root. `PathBuf::join` with an
-        // absolute path silently discards the root, so an unvalidated `cwd` of `/` or
-        // `/etc` would run the command anywhere on the host — route it through the same
-        // containment check the file tools use.
+        if command_targets_vendored_deps(program, &args) {
+            return Err(AppError::InvalidRequest(
+                "Cannot grep/cat/read inside vendored dependency trees (.venv, node_modules, \
+                 site-packages). Search project source with search_files/semantic_search, or use \
+                 web_search for third-party library documentation."
+                    .into(),
+            ));
+        }
+
+        // Resolve `cwd` strictly inside the project root.
         let work_dir = match input["cwd"].as_str() {
             None | Some("") => self.root.as_ref().clone(),
             Some(p) => super::workspace::resolve_path(self.root.as_ref(), p)?,
