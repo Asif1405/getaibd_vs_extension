@@ -4,6 +4,18 @@ All notable changes to the "getaibd" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.7.10]
+
+- **Tighter continuation detection (fixes 0.7.9 over-reach).** A follow-up is now treated
+  as "act on prior findings" only when it actually refers back to that work — a
+  back-referential phrase ("fix those", "apply your fix", "what you suggested") or an
+  action verb paired with a back-reference ("apply them", "patch it"). Bare verbs like
+  "implement a new caching layer" or "update the README" are no longer misread as
+  continuations, so genuinely new tasks still get full codebase exploration.
+- **Correct task resolution on continuation turns.** The active task a continuation refers
+  back to is now resolved correctly at runtime (the current message is skipped when walking
+  back), instead of collapsing to the follow-up text itself.
+
 ## [0.7.9]
 
 - **Continuation turns no longer re-explore the codebase.** When you follow up with

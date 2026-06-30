@@ -1317,8 +1317,15 @@ fn has_prior_assistant_turn(messages: &[ToolMessage]) -> bool {
     })
 }
 
-/// Continuation directives: the user wants the agent to act on prior findings, not
+/// Continuation directives: the user wants the agent to ACT on prior findings, not
 /// re-explore ("fix those issues", "apply your suggestions", "go ahead", …).
+///
+/// The signal that distinguishes a continuation from a brand-new task is **anaphora** —
+/// the message points back at the agent's prior work ("those", "them", "your fix",
+/// "what you suggested"). A bare action verb is NOT enough: "implement caching" and
+/// "update the README" are new tasks that happen to share a verb with a continuation,
+/// and must still get full exploration. We therefore require either an explicit
+/// back-referential phrase or an action verb PAIRED WITH a back-reference pronoun.
 fn is_continuation_request(text: &str, messages: &[ToolMessage]) -> bool {
     if !has_prior_assistant_turn(messages) {
         return false;
@@ -1327,56 +1334,131 @@ fn is_continuation_request(text: &str, messages: &[ToolMessage]) -> bool {
         return true;
     }
     let lower = text.trim().to_lowercase();
-    const PHRASES: &[&str] = &[
+
+    // Whole-message "just continue" directives (after stripping punctuation/spaces).
+    let normalized: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
+    const STANDALONE_GO: &[&str] = &[
+        "proceed",
+        "continue",
+        "goahead",
+        "goforit",
+        "shipit",
+        "doit",
+        "fixit",
+        "applyit",
+        "carryon",
+        "carryout",
+        "yesproceed",
+        "yescontinue",
+    ];
+    if STANDALONE_GO.iter().any(|w| normalized == *w) {
+        return true;
+    }
+
+    // Phrases that explicitly point back at the agent's prior work (anaphora). These
+    // are unambiguous continuations regardless of length.
+    const BACKREF_PHRASES: &[&str] = &[
         "fix it",
         "fix that",
         "fix those",
         "fix this",
         "fix them",
-        "apply",
-        "implement",
-        "go ahead",
         "do it",
         "do that",
         "do those",
         "make the change",
-        "make those",
-        "make that",
+        "make those change",
+        "make that change",
+        "apply it",
+        "apply that",
+        "apply those",
+        "apply them",
+        "apply your",
+        "apply the change",
+        "apply the fix",
+        "apply the suggestion",
+        "implement it",
+        "implement that",
+        "implement those",
+        "implement them",
+        "implement your",
+        "go ahead",
+        "go for it",
+        "ship it",
+        "proceed with",
+        "address those",
+        "address them",
+        "address the issue",
+        "address the issues",
+        "resolve those",
+        "resolve them",
         "yes fix",
         "yes please",
+        "yes do",
         "please fix",
         "please apply",
-        "address those",
-        "address the",
-        "apply your",
-        "apply the",
-        "implement your",
-        "implement the",
-        "implement those",
-        "proceed",
-        "carry out",
-        "go for it",
+        "please proceed",
         "those issues",
         "those fixes",
+        "those changes",
+        "those problems",
+        "the issue you",
+        "the issues you",
+        "the fix you",
+        "the fixes you",
+        "the changes you",
         "your suggestion",
         "your suggestions",
+        "your recommendation",
+        "your recommendations",
         "what you suggested",
         "what you found",
         "what you identified",
-        "the issues you",
-        "the fix you",
-        "the changes you",
-        "ship it",
+        "what you recommended",
+        "what you proposed",
     ];
-    if PHRASES.iter().any(|p| lower.contains(p)) {
+    if BACKREF_PHRASES.iter().any(|p| lower.contains(p)) {
         return true;
     }
-    // Short directive after a long assistant reply (e.g. "fix them" / "apply now").
+
+    // Short imperative that pairs an action verb with a back-reference ("apply them now",
+    // "patch it"). Both are required: a verb alone is a new task, an anaphor alone is not
+    // a directive. Verbs are matched on word boundaries so "do"/"make" don't hit
+    // "domain"/"makefile".
     if lower.len() <= 80 && lower.split_whitespace().count() <= 12 {
         const VERBS: &[&str] = &[
-            "fix", "apply", "implement", "change", "update", "patch", "ship", "commit",
+            "fix",
+            "apply",
+            "implement",
+            "change",
+            "update",
+            "patch",
+            "ship",
+            "commit",
+            "do",
+            "make",
+            "address",
+            "resolve",
         ];
-        if VERBS.iter().any(|v| lower.contains(v)) {
+        const ANAPHORS: &[&str] = &[
+            " it",
+            " them",
+            " those",
+            " that",
+            " these",
+            " this",
+            " your ",
+            " the above",
+            " the issues",
+            " the fixes",
+            " the changes",
+            " the suggestions",
+        ];
+        let has_verb = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| VERBS.contains(&w));
+        let has_anaphor = ANAPHORS.iter().any(|a| lower.contains(a));
+        if has_verb && has_anaphor {
             return true;
         }
     }
@@ -1411,13 +1493,19 @@ fn is_substantive_user_message(text: &str) -> bool {
     !t.is_empty() && !is_short_follow_up(t)
 }
 
-/// Last substantive user request in the thread (skips "ok", "thanks", etc.).
-fn last_substantive_user_task(messages: &[ToolMessage]) -> Option<String> {
+/// Most recent substantive user request in the thread, skipping "ok"/"thanks"-style
+/// follow-ups AND any message equal to `exclude`. By the time we resolve task context
+/// the CURRENT turn is already in `messages`, so without excluding it a substantive
+/// continuation like "fix those issues" would resolve to itself instead of the real
+/// prior task it refers back to.
+fn last_substantive_user_task_excluding(messages: &[ToolMessage], exclude: &str) -> Option<String> {
+    let exclude = exclude.trim();
     messages
         .iter()
         .filter(|m| m.role == "user")
         .filter_map(|m| m.content.as_deref())
         .rev()
+        .filter(|t| t.trim() != exclude)
         .find(|t| is_substantive_user_message(t))
         .map(|s| s.to_string())
 }
@@ -1557,8 +1645,7 @@ fn resolve_task_context(session: &Session, current: &str) -> TaskContext {
     let is_continuation = is_continuation_request(current, &session.messages);
     let is_follow_up = is_short_follow_up(current) || is_continuation;
     let effective_task = if is_follow_up {
-        last_substantive_user_task(&session.messages)
-            .filter(|t| t.trim() != current.trim())
+        last_substantive_user_task_excluding(&session.messages, current)
             .unwrap_or_else(|| current.to_string())
     } else {
         current.to_string()
@@ -2551,14 +2638,45 @@ mod task_context_tests {
              notification_row.html opens a modal. Fix: update notification_row.html to match \
              tasks/views.py redirect pattern…",
         ));
+        // Real call order: the current user message is already in the thread by the time
+        // agent_loop resolves task context. The test must mirror that or it gives false
+        // confidence about effective_task resolution.
+        session.push_message(ToolMessage::user("fix those issues"));
         let ctx = resolve_task_context(&session, "fix those issues");
         assert!(ctx.is_follow_up);
         assert_eq!(
             ctx.effective_task,
             "Login view should redirect when session expires"
         );
-        assert!(is_continuation_request("fix those issues", &session.messages));
-        assert!(is_continuation_request("go ahead and apply", &session.messages));
+
+        // Back-referential directives are continuations.
+        assert!(is_continuation_request(
+            "fix those issues",
+            &session.messages
+        ));
+        assert!(is_continuation_request(
+            "go ahead and apply your fix",
+            &session.messages
+        ));
+        assert!(is_continuation_request("apply them now", &session.messages));
+        assert!(is_continuation_request("proceed", &session.messages));
+
+        // New substantive tasks that merely share a verb must NOT be misread as
+        // continuations — they still need full exploration.
+        assert!(!is_continuation_request(
+            "implement a new caching layer",
+            &session.messages
+        ));
+        assert!(!is_continuation_request(
+            "update the README with install steps",
+            &session.messages
+        ));
+        assert!(!is_continuation_request(
+            "add rate limiting to the login endpoint",
+            &session.messages
+        ));
+
+        // No prior assistant turn → never a continuation.
         assert!(!is_continuation_request(
             "fix those issues",
             &[ToolMessage::user("only message")]
