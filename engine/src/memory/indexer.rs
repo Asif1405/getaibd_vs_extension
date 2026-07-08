@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::AppError;
 use crate::models::ToolMessage;
 
-use super::chunker::chunk_code_to_strings;
+use super::chunker::chunk_code;
 use super::embeddings::EmbeddingProvider;
 use super::store::MemoryStore;
 use super::{MemoryEntry, MemorySource, MemoryTier};
@@ -78,7 +78,28 @@ impl<'a> MemoryIndexer<'a> {
 
         let is_code = is_code_file(path);
         let chunks = if is_code {
-            chunk_code_to_strings(content, path, self.max_code_lines)
+            // Prefix each code chunk with a one-line locator (path, symbol, line
+            // range). This gives the embedding and the retrieved context explicit
+            // symbol-level attribution without a separate DB column.
+            chunk_code(content, path, self.max_code_lines)
+                .into_iter()
+                .map(|c| {
+                    let head = match &c.symbol {
+                        Some(sym) => format!(
+                            "[{path_str}] {} {} (lines {}-{})",
+                            c.kind.as_str(),
+                            sym,
+                            c.start_line,
+                            c.end_line
+                        ),
+                        None => format!(
+                            "[{path_str}] (lines {}-{})",
+                            c.start_line, c.end_line
+                        ),
+                    };
+                    format!("{head}\n{}", c.content)
+                })
+                .collect()
         } else {
             chunk_text(content, self.chunk_size, self.chunk_overlap)
         };

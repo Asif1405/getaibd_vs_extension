@@ -2,10 +2,13 @@ pub mod approval;
 pub mod ask;
 pub mod ask_gate;
 pub mod command;
+pub mod editor_gate;
 pub mod edits;
 pub mod env_manager;
 pub mod git;
+pub mod lsp;
 pub mod mcp_proxy;
+pub mod patch_graph;
 pub mod plan;
 pub mod semantic;
 pub mod skill;
@@ -138,14 +141,18 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitLog::new(root.clone())));
         registry.register(Arc::new(command::RunCommand::new(
             root.clone(),
-            command::default_allowlist(),
             env_mgr.clone(),
         )));
         registry.register(Arc::new(env_manager::ManageEnv::new(env_mgr)));
         registry.register(Arc::new(ask::AskQuestion::new()));
         registry.register(Arc::new(plan::UpdatePlan::new()));
+        registry.register(Arc::new(plan::WritePlan::new()));
         registry.register(Arc::new(skill::FetchSkill::new(root.clone())));
         registry.register(Arc::new(terminal::ReadTerminal::new()));
+        registry.register(Arc::new(lsp::FindSymbol::new(root.clone())));
+        registry.register(Arc::new(lsp::FindReferences::new(root.clone())));
+        registry.register(Arc::new(lsp::DocumentSymbols::new(root.clone())));
+        registry.register(Arc::new(patch_graph::PatchGraph::new(root.clone())));
     }
 }
 

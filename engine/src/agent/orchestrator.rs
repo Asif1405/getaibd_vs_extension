@@ -19,6 +19,7 @@ pub struct Orchestrator {
     approval_gate: Option<crate::tools::approval::ApprovalGate>,
     terminal_gate: Option<crate::tools::terminal_gate::TerminalGate>,
     ask_gate: Option<crate::tools::ask_gate::AskGate>,
+    editor_gate: Option<crate::tools::editor_gate::EditorGate>,
 }
 
 impl Orchestrator {
@@ -32,6 +33,7 @@ impl Orchestrator {
             approval_gate: None,
             terminal_gate: None,
             ask_gate: None,
+            editor_gate: None,
         }
     }
 
@@ -47,6 +49,11 @@ impl Orchestrator {
 
     pub fn with_ask_gate(mut self, gate: crate::tools::ask_gate::AskGate) -> Self {
         self.ask_gate = Some(gate);
+        self
+    }
+
+    pub fn with_editor_gate(mut self, gate: crate::tools::editor_gate::EditorGate) -> Self {
+        self.editor_gate = Some(gate);
         self
     }
 
@@ -113,13 +120,28 @@ impl Orchestrator {
         session.push_message(ToolMessage::user(input));
 
         let memory_ctx = self.memory_context();
+        // Ask mode still has tool access (it can run read-only commands, etc.), so it
+        // must carry the gates too — otherwise approval/ask are silently bypassed.
+        let options = AgentOptions {
+            approval_gate: self.approval_gate.clone(),
+            terminal_gate: self.terminal_gate.clone(),
+            ask_gate: self.ask_gate.clone(),
+            editor_gate: self.editor_gate.clone(),
+            tool_timeout_secs: 300,
+            circuit_breaker: None,
+            context_config: Some(crate::context::ContextConfig::default()),
+            enable_thinking: super::thinking::model_uses_reasoning(&session.model),
+            // Ask is meant to answer and yield, not loop to "completion".
+            auto_complete: false,
+            temperature: None,
+        };
         run_agent_with_memory(
             session,
             input,
             &self.provider,
             &self.registry,
             memory_ctx.as_ref(),
-            None,
+            Some(&options),
             on_event,
         )
         .await
@@ -138,18 +160,26 @@ impl Orchestrator {
             approval_gate: self.approval_gate.clone(),
             terminal_gate: self.terminal_gate.clone(),
             ask_gate: self.ask_gate.clone(),
+            editor_gate: self.editor_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: super::thinking::model_uses_reasoning(&session.model),
             // Plan mode is meant to produce a plan and yield, not loop to "completion".
             auto_complete: false,
+            temperature: None,
+        };
+        // Plan is read-only: hand it a filtered registry with just the read/search
+        // tools plus `write_plan` (temp file), so it can never mutate the repo.
+        let registry = match AgentMode::Plan.tool_allowlist() {
+            Some(allow) => self.registry.filter(|name| allow.contains(&name)),
+            None => self.registry.filter(|_| true),
         };
         run_agent_with_memory(
             session,
             input,
             &self.provider,
-            &self.registry,
+            &registry,
             memory_ctx.as_ref(),
             Some(&options),
             on_event,
@@ -175,11 +205,20 @@ impl Orchestrator {
             approval_gate: self.approval_gate.clone(),
             terminal_gate: self.terminal_gate.clone(),
             ask_gate: self.ask_gate.clone(),
+            editor_gate: self.editor_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: super::thinking::model_uses_reasoning(&session.model),
             auto_complete: true,
+            // Pin a low temperature for action modes so the worker reports what it
+            // actually observed instead of inventing a plausible-sounding outcome.
+            // Reasoning models reject a custom temperature, so leave them at default.
+            temperature: if super::thinking::model_uses_reasoning(&session.model) {
+                None
+            } else {
+                Some(0.1)
+            },
         };
 
         run_agent_with_memory(
@@ -217,11 +256,20 @@ impl Orchestrator {
             approval_gate: self.approval_gate.clone(),
             terminal_gate: self.terminal_gate.clone(),
             ask_gate: self.ask_gate.clone(),
+            editor_gate: self.editor_gate.clone(),
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
             enable_thinking: super::thinking::model_uses_reasoning(&session.model),
             auto_complete: true,
+            // Pin a low temperature for action modes so the worker reports what it
+            // actually observed instead of inventing a plausible-sounding outcome.
+            // Reasoning models reject a custom temperature, so leave them at default.
+            temperature: if super::thinking::model_uses_reasoning(&session.model) {
+                None
+            } else {
+                Some(0.1)
+            },
         };
 
         run_agent_with_memory(

@@ -18,8 +18,14 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
+[features]
+# The VS Code extension always talks to the agent over HTTP/SSE, so the server
+# is on by default here (the CLI vendoring of this engine keeps it off).
+default = ["server"]
+server = ["dep:axum", "dep:tower-http"]
+
 [dependencies]
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros"], optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
@@ -32,7 +38,7 @@ toml_edit = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
 futures = "0.3"
 futures-util = "0.3"
 pin-project-lite = "0.2"
@@ -46,10 +52,21 @@ syn = { version = "2", features = ["full", "parsing", "visit"] }
 quote = "1"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 chrono = { version = "0.4.43", features = ["serde"] }
+tree-sitter = "0.26.10"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [[bin]]
 name = "getaibd-agent"
 path = "src/main.rs"
+required-features = ["server"]
 
 [dev-dependencies]
 tempfile = "3"

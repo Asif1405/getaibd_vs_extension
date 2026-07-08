@@ -1,5 +1,4 @@
 pub mod cache;
-pub mod call_graph;
 pub mod chunker;
 pub mod context_builder;
 pub mod embeddings;

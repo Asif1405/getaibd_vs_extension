@@ -88,6 +88,24 @@ const REASONING_KEY = "getaibd.reasoningEffort";
 const ALWAYS_ALLOW_KEY = "getaibd.alwaysAllowTools";
 const MAX_RECONNECT = 3;
 
+/** Programs destructive or exfiltration-prone enough that a `run_command` call must
+ * always get an explicit approval — even when the user chose "Always allow" for
+ * run_command. Matches the base program name of the command. */
+const DANGEROUS_COMMANDS = new Set([
+  "sudo", "doas", "su", "rm", "rmdir", "dd", "mkfs", "fdisk", "diskutil", "shred",
+  "shutdown", "reboot", "halt", "poweroff", "kill", "killall", "pkill", "chmod",
+  "chown", "chgrp", "curl", "wget", "scp", "sftp", "ssh", "ftp", "nc", "ncat",
+  "netcat", "telnet", "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "eval",
+]);
+function commandIsDangerous(args: Record<string, unknown>): boolean {
+  const program = typeof args?.command === "string" ? args.command : "";
+  if (!program) {
+    return false;
+  }
+  const base = program.split("/").pop()!.trim().split(/\s+/)[0] ?? "";
+  return DANGEROUS_COMMANDS.has(base);
+}
+
 /** Image file extensions we attach as base64 vision input (vs. text @context). */
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
 /** Cap a single attached image so we never post a multi-MB blob into a request. */
@@ -470,6 +488,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "loadModels": {
         const provider = msgString(msg, "provider");
         if (provider) {await this.loadModels(provider);}
+        break;
+      }
+      case "mentionSearch": {
+        await this.searchMentionFiles(msgString(msg, "query"));
         break;
       }
       case "send": {
@@ -1157,7 +1179,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       const fullText = doc.getText();
       let content = fullText;
       let header = `[File: ${ref}]`;
-      let label = `@${ref}`;
+      // Chip shows just the file name (not the path or contents) to stay compact.
+      const baseName = ref.split("/").pop() || ref;
+      let label = `@${baseName}`;
       if (start && end) {
         const lines = fullText.split("\n");
         const s = Math.max(1, Math.min(start, lines.length));
@@ -1165,17 +1189,67 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         content = lines.slice(s - 1, e).join("\n");
         // Keep the bracket as just the path so open-file dedupe still matches.
         header = `[File: ${ref}] (lines ${s}-${e})`;
-        label = `@${ref} (${s}-${e})`;
+        label = `@${baseName} (${s}-${e})`;
       }
       const snippet = truncateFileContent(content);
       messages.push({ role: "user", content: `${header}\n\`\`\`\n${snippet}\n\`\`\`` });
+      // No `code` preview — the transcript shows only the file-name chip.
       this.post({
         type: "addContext",
         label,
-        code: content.slice(0, 500) + (content.length > 500 ? "\n..." : ""),
       });
     }
     return messages;
+  }
+
+  /** Backs the `@` file picker: returns up to 20 workspace-relative paths matching
+   * `query`, ranked so a basename prefix match wins. Only paths the mention resolver
+   * can parse (its `[A-Za-z0-9._/-]` char-class) are offered. */
+  private async searchMentionFiles(query: string | undefined): Promise<void> {
+    const EXCLUDE =
+      "**/{node_modules,.venv,venv,env,.git,dist,build,target,__pycache__,.next,.cache,vendor}/**";
+    const q = (query || "").trim();
+    // findFiles takes a glob, so match on the last path segment; the full query is
+    // used for ranking against the relative path below.
+    const seg = q.split("/").pop() || "";
+    const glob = seg ? `**/*${seg}*` : "**/*";
+    let uris: vscode.Uri[] = [];
+    try {
+      uris = await vscode.workspace.findFiles(glob, EXCLUDE, 400);
+    } catch {
+      uris = [];
+    }
+    const ql = q.toLowerCase();
+    const hasSlash = q.includes("/");
+    const items = uris
+      .map((u) => vscode.workspace.asRelativePath(u, false))
+      .filter((p) => /^[A-Za-z0-9._/\-]+$/.test(p))
+      .map((p) => {
+        const base = p.split("/").pop() || p;
+        let score = 3;
+        if (ql) {
+          const hay = (hasSlash ? p : base).toLowerCase();
+          if (hay.startsWith(ql)) {
+            score = 0;
+          } else if (base.toLowerCase().startsWith(ql)) {
+            score = 1;
+          } else if (hay.includes(ql)) {
+            score = 2;
+          }
+        } else {
+          score = 0;
+        }
+        return { path: p, base, score };
+      })
+      .sort(
+        (a, b) =>
+          a.score - b.score ||
+          a.path.length - b.path.length ||
+          a.path.localeCompare(b.path),
+      )
+      .slice(0, 20)
+      .map((x) => ({ path: x.path, base: x.base }));
+    this.post({ type: "mentionResults", items });
   }
 
   private buildFileContext(skipPaths?: Set<string>): ChatMessage[] {
@@ -1892,7 +1966,10 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   private handleApprovalRequest(requestId: string, sessionId: string | undefined, toolName: string, args: Record<string, unknown>) {
     this.pendingApprovals.set(requestId, sessionId);
     this.pendingApprovalTools.set(requestId, toolName);
-    if (this.getAlwaysAllow().includes(toolName)) {
+    // A destructive/network `run_command` always requires an explicit approval, even
+    // when the user chose "Always allow" for run_command.
+    const dangerous = toolName === "run_command" && commandIsDangerous(args);
+    if (!dangerous && this.getAlwaysAllow().includes(toolName)) {
       void this.resolveApproval(requestId, true);
       return;
     }
@@ -3209,6 +3286,7 @@ body {
 .brand { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.3px; }
 
 .composer {
+  position: relative;
   margin: 8px 12px 12px;
   border: 1px solid var(--input-border);
   border-radius: 12px;
@@ -3218,6 +3296,41 @@ body {
   flex-direction: column;
   gap: 6px;
   flex-shrink: 0;
+}
+.mention-dropdown {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 100%;
+  margin-bottom: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--vscode-dropdown-background, var(--code-bg));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  z-index: 60;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+.mention-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.mention-item.active,
+.mention-item:hover {
+  background: var(--btn-bg);
+  color: #fff;
+}
+.mention-name { font-weight: 600; flex-shrink: 0; }
+.mention-path {
+  font-size: 11px;
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .composer:focus-within { border-color: var(--focus); }
 .composer.drag-over { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus) inset; }
@@ -3511,6 +3624,16 @@ body {
   letter-spacing: 0.7px;
   color: var(--muted);
 }
+.model-subgroup-header {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+  opacity: 0.75;
+  padding: 6px 14px 2px 20px;
+}
+.thinking-badge { font-size: 10px; opacity: 0.85; cursor: help; line-height: 1; }
 
 .model-item {
   padding: 7px 14px;
@@ -3795,8 +3918,9 @@ body {
 </div>
 
 <div class="composer">
+  <div class="mention-dropdown" id="mentionDropdown" style="display:none"></div>
   <div class="attach-strip" id="attachStrip" style="display:none"></div>
-  <textarea id="input" rows="1" placeholder="Ask anything... (paste or drop images)"></textarea>
+  <textarea id="input" rows="1" placeholder="Ask anything... (@ to add a file, paste or drop images)"></textarea>
   <div class="composer-row">
     <button class="ctl-pill" id="modePill" title="Mode">
       <span class="ctl-icon" id="modePillIcon">&#8734;</span>
@@ -4388,6 +4512,23 @@ function renderProviderTabs() {
   }
 }
 
+// Vendor bucket for a model id (mirrors the editor's grouping). Inferred from
+// the id prefix so new models sort into the right section automatically.
+const VENDOR_ORDER = ["Anthropic", "OpenAI", "Google", "xAI", "DeepSeek", "Qwen", "Moonshot", "Meta", "Perplexity", "Other"];
+function modelVendor(id) {
+  const l = (id || "").toLowerCase();
+  if (l.startsWith("claude")) return "Anthropic";
+  if (l.startsWith("gpt") || l.startsWith("o1") || l.startsWith("o3") || l.startsWith("o4")) return "OpenAI";
+  if (l.startsWith("gemini")) return "Google";
+  if (l.startsWith("grok")) return "xAI";
+  if (l.startsWith("deepseek")) return "DeepSeek";
+  if (l.startsWith("qwen")) return "Qwen";
+  if (l.startsWith("kimi")) return "Moonshot";
+  if (l.startsWith("llama")) return "Meta";
+  if (l.startsWith("perplexity")) return "Perplexity";
+  return "Other";
+}
+
 function renderModelList(filter) {
   modelList.innerHTML = "";
   let total = 0;
@@ -4426,9 +4567,31 @@ function renderModelList(filter) {
         div.className = "model-divider";
         modelList.appendChild(div);
       }
-      for (const m of apiModels) {
+
+      // Pin the free / "Auto" model to the top, then group the rest by vendor.
+      const freeFirst = apiModels.filter(m => isFreeModel(m.id, m.free));
+      const rest = apiModels.filter(m => !isFreeModel(m.id, m.free));
+      for (const m of freeFirst) {
         modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, [], m.capabilities || [], m.free));
         total++;
+      }
+
+      const buckets = {};
+      for (const m of rest) {
+        const v = modelVendor(m.id);
+        (buckets[v] = buckets[v] || []).push(m);
+      }
+      for (const vendor of VENDOR_ORDER) {
+        const arr = buckets[vendor];
+        if (!arr || arr.length === 0) continue;
+        const sub = document.createElement("div");
+        sub.className = "model-subgroup-header";
+        sub.textContent = vendor;
+        modelList.appendChild(sub);
+        for (const m of arr) {
+          modelList.appendChild(makeModelItem(pid, m.id, m.name || m.id, undefined, [], m.capabilities || [], m.free));
+          total++;
+        }
       }
     }
   }
@@ -4487,6 +4650,14 @@ function makeModelItem(providerId, modelId, displayName, ctx, tags, capabilities
     chatOnly.textContent = "💬";
     chatOnly.title = "Chat only — this model can't use tools or run as an agent";
     badges.appendChild(chatOnly);
+  }
+
+  if (caps.includes("thinking")) {
+    const think = document.createElement("span");
+    think.className = "thinking-badge";
+    think.textContent = "🧠";
+    think.title = "Supports reasoning / extended thinking";
+    badges.appendChild(think);
   }
 
   if (locked) {
@@ -4647,7 +4818,109 @@ sendBtn.addEventListener("click", () => {
   }
 });
 
+// ---- @-mention file picker ----------------------------------------------
+const mentionDropdown = document.getElementById("mentionDropdown");
+let mentionItems = [];
+let mentionActive = -1;
+let mentionRange = null; // { at, start, end } byte offsets of the @token in the textarea
+
+/** The @token immediately left of the caret, or null. A token starts at "@" that
+ * is at the string start or preceded by whitespace, and contains no whitespace. */
+function mentionTokenAtCursor() {
+  const pos = inputEl.selectionStart;
+  const val = inputEl.value;
+  let i = pos - 1;
+  while (i >= 0) {
+    const ch = val[i];
+    if (ch === "@") {
+      if (i === 0 || /\\s/.test(val[i - 1])) {
+        const token = val.slice(i + 1, pos);
+        if (!/\\s/.test(token)) { return { at: i, start: i + 1, end: pos, token }; }
+      }
+      return null;
+    }
+    if (/\\s/.test(ch)) { return null; }
+    i--;
+  }
+  return null;
+}
+
+function hideMention() {
+  mentionDropdown.style.display = "none";
+  mentionItems = [];
+  mentionActive = -1;
+  mentionRange = null;
+}
+
+function updateMentionPicker() {
+  const t = mentionTokenAtCursor();
+  if (!t) { hideMention(); return; }
+  mentionRange = t;
+  vscode.postMessage({ type: "mentionSearch", query: t.token });
+}
+
+function renderMention() {
+  if (!mentionItems.length) { mentionDropdown.style.display = "none"; return; }
+  if (mentionActive < 0) { mentionActive = 0; }
+  mentionDropdown.innerHTML = "";
+  mentionItems.forEach((it, idx) => {
+    const row = document.createElement("div");
+    row.className = "mention-item" + (idx === mentionActive ? " active" : "");
+    row.innerHTML = '<span class="mention-name">' + escapeHtml(it.base) + '</span>'
+      + '<span class="mention-path">' + escapeHtml(it.path) + '</span>';
+    row.addEventListener("mousedown", (e) => { e.preventDefault(); acceptMention(idx); });
+    mentionDropdown.appendChild(row);
+  });
+  mentionDropdown.style.display = "block";
+  const activeEl = mentionDropdown.children[mentionActive];
+  if (activeEl && activeEl.scrollIntoView) { activeEl.scrollIntoView({ block: "nearest" }); }
+}
+
+function acceptMention(idx) {
+  const it = mentionItems[idx];
+  if (!it || !mentionRange) { hideMention(); return; }
+  const val = inputEl.value;
+  const before = val.slice(0, mentionRange.at);
+  const after = val.slice(mentionRange.end);
+  const insert = "@" + it.path + " ";
+  inputEl.value = before + insert + after;
+  const caret = (before + insert).length;
+  inputEl.setSelectionRange(caret, caret);
+  inputEl.focus();
+  hideMention();
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 150) + "px";
+}
+
+const mentionOpen = () => mentionDropdown.style.display === "block" && mentionItems.length > 0;
+
 inputEl.addEventListener("keydown", (e) => {
+  // The picker owns navigation keys while it's open, so Enter/Tab pick a file and
+  // don't send the message.
+  if (mentionOpen()) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      mentionActive = (mentionActive + 1) % mentionItems.length;
+      renderMention();
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      mentionActive = (mentionActive - 1 + mentionItems.length) % mentionItems.length;
+      renderMention();
+      return;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      acceptMention(mentionActive < 0 ? 0 : mentionActive);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      hideMention();
+      return;
+    }
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     // Empty composer + a non-empty queue: release the first queued item (run it
@@ -4664,7 +4937,14 @@ inputEl.addEventListener("keydown", (e) => {
 inputEl.addEventListener("input", () => {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 150) + "px";
+  updateMentionPicker();
 });
+// Re-evaluate the token when the caret moves without editing (arrow keys, click).
+inputEl.addEventListener("keyup", (e) => {
+  if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) { updateMentionPicker(); }
+});
+inputEl.addEventListener("click", () => updateMentionPicker());
+inputEl.addEventListener("blur", () => setTimeout(hideMention, 150));
 
 function detectPlanIntent(text) {
   const t = text.toLowerCase();
@@ -5691,6 +5971,15 @@ window.addEventListener("message", (event) => {
         historyPos: msg.historyPos,
       });
       break;
+
+    case "mentionResults": {
+      // Ignore stale results if the user has since dismissed / moved off the token.
+      if (!mentionRange) { break; }
+      mentionItems = Array.isArray(msg.items) ? msg.items : [];
+      mentionActive = 0;
+      renderMention();
+      break;
+    }
 
     case "addContext": {
       const block = document.createElement("div");

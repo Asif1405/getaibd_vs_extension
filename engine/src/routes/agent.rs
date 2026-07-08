@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
 use crate::agent::runtime::{run_agent_with_memory, AgentEventKind, AgentOptions, MemoryContext};
@@ -74,7 +74,9 @@ pub async fn agent_handler(
         )));
     }
 
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+    // Unbounded so the synchronous event callback can never drop a control event
+    // (approval/ask) via a full-buffer `try_send`, which would hang the run.
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
     // Each agent session gets its own scoped gate identified by a UUID
     let session_id = Uuid::new_v4().to_string();
@@ -118,7 +120,7 @@ pub async fn agent_handler(
         state.clear_ask_gate(&sid);
     });
 
-    let stream = ReceiverStream::new(rx);
+    let stream = UnboundedReceiverStream::new(rx);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -133,7 +135,7 @@ async fn run_agent_task(
     gate: Option<ApprovalGate>,
     ask_gate: crate::tools::ask_gate::AskGate,
     session_id_for_events: String,
-    tx: mpsc::Sender<Result<Event, Infallible>>,
+    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
 ) {
     let environment =
         crate::agent::runtime::format_environment(req.os.as_deref(), req.shell.as_deref());
@@ -172,17 +174,25 @@ async fn run_agent_task(
         approval_gate: gate,
         terminal_gate: None,
         ask_gate: Some(ask_gate),
+        editor_gate: None,
         tool_timeout_secs: 300,
         circuit_breaker: Some(state.circuit_breaker.clone()),
         context_config: Some(state.context_config.clone()),
         enable_thinking: crate::agent::thinking::model_uses_reasoning(&session.model),
         auto_complete: true,
+        // Low temperature keeps the worker grounded in observed tool output; reasoning
+        // models reject a custom temperature, so leave those at the provider default.
+        temperature: if crate::agent::thinking::model_uses_reasoning(&session.model) {
+            None
+        } else {
+            Some(0.1)
+        },
     };
 
     let approval_session = session_id_for_events.clone();
     let mut event_handler = |event: crate::agent::runtime::AgentEvent| {
         if let Some(evt) = agent_event_to_sse(&event, &approval_session) {
-            let _ = tx.try_send(Ok(evt));
+            let _ = tx.send(Ok(evt));
         }
     };
 
@@ -203,14 +213,14 @@ async fn run_agent_task(
                 .event("complete")
                 .json_data(serde_json::json!({ "iterations": agent_result.iterations }))
             {
-                let _ = tx.send(Ok(evt)).await;
+                let _ = tx.send(Ok(evt));
             }
         }
         Err(e) => {
             let evt = Event::default()
                 .event("error")
                 .data(crate::routes::sse::sse_text_data(&e.to_string()));
-            let _ = tx.send(Ok(evt)).await;
+            let _ = tx.send(Ok(evt));
         }
     }
 }
@@ -262,6 +272,10 @@ fn agent_event_to_sse(
         AgentEventKind::AskRequired => {
             let payload = inject_session_id(data, session_id);
             Some(Event::default().event("ask_required").data(payload))
+        }
+        AgentEventKind::EditorRequest => {
+            let payload = inject_session_id(data, session_id);
+            Some(Event::default().event("editor_request").data(payload))
         }
         AgentEventKind::StepLimitReached => {
             Some(Event::default().event("step_limit").data(data))
@@ -365,6 +379,36 @@ pub async fn ask_result_handler(
     } else {
         Err(AppError::InvalidRequest(
             "No active agent session awaiting an answer".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EditorResultRequest {
+    pub request_id: String,
+    /// Session UUID returned in the editor_request SSE event.
+    pub session_id: Option<String>,
+    /// JSON-encoded LSP/diagnostics result the editor resolved for this request.
+    pub result: String,
+}
+
+#[allow(clippy::unused_async)]
+pub async fn editor_result_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EditorResultRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let gate = if let Some(sid) = &req.session_id {
+        state.get_editor_gate(sid)
+    } else {
+        state.any_editor_gate()
+    };
+
+    if let Some(gate) = gate {
+        let sent = gate.respond(&req.request_id, req.result).await;
+        Ok(Json(serde_json::json!({ "acknowledged": sent })))
+    } else {
+        Err(AppError::InvalidRequest(
+            "No active agent session awaiting an editor result".into(),
         ))
     }
 }

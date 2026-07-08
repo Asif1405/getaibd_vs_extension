@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::agent::modes::AgentMode;
 use crate::agent::orchestrator::Orchestrator;
@@ -40,6 +40,10 @@ pub struct OrchestratedRequest {
     /// When true, run_command is delegated to the client's managed terminal.
     #[serde(default)]
     pub client_terminal: bool,
+    /// When true, structural queries (references/definition/symbols) and post-edit
+    /// diagnostics are delegated to the editor's language servers.
+    #[serde(default)]
+    pub client_editor: bool,
     /// Reasoning effort hint (low/medium/high) for thinking-capable models.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
@@ -87,7 +91,15 @@ pub async fn orchestrated_agent_handler(
     // orchestrated path too, so chat-driven agent runs can search the web.
     registry.register_session_state_tools(&state);
 
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
+    // Unbounded: the event callback below is a *synchronous* closure, so it can
+    // only ever `try_send`. On a bounded channel a momentary backlog (TCP
+    // backpressure while the client is mid-read during heavy token streaming)
+    // makes `try_send` drop events. Dropping a text/think token is cosmetic, but
+    // dropping a control event (`terminal_exec` / `approval_required` /
+    // `ask_required`) is fatal: the orchestrator then waits forever on a gate the
+    // client was never told to satisfy, and the run hangs mid-stage. Unbounded
+    // guarantees every control event reaches the client.
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let gate = if req.require_approval {
@@ -100,6 +112,13 @@ pub async fn orchestrated_agent_handler(
     let term_gate = if req.client_terminal {
         let g = crate::tools::terminal_gate::TerminalGate::new();
         state.set_terminal_gate(&session_id, g.clone());
+        Some(g)
+    } else {
+        None
+    };
+    let editor_gate = if req.client_editor {
+        let g = crate::tools::editor_gate::EditorGate::new();
+        state.set_editor_gate(&session_id, g.clone());
         Some(g)
     } else {
         None
@@ -120,6 +139,7 @@ pub async fn orchestrated_agent_handler(
             registry,
             gate,
             term_gate,
+            editor_gate,
             ask_gate,
             sid.clone(),
             tx.clone(),
@@ -127,27 +147,24 @@ pub async fn orchestrated_agent_handler(
         .await;
         state.clear_approval_gate(&sid);
         state.clear_terminal_gate(&sid);
+        state.clear_editor_gate(&sid);
         state.clear_ask_gate(&sid);
 
         match result {
             Ok(resp) => {
-                let _ = tx
-                    .send(Ok(Event::default()
-                        .event("complete")
-                        .data(serde_json::to_string(&resp).unwrap_or_default())))
-                    .await;
+                let _ = tx.send(Ok(Event::default()
+                    .event("complete")
+                    .data(serde_json::to_string(&resp).unwrap_or_default())));
             }
             Err(e) => {
-                let _ = tx
-                    .send(Ok(Event::default()
-                        .event("error")
-                        .data(crate::routes::sse::sse_text_data(&e.to_string()))))
-                    .await;
+                let _ = tx.send(Ok(Event::default()
+                    .event("error")
+                    .data(crate::routes::sse::sse_text_data(&e.to_string()))));
             }
         }
     });
 
-    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -158,9 +175,10 @@ async fn run_orchestrated_task(
     registry: ToolRegistry,
     gate: Option<crate::tools::approval::ApprovalGate>,
     term_gate: Option<crate::tools::terminal_gate::TerminalGate>,
+    editor_gate: Option<crate::tools::editor_gate::EditorGate>,
     ask_gate: crate::tools::ask_gate::AskGate,
     session_id: String,
-    tx: mpsc::Sender<Result<Event, Infallible>>,
+    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
 ) -> Result<OrchestratedResponse, AppError> {
     let environment =
         crate::agent::runtime::format_environment(req.os.as_deref(), req.shell.as_deref());
@@ -202,6 +220,10 @@ async fn run_orchestrated_task(
         orchestrator = orchestrator.with_terminal_gate(g);
     }
 
+    if let Some(g) = editor_gate {
+        orchestrator = orchestrator.with_editor_gate(g);
+    }
+
     if req.use_memory {
         if let (Some(store), Some(embedder)) = (&state.memory_store, &state.embedder) {
             orchestrator = orchestrator.with_memory(store.clone().into(), embedder.clone_box());
@@ -229,6 +251,7 @@ async fn run_orchestrated_task(
             AgentEventKind::ApprovalRequired => "approval_required",
             AgentEventKind::TerminalExec => "terminal_exec",
             AgentEventKind::AskRequired => "ask_required",
+            AgentEventKind::EditorRequest => "editor_request",
             AgentEventKind::StepLimitReached => "step_limit",
             AgentEventKind::DiscardDraft => "discard_draft",
         };
@@ -236,7 +259,8 @@ async fn run_orchestrated_task(
         let data = match event.kind {
             AgentEventKind::ApprovalRequired
             | AgentEventKind::TerminalExec
-            | AgentEventKind::AskRequired => inject_session_id(&event.content, &session_id),
+            | AgentEventKind::AskRequired
+            | AgentEventKind::EditorRequest => inject_session_id(&event.content, &session_id),
             AgentEventKind::ToolCall | AgentEventKind::ToolResult | AgentEventKind::FileEdit => {
                 event.content.unwrap_or_default()
             }
@@ -254,7 +278,7 @@ async fn run_orchestrated_task(
             _ => event.content.unwrap_or_default(),
         };
 
-        let _ = tx.try_send(Ok(Event::default().event(event_name).data(data)));
+        let _ = tx.send(Ok(Event::default().event(event_name).data(data)));
     };
 
     let result = orchestrator

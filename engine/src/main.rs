@@ -47,6 +47,8 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    spawn_parent_watchdog();
+
     let mut app_config = AppConfig::load(cli.config.as_deref());
 
     if let Some(host) = cli.host {
@@ -105,6 +107,10 @@ async fn main() {
             post(routes::agent::ask_result_handler),
         )
         .route(
+            "/agent/editor_result",
+            post(routes::agent::editor_result_handler),
+        )
+        .route(
             "/agent/orchestrated",
             post(routes::orchestrated_agent::orchestrated_agent_handler),
         )
@@ -151,6 +157,37 @@ async fn main() {
 
     axum::serve(listener, app).await.unwrap();
 }
+
+/// Exit when the parent that spawned us goes away — including when it is
+/// SIGKILL'd, in which case no graceful shutdown ever reaches this process.
+/// Without this the agent orphans (reparented to pid 1) and keeps its RAG index
+/// resident in memory forever. Gated on `GETAIBD_PARENT_WATCH` so standalone or
+/// manually-launched servers are never affected.
+#[cfg(unix)]
+fn spawn_parent_watchdog() {
+    if std::env::var_os("GETAIBD_PARENT_WATCH").is_none() {
+        return;
+    }
+    // `getppid` has no preconditions and cannot fail.
+    let initial = unsafe { libc::getppid() };
+    // Already orphaned (or no real parent) — nothing meaningful to watch.
+    if initial <= 1 {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // When the parent dies we are reparented, so getppid() no longer matches.
+        if unsafe { libc::getppid() } != initial {
+            tracing::info!(
+                "parent process {initial} exited; shutting down getaibd-agent"
+            );
+            std::process::exit(0);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_parent_watchdog() {}
 
 async fn run_startup_indexing(state: &AppState) {
     let Some(ref store) = state.memory_store else {

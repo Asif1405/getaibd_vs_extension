@@ -1,6 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
 use crate::error::AppError;
 
 use super::embeddings::EmbeddingProvider;
@@ -46,8 +44,6 @@ pub struct EditContext {
 pub struct ContextBuilder<'a> {
     store: &'a MemoryStore,
     embedder: &'a dyn EmbeddingProvider,
-    #[allow(dead_code)]
-    project_root: PathBuf,
     max_context_chars: usize,
     min_relevance_score: f32,
     project_graph: Option<ProjectGraph>,
@@ -55,15 +51,10 @@ pub struct ContextBuilder<'a> {
 }
 
 impl<'a> ContextBuilder<'a> {
-    pub fn new(
-        store: &'a MemoryStore,
-        embedder: &'a dyn EmbeddingProvider,
-        project_root: PathBuf,
-    ) -> Self {
+    pub fn new(store: &'a MemoryStore, embedder: &'a dyn EmbeddingProvider) -> Self {
         Self {
             store,
             embedder,
-            project_root,
             max_context_chars: 50_000,
             min_relevance_score: 0.3,
             project_graph: None,
@@ -383,11 +374,10 @@ impl<'a> ContextBuilder<'a> {
 pub async fn build_smart_context(
     store: &MemoryStore,
     embedder: &dyn EmbeddingProvider,
-    project_root: &Path,
     query: &str,
     current_files: &[String],
 ) -> Result<String, AppError> {
-    let builder = ContextBuilder::new(store, embedder, project_root.to_path_buf())
+    let builder = ContextBuilder::new(store, embedder)
         .with_max_context_chars(50_000)
         .with_min_relevance_score(0.3);
 

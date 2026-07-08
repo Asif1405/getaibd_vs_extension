@@ -46,6 +46,8 @@ pub struct AppState {
     terminal_gates: Mutex<HashMap<String, crate::tools::terminal_gate::TerminalGate>>,
     /// Session-scoped ask gates (clarifying questions) keyed by session UUID
     ask_gates: Mutex<HashMap<String, crate::tools::ask_gate::AskGate>>,
+    /// Session-scoped editor gates (LSP queries / diagnostics) keyed by session UUID
+    editor_gates: Mutex<HashMap<String, crate::tools::editor_gate::EditorGate>>,
     /// Snapshots for patch rollback, keyed by patch ID (UUID)
     pub patch_snapshots: Mutex<HashMap<String, Snapshot>>,
     pub context_config: crate::context::ContextConfig,
@@ -151,6 +153,7 @@ impl AppState {
             approval_gates: Mutex::new(HashMap::new()),
             terminal_gates: Mutex::new(HashMap::new()),
             ask_gates: Mutex::new(HashMap::new()),
+            editor_gates: Mutex::new(HashMap::new()),
             patch_snapshots: Mutex::new(HashMap::new()),
             context_config: config.context.clone(),
         }
@@ -227,6 +230,28 @@ impl AppState {
     /// Find any active ask gate — fallback when session_id is unknown.
     pub fn any_ask_gate(&self) -> Option<crate::tools::ask_gate::AskGate> {
         self.ask_gates.lock().expect("state mutex poisoned").values().next().cloned()
+    }
+
+    /// Register an editor gate (LSP queries / diagnostics) for a specific agent session.
+    pub fn set_editor_gate(&self, session_id: &str, gate: crate::tools::editor_gate::EditorGate) {
+        self.editor_gates
+            .lock().expect("state mutex poisoned")
+            .insert(session_id.to_string(), gate);
+    }
+
+    /// Retrieve the editor gate for a session.
+    pub fn get_editor_gate(&self, session_id: &str) -> Option<crate::tools::editor_gate::EditorGate> {
+        self.editor_gates.lock().expect("state mutex poisoned").get(session_id).cloned()
+    }
+
+    /// Remove the editor gate after a session finishes.
+    pub fn clear_editor_gate(&self, session_id: &str) {
+        self.editor_gates.lock().expect("state mutex poisoned").remove(session_id);
+    }
+
+    /// Find any active editor gate — fallback when session_id is unknown.
+    pub fn any_editor_gate(&self) -> Option<crate::tools::editor_gate::EditorGate> {
+        self.editor_gates.lock().expect("state mutex poisoned").values().next().cloned()
     }
 
     /// Store a patch snapshot for later rollback.

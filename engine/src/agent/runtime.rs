@@ -124,6 +124,9 @@ pub enum AgentEventKind {
     TerminalExec,
     /// The agent is asking the user a clarifying question with options.
     AskRequired,
+    /// A structural query (LSP references/definition/symbols) or a post-edit
+    /// diagnostics request that the client (editor) should resolve and POST back.
+    EditorRequest,
     /// The run stopped because it reached the step-limit brake; the user can continue.
     StepLimitReached,
     /// A provisional assistant message that was already streamed is being superseded
@@ -151,6 +154,9 @@ pub struct AgentOptions {
     pub approval_gate: Option<ApprovalGate>,
     pub terminal_gate: Option<crate::tools::terminal_gate::TerminalGate>,
     pub ask_gate: Option<crate::tools::ask_gate::AskGate>,
+    /// When set, structural code queries and post-edit diagnostics are delegated to
+    /// the editor's language servers instead of the headless grep/tree-sitter path.
+    pub editor_gate: Option<crate::tools::editor_gate::EditorGate>,
     pub tool_timeout_secs: u64,
     pub circuit_breaker: Option<Arc<CircuitBreaker>>,
     pub context_config: Option<ContextConfig>,
@@ -159,6 +165,11 @@ pub struct AgentOptions {
     /// finished before the run ends, and forces the agent to keep working if it is not.
     /// Only action modes (Agent/Debug) set this; Ask/Plan are meant to yield.
     pub auto_complete: bool,
+    /// Sampling temperature for the worker model. Action modes pin this low so the
+    /// agent sticks to observed facts instead of confabulating outcomes. `None`
+    /// falls back to the provider default (and is used for reasoning models, which
+    /// reject a custom temperature).
+    pub temperature: Option<f32>,
 }
 
 impl Default for AgentOptions {
@@ -167,11 +178,13 @@ impl Default for AgentOptions {
             approval_gate: None,
             terminal_gate: None,
             ask_gate: None,
+            editor_gate: None,
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: None,
             enable_thinking: true,
             auto_complete: false,
+            temperature: None,
         }
     }
 }
@@ -286,7 +299,15 @@ fn edit_target_hints(messages: &[ToolMessage]) -> Vec<String> {
         .collect()
 }
 
-async fn inject_context(session: &mut Session, task: &str, memory: Option<&MemoryContext<'_>>) {
+async fn inject_context(
+    session: &mut Session,
+    task: &str,
+    memory: Option<&MemoryContext<'_>>,
+) {
+    // Each turn re-injects a fresh system prefix. Strip the prior turn's leading
+    // system block so instructions/RAG don't stack and tool history stays salient.
+    strip_leading_system_prefix(&mut session.messages);
+
     // Build the static prefix (system prompt + long-term memory) and prepend it so it sits
     // BEFORE the conversation history. This keeps the most recent turns closest to the task,
     // which makes them the most salient context for the model.
@@ -331,50 +352,42 @@ async fn inject_context(session: &mut Session, task: &str, memory: Option<&Memor
         // and encourages the model to re-read the whole repo.
         let continuation = is_continuation_request(task, &session.messages);
         if !continuation {
-        // Reuse the file paths the extension referenced in prior context messages.
-        let current_files = hint_paths.clone();
+            // Reuse the file paths the extension referenced in prior context messages.
+            let current_files = hint_paths.clone();
 
-        // Try to enrich context with cached project graph when available.
-        let ctx_result = if let Some(cache) = mem.analysis_cache.as_ref() {
-            let project_root = Path::new(&session.project_root);
-            let maybe_graph = cache.get_project_graph(project_root).ok().flatten();
-            let mut builder =
-                ContextBuilder::new(mem.store, mem.embedder, project_root.to_path_buf())
-                    .with_max_context_chars(50_000)
-                    .with_min_relevance_score(0.3);
-            if let Some(graph) = maybe_graph {
-                builder = builder.with_project_graph(graph);
-            }
-            match builder.build_context(task, &current_files).await {
-                Ok(window) => Ok(builder.format_context_window(&window)),
-                Err(e) => Err(e),
-            }
-        } else {
-            build_smart_context(
-                mem.store,
-                mem.embedder,
-                Path::new(&session.project_root),
-                task,
-                &current_files,
-            )
-            .await
-        };
+            // Try to enrich context with cached project graph when available.
+            let ctx_result = if let Some(cache) = mem.analysis_cache.as_ref() {
+                let project_root = Path::new(&session.project_root);
+                let maybe_graph = cache.get_project_graph(project_root).ok().flatten();
+                let mut builder = ContextBuilder::new(mem.store, mem.embedder)
+                        .with_max_context_chars(50_000)
+                        .with_min_relevance_score(0.3);
+                if let Some(graph) = maybe_graph {
+                    builder = builder.with_project_graph(graph);
+                }
+                match builder.build_context(task, &current_files).await {
+                    Ok(window) => Ok(builder.format_context_window(&window)),
+                    Err(e) => Err(e),
+                }
+            } else {
+                build_smart_context(mem.store, mem.embedder, task, &current_files).await
+            };
 
-        match ctx_result {
-            Ok(ctx) if !ctx.is_empty() => {
-                prefix.push(ToolMessage::system(ctx));
-            }
-            _ => {
-                if let Ok(memories) =
-                    retrieve_context(mem.store, mem.embedder, task, mem.top_k).await
-                {
-                    let ctx = format_context(&memories);
-                    if !ctx.is_empty() {
-                        prefix.push(ToolMessage::system(ctx));
+            match ctx_result {
+                Ok(ctx) if !ctx.is_empty() => {
+                    prefix.push(ToolMessage::system(ctx));
+                }
+                _ => {
+                    if let Ok(memories) =
+                        retrieve_context(mem.store, mem.embedder, task, mem.top_k).await
+                    {
+                        let ctx = format_context(&memories);
+                        if !ctx.is_empty() {
+                            prefix.push(ToolMessage::system(ctx));
+                        }
                     }
                 }
             }
-        }
         }
     }
 
@@ -410,6 +423,10 @@ async fn agent_loop(
     let mut iterations = 0;
     let mut last_text = String::new();
     let mut nudge_count = 0u32;
+    // Total tool calls the model has actually emitted this run. Used to catch a
+    // FABRICATED completion — a model that reports it started/killed a server (etc.)
+    // without ever calling a tool, so nothing really happened.
+    let mut total_tool_calls = 0usize;
     let use_streaming = provider.supports_streaming_tools();
     let enable_thinking = options.is_none_or(|o| o.enable_thinking);
 
@@ -611,22 +628,25 @@ async fn agent_loop(
         // we're back under 85% of the model's real window, or a pass can no longer
         // compress anything (guarantees termination even if the recent tail alone
         // is large).
-        let mut compressed = false;
+        let mut announced = false;
         loop {
             let used = crate::context::count_tool_message_tokens(&session.messages) + tool_tokens;
             if used <= summarize_threshold {
                 break;
             }
+            // Announce once, BEFORE the first (possibly slow, provider-backed)
+            // summarization pass, so the UI can show a live "Summarizing chat
+            // context…" status *while* it happens instead of only after it's done.
+            if !announced {
+                on_event(AgentEvent {
+                    kind: AgentEventKind::ContextCompressed,
+                    content: Some("Summarizing chat context…".into()),
+                });
+                announced = true;
+            }
             if !summarize_old_messages(session, provider).await {
                 break;
             }
-            compressed = true;
-        }
-        if compressed {
-            on_event(AgentEvent {
-                kind: AgentEventKind::ContextCompressed,
-                content: Some("Summarized earlier turns to stay within the context window".into()),
-            });
         }
 
         // Re-inject the task ledger as the most-recent system note every turn so the
@@ -646,11 +666,17 @@ async fn agent_loop(
             model: session.model.clone(),
             messages: req_messages,
             tools: tool_defs.clone(),
-            temperature: None,
+            // Action modes pin a low temperature (set in the orchestrator) so the
+            // model reports observed facts rather than inventing plausible ones;
+            // None here means "use the provider default" (Ask/Plan, reasoning models).
+            temperature: options.and_then(|o| o.temperature),
             max_tokens: None,
             reasoning_effort: session.reasoning_effort.clone(),
-            // Never send tool_choice=required — breaks Alibaba/Qwen thinking mode.
-            // Weak models are nudged via system messages; compat layer defaults to "auto".
+            // Never send tool_choice=required — the getaibd backend routes to
+            // Alibaba/Qwen thinking mode, which hard-rejects it with a 400
+            // ("tool_choice … not supported … in thinking mode"), failing the whole
+            // run. Weak models are pushed to act via the system-message nudges below;
+            // the compat layer sends "auto".
             tool_choice: None,
             compress: session.compress,
             cache_session_id: session.cache_session_id.clone(),
@@ -750,6 +776,109 @@ async fn agent_loop(
                 .await;
             }
 
+            // Consecutive-narration budget, shared by the two nudges below.
+            const MAX_NUDGES: u32 = 6;
+
+            // "It says it will do something then stops": the model ended its turn
+            // announcing an imminent action ("Let me restart:", "Now I'll edit …")
+            // WITHOUT calling any tool, so the action never happened. Left alone, the
+            // completion reviewer below can accept the task as done (the earlier code
+            // fix already shows in the diff) and end the run on that dangling promise.
+            // Intercept it FIRST: nudge the model to actually perform the step (or give
+            // a clean summary). Bounded by MAX_NUDGES; a real tool call resets the count.
+            //
+            // Gate on `auto_complete` (action modes: Agent/Debug), NOT the
+            // `requires_tools` keyword heuristic: a short follow-up like "start again"
+            // resolves to requires_tools=false, yet the model is clearly mid-action
+            // ("Killing and restarting:"). The action cue itself is the signal that
+            // work remains — so in any action mode a dangling cue must nudge, never
+            // let the completion reviewer accept a no-op turn (work_total=0) as done.
+            if (auto_complete || task_ctx.requires_tools)
+                && !looks_like_user_question(content_txt)
+                && ends_with_action_cue(content_txt)
+                && nudge_count < MAX_NUDGES
+                && !tool_defs.is_empty()
+                && session.max_iterations > 1
+                && iterations < session.max_iterations
+            {
+                tracing::debug!(
+                    nudge_count,
+                    "empty tool_calls: reply ends on an action cue without acting — nudging to execute"
+                );
+                if !last_text.trim().is_empty() {
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::DiscardDraft,
+                        content: None,
+                    });
+                }
+                on_event(AgentEvent {
+                    kind: AgentEventKind::Reflecting,
+                    content: Some(
+                        "The model described the next step but didn't do it — pushing it to \
+                         run the tool now…"
+                            .to_string(),
+                    ),
+                });
+                nudge_count += 1;
+                session.push_message(ToolMessage::system(
+                    "Your reply ended by announcing a next action (e.g. \"let me…\", \"I'll…\", or a \
+                     line ending in ':'), but you did NOT call any tool, so that action did not \
+                     happen. Perform it NOW by calling the appropriate tool (run_command, \
+                     write_file, patch_file, …) — do not describe the step, execute it. If the task \
+                     is in fact already complete, reply instead with a brief final summary and no \
+                     trailing \"let me…\".",
+                ));
+                continue;
+            }
+
+            // Fabricated completion: the model reports an outcome that could ONLY be
+            // achieved by running commands — a server "started"/"restarted"/"running",
+            // processes "killed", a live URL/port — yet it has made ZERO tool calls this
+            // entire run (total_tool_calls == 0). Nothing actually happened; the report
+            // is invented. The diff-aware reviewer can't catch this (there's no file
+            // change to inspect and the claim is about runtime state), so it would accept
+            // the lie. Refuse: force a real tool call instead of finishing on fiction.
+            if auto_complete
+                && total_tool_calls == 0
+                && !looks_like_user_question(content_txt)
+                && claims_completed_action(content_txt)
+                && nudge_count < MAX_NUDGES
+                && !tool_defs.is_empty()
+                && session.max_iterations > 1
+                && iterations < session.max_iterations
+            {
+                tracing::debug!(
+                    nudge_count,
+                    "empty tool_calls: reply claims an executed outcome but no tool ran all run — forcing a real tool call"
+                );
+                if !last_text.trim().is_empty() {
+                    on_event(AgentEvent {
+                        kind: AgentEventKind::DiscardDraft,
+                        content: None,
+                    });
+                }
+                // Make the retry visible: discarding the draft leaves the UI on
+                // "Generating…" with nothing new, so a burst of these looks like a hang.
+                on_event(AgentEvent {
+                    kind: AgentEventKind::Reflecting,
+                    content: Some(
+                        "The model reported a result without running anything — making it \
+                         actually run the commands and verify before answering…"
+                            .to_string(),
+                    ),
+                });
+                nudge_count += 1;
+                session.push_message(ToolMessage::system(
+                    "You reported an outcome (a server started/restarted/running, processes \
+                     killed, or a working URL/port) but you have NOT called a single tool this \
+                     run, so NONE of that actually happened — you invented it. Do the work for \
+                     real now: call run_command to perform the steps, then read_terminal to \
+                     confirm the actual output BEFORE reporting any result. Never claim a server \
+                     is running or a URL works unless a command's real output this turn proves it.",
+                ));
+                continue;
+            }
+
             // Auto-complete: the worker stopped calling tools, so it is implicitly claiming the
             // task is done. A strict, diff-aware reviewer independently checks the result against
             // the ORIGINAL task AND the real workspace changes. If genuinely complete the agent
@@ -841,6 +970,40 @@ async fn agent_loop(
                 // isn't an action task that did nothing). Otherwise fall through so the
                 // narration nudge below can push an action task that hasn't acted yet.
                 if done {
+                    // Don't end on a FABRICATION. If this is an action-mode run that
+                    // claims a command-only outcome (server running, URL live, processes
+                    // killed) yet never ran a single tool all run (total_tool_calls == 0),
+                    // nothing real happened — the nudge budget is simply spent. Replace the
+                    // invented success with an honest note rather than presenting fiction.
+                    if auto_complete
+                        && total_tool_calls == 0
+                        && claims_completed_action(response.content.as_deref().unwrap_or(""))
+                    {
+                        tracing::debug!(
+                            iterations,
+                            "reviewer accepted but zero tools ran on a claimed outcome — ending honestly"
+                        );
+                        let honest = "I couldn't actually perform this. I did not run any \
+                            commands this run, so — despite anything a draft reply may have \
+                            claimed — nothing was started, restarted, or changed on the running \
+                            system. Please try again. If it keeps happening, make sure the \
+                            project is opened at the directory where the code actually runs."
+                            .to_string();
+                        return finish_agent(
+                            session,
+                            Some(honest),
+                            memory,
+                            provider,
+                            iterations,
+                            on_event,
+                        )
+                        .await;
+                    }
+                    tracing::debug!(
+                        iterations,
+                        work_total,
+                        "completion reviewer accepted task as done — finishing run"
+                    );
                     return finish_agent(
                         session,
                         response.content,
@@ -857,7 +1020,6 @@ async fn agent_loop(
             // the file now") without emitting a tool call, so nothing actually happens. Nudge it to
             // run the tools. This counts CONSECUTIVE narrations (reset whenever it actually calls a
             // tool), so a long, productive run is never cut off just because it paused to narrate.
-            const MAX_NUDGES: u32 = 6;
             let described_only = !looks_like_user_question(content_txt)
                 && task_ctx.requires_tools
                 && nudge_count < MAX_NUDGES
@@ -883,6 +1045,13 @@ async fn agent_loop(
                 ));
                 continue;
             }
+            tracing::debug!(
+                iterations,
+                nudge_count,
+                auto_complete,
+                requires_tools = task_ctx.requires_tools,
+                "empty tool_calls and no nudge condition met — finishing run with model's reply"
+            );
             return finish_agent(session, response.content, memory, provider, iterations, on_event)
                 .await;
         }
@@ -903,6 +1072,7 @@ async fn agent_loop(
         // not the whole run. An identical repeat is NOT progress — counting it would
         // reset stall detection and let the agent redo the same work indefinitely.
         nudge_count = 0;
+        total_tool_calls += response.tool_calls.len();
         if !is_repeat {
             work_total += response
                 .tool_calls
@@ -1308,8 +1478,14 @@ async fn verify_task_complete(
     }
 }
 
-/// True when the thread already has a substantive assistant reply the user may be
-/// building on (exploration, findings, proposed fixes).
+/// Remove leading `system` messages injected by a prior turn's `inject_context`.
+/// Mid-conversation system notes (nudges, reflections) are left intact.
+fn strip_leading_system_prefix(messages: &mut Vec<ToolMessage>) {
+    while messages.first().is_some_and(|m| m.role == "system") {
+        messages.remove(0);
+    }
+}
+
 fn has_prior_assistant_turn(messages: &[ToolMessage]) -> bool {
     messages.iter().any(|m| {
         m.role == "assistant"
@@ -1317,15 +1493,8 @@ fn has_prior_assistant_turn(messages: &[ToolMessage]) -> bool {
     })
 }
 
-/// Continuation directives: the user wants the agent to ACT on prior findings, not
+/// Continuation directives: the user wants the agent to act on prior findings, not
 /// re-explore ("fix those issues", "apply your suggestions", "go ahead", …).
-///
-/// The signal that distinguishes a continuation from a brand-new task is **anaphora** —
-/// the message points back at the agent's prior work ("those", "them", "your fix",
-/// "what you suggested"). A bare action verb is NOT enough: "implement caching" and
-/// "update the README" are new tasks that happen to share a verb with a continuation,
-/// and must still get full exploration. We therefore require either an explicit
-/// back-referential phrase or an action verb PAIRED WITH a back-reference pronoun.
 fn is_continuation_request(text: &str, messages: &[ToolMessage]) -> bool {
     if !has_prior_assistant_turn(messages) {
         return false;
@@ -1334,131 +1503,56 @@ fn is_continuation_request(text: &str, messages: &[ToolMessage]) -> bool {
         return true;
     }
     let lower = text.trim().to_lowercase();
-
-    // Whole-message "just continue" directives (after stripping punctuation/spaces).
-    let normalized: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
-    const STANDALONE_GO: &[&str] = &[
-        "proceed",
-        "continue",
-        "goahead",
-        "goforit",
-        "shipit",
-        "doit",
-        "fixit",
-        "applyit",
-        "carryon",
-        "carryout",
-        "yesproceed",
-        "yescontinue",
-    ];
-    if STANDALONE_GO.iter().any(|w| normalized == *w) {
-        return true;
-    }
-
-    // Phrases that explicitly point back at the agent's prior work (anaphora). These
-    // are unambiguous continuations regardless of length.
-    const BACKREF_PHRASES: &[&str] = &[
+    const PHRASES: &[&str] = &[
         "fix it",
         "fix that",
         "fix those",
         "fix this",
         "fix them",
+        "apply",
+        "implement",
+        "go ahead",
         "do it",
         "do that",
         "do those",
         "make the change",
-        "make those change",
-        "make that change",
-        "apply it",
-        "apply that",
-        "apply those",
-        "apply them",
-        "apply your",
-        "apply the change",
-        "apply the fix",
-        "apply the suggestion",
-        "implement it",
-        "implement that",
-        "implement those",
-        "implement them",
-        "implement your",
-        "go ahead",
-        "go for it",
-        "ship it",
-        "proceed with",
-        "address those",
-        "address them",
-        "address the issue",
-        "address the issues",
-        "resolve those",
-        "resolve them",
+        "make those",
+        "make that",
         "yes fix",
         "yes please",
-        "yes do",
         "please fix",
         "please apply",
-        "please proceed",
+        "address those",
+        "address the",
+        "apply your",
+        "apply the",
+        "implement your",
+        "implement the",
+        "implement those",
+        "proceed",
+        "carry out",
+        "go for it",
         "those issues",
         "those fixes",
-        "those changes",
-        "those problems",
-        "the issue you",
-        "the issues you",
-        "the fix you",
-        "the fixes you",
-        "the changes you",
         "your suggestion",
         "your suggestions",
-        "your recommendation",
-        "your recommendations",
         "what you suggested",
         "what you found",
         "what you identified",
-        "what you recommended",
-        "what you proposed",
+        "the issues you",
+        "the fix you",
+        "the changes you",
+        "ship it",
     ];
-    if BACKREF_PHRASES.iter().any(|p| lower.contains(p)) {
+    if PHRASES.iter().any(|p| lower.contains(p)) {
         return true;
     }
-
-    // Short imperative that pairs an action verb with a back-reference ("apply them now",
-    // "patch it"). Both are required: a verb alone is a new task, an anaphor alone is not
-    // a directive. Verbs are matched on word boundaries so "do"/"make" don't hit
-    // "domain"/"makefile".
+    // Short directive after a long assistant reply (e.g. "fix them" / "apply now").
     if lower.len() <= 80 && lower.split_whitespace().count() <= 12 {
         const VERBS: &[&str] = &[
-            "fix",
-            "apply",
-            "implement",
-            "change",
-            "update",
-            "patch",
-            "ship",
-            "commit",
-            "do",
-            "make",
-            "address",
-            "resolve",
+            "fix", "apply", "implement", "change", "update", "patch", "ship", "commit",
         ];
-        const ANAPHORS: &[&str] = &[
-            " it",
-            " them",
-            " those",
-            " that",
-            " these",
-            " this",
-            " your ",
-            " the above",
-            " the issues",
-            " the fixes",
-            " the changes",
-            " the suggestions",
-        ];
-        let has_verb = lower
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|w| VERBS.contains(&w));
-        let has_anaphor = ANAPHORS.iter().any(|a| lower.contains(a));
-        if has_verb && has_anaphor {
+        if VERBS.iter().any(|v| lower.contains(v)) {
             return true;
         }
     }
@@ -1493,19 +1587,13 @@ fn is_substantive_user_message(text: &str) -> bool {
     !t.is_empty() && !is_short_follow_up(t)
 }
 
-/// Most recent substantive user request in the thread, skipping "ok"/"thanks"-style
-/// follow-ups AND any message equal to `exclude`. By the time we resolve task context
-/// the CURRENT turn is already in `messages`, so without excluding it a substantive
-/// continuation like "fix those issues" would resolve to itself instead of the real
-/// prior task it refers back to.
-fn last_substantive_user_task_excluding(messages: &[ToolMessage], exclude: &str) -> Option<String> {
-    let exclude = exclude.trim();
+/// Last substantive user request in the thread (skips "ok", "thanks", etc.).
+fn last_substantive_user_task(messages: &[ToolMessage]) -> Option<String> {
     messages
         .iter()
         .filter(|m| m.role == "user")
         .filter_map(|m| m.content.as_deref())
         .rev()
-        .filter(|t| t.trim() != exclude)
         .find(|t| is_substantive_user_message(t))
         .map(|s| s.to_string())
 }
@@ -1645,7 +1733,8 @@ fn resolve_task_context(session: &Session, current: &str) -> TaskContext {
     let is_continuation = is_continuation_request(current, &session.messages);
     let is_follow_up = is_short_follow_up(current) || is_continuation;
     let effective_task = if is_follow_up {
-        last_substantive_user_task_excluding(&session.messages, current)
+        last_substantive_user_task(&session.messages)
+            .filter(|t| t.trim() != current.trim())
             .unwrap_or_else(|| current.to_string())
     } else {
         current.to_string()
@@ -1772,6 +1861,86 @@ fn looks_like_user_question(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+/// True when the assistant's reply ends by announcing an imminent action it has
+/// not performed — a line ending in ':' (the usual preface to a command/code
+/// block) or a trailing "let me…" / "I'll…" style cue. Such a message is a
+/// dangling promise when it carries no tool call: the model said it would do
+/// something and then stopped. Used to nudge it to actually act. Kept
+/// conservative (only the tail of the text is inspected) so normal final
+/// summaries that merely mention "I'll" in passing don't trip it.
+fn ends_with_action_cue(text: &str) -> bool {
+    let t = text.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    if t.ends_with(':') {
+        return true;
+    }
+    // Inspect only the tail so a long, genuine summary isn't misread as a preface.
+    let tail: String = {
+        let chars: Vec<char> = t.chars().collect();
+        let start = chars.len().saturating_sub(160);
+        chars[start..].iter().collect::<String>().to_lowercase()
+    };
+    const CUES: &[&str] = &[
+        "let me ",
+        "let's ",
+        "now i'll",
+        "now i will",
+        "next, i'll",
+        "next i'll",
+        "i'll now",
+        "i will now",
+        "i'm going to ",
+        "i am going to ",
+        "going to run",
+        "let me run",
+        "let me restart",
+        "let me start",
+        "let me try",
+        "let me fix",
+        "let me update",
+        "let me add",
+        "let me check",
+        "let me kill",
+    ];
+    CUES.iter().any(|c| tail.contains(c))
+}
+
+/// True when the text asserts an outcome that could only result from RUNNING a
+/// command — a server started/running, processes killed, a live URL/port. Used
+/// together with a zero-tool-call check to detect a FABRICATED completion (the
+/// model reporting success it never actually performed). Deliberately keyed on
+/// runtime-state claims, not file edits (those are caught by the diff reviewer).
+fn claims_completed_action(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const CLAIMS: &[&str] = &[
+        "is running",
+        "now running",
+        "running cleanly",
+        "up and running",
+        "server started",
+        "server is",
+        "started the server",
+        "restarted",
+        "is live",
+        "now serving",
+        "serving on",
+        "listening on",
+        "killed all",
+        "processes killed",
+        "killed the",
+        "http://",
+        "https://",
+        "localhost:",
+        "127.0.0.1:",
+        "all done",
+        "successfully started",
+        "successfully restarted",
+    ];
+    CLAIMS.iter().any(|c| lower.contains(c))
 }
 
 fn emit_thinking_events(text: &str, on_event: &mut impl FnMut(AgentEvent)) {
@@ -2463,10 +2632,18 @@ async fn execute_tool_calls(
                     let terminal_gate = options
                         .and_then(|o| o.terminal_gate.as_ref())
                         .filter(|_| matches!(call.name.as_str(), "run_command" | "read_terminal"));
+                    let editor_gate = options.and_then(|o| o.editor_gate.as_ref()).filter(|_| {
+                        matches!(
+                            call.name.as_str(),
+                            "find_symbol" | "find_references" | "document_symbols"
+                        )
+                    });
                     if let Some(gate) = ask_gate {
                         delegate_ask(call, gate, on_event).await
                     } else if let Some(gate) = terminal_gate {
                         delegate_terminal(call, gate, on_event).await
+                    } else if let Some(gate) = editor_gate {
+                        delegate_editor(call, gate, tool.as_ref(), timeout_secs, on_event).await
                     } else {
                         let execution = tool.execute(call.arguments.clone());
                         match tokio::time::timeout(
@@ -2507,7 +2684,32 @@ async fn execute_tool_calls(
         }
 
         let mut result = result;
+        // Upgrade `patch_graph`'s ripgrep reference evidence to semantic LSP
+        // references when the editor is attached. No-op (keeps ripgrep) otherwise.
+        if call.name == "patch_graph" {
+            enrich_patch_graph_refs(&call.id, &mut result, options, on_event).await;
+        }
         if let Some(edit) = result.as_object_mut().and_then(|o| o.remove("_edit")) {
+            // Best-effort post-edit diagnostics: the editor's language servers when
+            // attached, else a headless tree-sitter parse check. Surfaced on the tool
+            // result so the model sees compile/syntax errors and self-corrects.
+            let path = edit
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let new_content = edit
+                .get("new_content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if let Some(diags) =
+                post_edit_diagnostics(&call.id, &path, new_content.as_deref(), options, on_event)
+                    .await
+            {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("diagnostics".to_string(), diags);
+                }
+            }
             on_event(AgentEvent {
                 kind: AgentEventKind::FileEdit,
                 content: Some(edit.to_string()),
@@ -2587,6 +2789,195 @@ async fn delegate_ask(
     }
 }
 
+/// Delegates a structural query (references/definition/symbols) to the editor's
+/// language servers. Falls back to the tool's own headless implementation
+/// (ripgrep / tree-sitter) if the editor is unresponsive or reports `unsupported`.
+async fn delegate_editor(
+    call: &ToolCall,
+    gate: &crate::tools::editor_gate::EditorGate,
+    tool: &dyn crate::tools::Tool,
+    timeout_secs: u64,
+    on_event: &mut impl FnMut(AgentEvent),
+) -> serde_json::Value {
+    let req_id = format!("{}_lsp", call.id);
+    on_event(AgentEvent {
+        kind: AgentEventKind::EditorRequest,
+        content: Some(
+            serde_json::json!({
+                "request_id": req_id,
+                "tool": call.name,
+                "arguments": call.arguments,
+            })
+            .to_string(),
+        ),
+    });
+    if let Some(raw) = gate.request(req_id).await {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            // The editor returns `{"unsupported": true}` to defer to the headless
+            // path (e.g. no language server for this file type).
+            if !v
+                .get("unsupported")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return v;
+            }
+        }
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        tool.execute(call.arguments.clone()),
+    )
+    .await
+    {
+        Ok(Ok(val)) => val,
+        Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+        Err(_) => {
+            serde_json::json!({ "error": format!("Tool execution timeout after {timeout_secs}s") })
+        }
+    }
+}
+
+/// Reference-resolution budget for `patch_graph` LSP enrichment, matching the
+/// tool's own ripgrep budget so the fan-out can't explode on a huge diff.
+const PATCH_GRAPH_LSP_BUDGET: usize = 40;
+/// Sample of reference sites kept per symbol after LSP enrichment.
+const PATCH_GRAPH_REF_SAMPLE: usize = 12;
+
+/// When the editor is attached, replace each changed symbol's ripgrep reference
+/// evidence in a `patch_graph` result with semantic LSP references. On
+/// unsupported/empty/timeout it leaves the ripgrep value in place, so this only
+/// ever upgrades precision.
+async fn enrich_patch_graph_refs(
+    call_id: &str,
+    result: &mut serde_json::Value,
+    options: Option<&AgentOptions>,
+    on_event: &mut impl FnMut(AgentEvent),
+) {
+    let Some(gate) = options.and_then(|o| o.editor_gate.as_ref()) else {
+        return;
+    };
+    let Some(files) = result.get_mut("files").and_then(|f| f.as_array_mut()) else {
+        return;
+    };
+
+    let mut resolved = 0usize;
+    for file in files.iter_mut() {
+        let Some(symbols) = file.get_mut("changed_symbols").and_then(|s| s.as_array_mut())
+        else {
+            continue;
+        };
+        for sym in symbols.iter_mut() {
+            if resolved >= PATCH_GRAPH_LSP_BUDGET {
+                return;
+            }
+            let Some(name) = sym.get("name").and_then(|n| n.as_str()).map(str::to_string)
+            else {
+                continue;
+            };
+            let req_id = format!("{call_id}_pgref_{resolved}");
+            resolved += 1;
+
+            on_event(AgentEvent {
+                kind: AgentEventKind::EditorRequest,
+                content: Some(
+                    serde_json::json!({
+                        "request_id": req_id,
+                        "tool": "find_references",
+                        "arguments": { "symbol": name },
+                    })
+                    .to_string(),
+                ),
+            });
+
+            let Some(raw) = gate.request(req_id).await else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if v.get("unsupported")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(refs) = v.get("references").and_then(|r| r.as_array()) {
+                let count = v
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(refs.len(), |c| c as usize);
+                let sample: Vec<serde_json::Value> =
+                    refs.iter().take(PATCH_GRAPH_REF_SAMPLE).cloned().collect();
+                if let Some(obj) = sym.as_object_mut() {
+                    obj.insert(
+                        "references".into(),
+                        serde_json::json!({
+                            "count": count,
+                            "truncated": count > sample.len(),
+                            "sample": sample,
+                            "source": "lsp",
+                        }),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort diagnostics for a file the agent just edited. Prefers the editor's
+/// language servers (via the editor gate); falls back to a tree-sitter parse check
+/// on the new content. Returns `None` when there is nothing worth reporting.
+async fn post_edit_diagnostics(
+    call_id: &str,
+    path: &str,
+    new_content: Option<&str>,
+    options: Option<&AgentOptions>,
+    on_event: &mut impl FnMut(AgentEvent),
+) -> Option<serde_json::Value> {
+    if path.is_empty() {
+        return None;
+    }
+
+    if let Some(gate) = options.and_then(|o| o.editor_gate.as_ref()) {
+        let req_id = format!("{call_id}_diag");
+        on_event(AgentEvent {
+            kind: AgentEventKind::EditorRequest,
+            content: Some(
+                serde_json::json!({
+                    "request_id": req_id,
+                    "tool": "diagnostics",
+                    "arguments": { "path": path },
+                })
+                .to_string(),
+            ),
+        });
+        if let Some(raw) = gate.request(req_id).await {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let diags = v.get("diagnostics").cloned().unwrap_or(v);
+                // Non-empty language-server diagnostics win. An empty/unsupported
+                // reply falls through to the tree-sitter backstop below (covers a
+                // language server that isn't loaded yet or an unopened file).
+                if diags.as_array().is_some_and(|a| !a.is_empty()) {
+                    return Some(diags);
+                }
+            }
+        }
+    }
+
+    // Headless fallback (also a backstop when the editor reported nothing): only
+    // when we have the new content in hand.
+    let content = new_content?;
+    let errors = crate::memory::chunker::syntax_errors(content, std::path::Path::new(path));
+    if errors.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!(errors
+        .iter()
+        .map(|(line, message)| serde_json::json!({ "line": line, "message": message }))
+        .collect::<Vec<_>>()))
+}
+
 async fn check_approval(
     tool: &dyn crate::tools::Tool,
     call: &ToolCall,
@@ -2628,62 +3019,6 @@ mod task_context_tests {
     use crate::models::ToolMessage;
 
     #[test]
-    fn continuation_detects_fix_those_issues() {
-        let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
-        session.push_message(ToolMessage::user(
-            "Login view should redirect when session expires",
-        ));
-        session.push_message(ToolMessage::assistant(
-            "I found the issue in notifications/views.py — My Work uses X-Up-Location but \
-             notification_row.html opens a modal. Fix: update notification_row.html to match \
-             tasks/views.py redirect pattern…",
-        ));
-        // Real call order: the current user message is already in the thread by the time
-        // agent_loop resolves task context. The test must mirror that or it gives false
-        // confidence about effective_task resolution.
-        session.push_message(ToolMessage::user("fix those issues"));
-        let ctx = resolve_task_context(&session, "fix those issues");
-        assert!(ctx.is_follow_up);
-        assert_eq!(
-            ctx.effective_task,
-            "Login view should redirect when session expires"
-        );
-
-        // Back-referential directives are continuations.
-        assert!(is_continuation_request(
-            "fix those issues",
-            &session.messages
-        ));
-        assert!(is_continuation_request(
-            "go ahead and apply your fix",
-            &session.messages
-        ));
-        assert!(is_continuation_request("apply them now", &session.messages));
-        assert!(is_continuation_request("proceed", &session.messages));
-
-        // New substantive tasks that merely share a verb must NOT be misread as
-        // continuations — they still need full exploration.
-        assert!(!is_continuation_request(
-            "implement a new caching layer",
-            &session.messages
-        ));
-        assert!(!is_continuation_request(
-            "update the README with install steps",
-            &session.messages
-        ));
-        assert!(!is_continuation_request(
-            "add rate limiting to the login endpoint",
-            &session.messages
-        ));
-
-        // No prior assistant turn → never a continuation.
-        assert!(!is_continuation_request(
-            "fix those issues",
-            &[ToolMessage::user("only message")]
-        ));
-    }
-
-    #[test]
     fn follow_up_resolves_effective_task() {
         let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
         session.push_message(ToolMessage::user("explain the repo"));
@@ -2695,9 +3030,106 @@ mod task_context_tests {
     }
 
     #[test]
+    fn continuation_phrase_is_follow_up_with_prior_task() {
+        let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        session.push_message(ToolMessage::user("analyze the pipeline"));
+        session.push_message(ToolMessage::assistant(
+            "Issues found: 1) dead code in text_fixes.py 2) no repo clone cache 3) single model for all stages — these are the main problems I identified after reading the codebase.",
+        ));
+        let ctx = resolve_task_context(&session, "fix those issues");
+        assert!(ctx.is_follow_up);
+        assert_eq!(ctx.effective_task, "analyze the pipeline");
+    }
+
+    #[test]
+    fn continuation_requires_prior_assistant_turn() {
+        assert!(!is_continuation_request("fix those issues", &[]));
+        let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        session.push_message(ToolMessage::user("analyze"));
+        session.push_message(ToolMessage::assistant("short"));
+        assert!(!is_continuation_request("fix those issues", &session.messages));
+    }
+
+    #[test]
+    fn continuation_detected_with_long_prior_reply() {
+        let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        session.push_message(ToolMessage::user("analyze"));
+        session.push_message(ToolMessage::assistant(
+            "Issues found: dead code, missing cache, model routing — full analysis with ten issues listed in detail for the user to review before implementing fixes.",
+        ));
+        assert!(is_continuation_request("fix those issues", &session.messages));
+        assert!(is_continuation_request("go ahead", &session.messages));
+        assert!(!is_continuation_request(
+            "analyze a completely different repository from scratch",
+            &session.messages
+        ));
+    }
+
+    #[test]
+    fn strip_leading_system_prefix_removes_only_head() {
+        let mut msgs = vec![
+            ToolMessage::system("rag context"),
+            ToolMessage::system("env note"),
+            ToolMessage::user("hello"),
+            ToolMessage::assistant("hi"),
+            ToolMessage::system("reflection nudge"),
+        ];
+        strip_leading_system_prefix(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[2].role, "system");
+    }
+
+    #[test]
+    fn continuation_phrase_detection() {
+        let mut session = Session::new("getaibd", "test", std::path::PathBuf::from("/tmp"));
+        session.push_message(ToolMessage::assistant("x".repeat(150)));
+        assert!(is_continuation_request("fix those issues", &session.messages));
+        assert!(is_continuation_request("please implement your suggestions", &session.messages));
+        assert!(!is_continuation_request(
+            "analyze the aria pipeline from scratch",
+            &session.messages
+        ));
+    }
+
+    #[test]
     fn action_task_requires_tools() {
         assert!(task_requires_tools("implement login"));
         assert!(!task_requires_tools("explain the repo"));
+    }
+
+    #[test]
+    fn action_cue_detects_dangling_promises() {
+        // The exact reported symptom: narration ending on a colon before an action.
+        assert!(ends_with_action_cue("Server killed. Let me restart:"));
+        assert!(ends_with_action_cue("The code is fixed. Let me restart the server."));
+        assert!(ends_with_action_cue("Now I'll edit the view to add todo_list."));
+        assert!(ends_with_action_cue("I'll now run the migration"));
+        // A clean final summary must NOT trip it, even if it mentions the word.
+        assert!(!ends_with_action_cue(
+            "Done. Fixed the missing todo_list view and verified the diff."
+        ));
+        assert!(!ends_with_action_cue(
+            "All set — the endpoint now returns the todo list correctly."
+        ));
+        assert!(!ends_with_action_cue(""));
+    }
+
+    #[test]
+    fn claims_completed_action_detects_fabricated_success() {
+        // The exact fabricated report from the repro.
+        assert!(claims_completed_action(
+            "All done. http://127.0.0.1:5000/ is running cleanly — no errors."
+        ));
+        assert!(claims_completed_action("Killed all server processes and restarted."));
+        assert!(claims_completed_action("The server is now serving on port 8000."));
+        // A plain analytical answer with no runtime-state claim must not trip it.
+        assert!(!claims_completed_action(
+            "The bug is a missing todo_list view in views.py."
+        ));
+        assert!(!claims_completed_action(
+            "I updated the template to loop over todos."
+        ));
     }
 
     #[test]

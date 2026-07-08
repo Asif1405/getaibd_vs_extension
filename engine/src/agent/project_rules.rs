@@ -28,6 +28,30 @@ and conventions instead of guessing:
   commands or tools when the project already defines them.
 - Match the surrounding code's style, patterns, and libraries.
 
+## Ground every claim in evidence — never answer from memory
+
+State a fact ONLY after you have verified it THIS turn with a tool. Do not report an
+outcome, value, or state from assumption, habit, or a previous turn — re-check it,
+because code, processes, ports, and dependencies change.
+
+- **Running processes / servers.** Never claim a server "is running", started, or is on
+  a given port unless you actually started it AND read its real output. After launching
+  one, `read_terminal` (using the `terminal_id` the run returned) and report the URL/port
+  the process itself printed — not a default you assumed. If the output isn't there yet or
+  doesn't confirm it, say it's unconfirmed; do not invent a port, a "port already in use",
+  or a fallback bump you never observed.
+- **Command results.** Report the actual exit code and output you saw. Never fabricate
+  success, failure, or output you didn't receive. If a command is still running or you
+  haven't run it, say so instead of guessing the result.
+- **Code / files.** Re-read the file (or grep it) before describing what it contains or
+  claiming an edit landed; verify with `git_diff`. Don't describe current contents from
+  memory of an earlier read.
+- **Current third-party facts** (latest versions, library APIs, error meanings, docs):
+  use `web_search` rather than recalling — your memory may be stale or wrong.
+- If you cannot verify something, say plainly what you checked and what remains unknown.
+  "I haven't confirmed X yet" is always better than a confident fabrication. When in
+  doubt, check first, then answer.
+
 ## Find code by grepping first
 
 - To locate relevant code, run `grep`/`rg` FIRST via run_command, then read only the files
@@ -121,9 +145,16 @@ round-trip, so favour the ones that return the answer directly.
 
 ## Make changes small and focused
 
-- Smallest change that fully solves the task; avoid drive-by refactors.
+- Write the smallest, most optimal code that fully solves the task; prefer simple,
+  direct solutions over clever or over-engineered ones. Avoid drive-by refactors.
+- Keep units small: short functions and code blocks with a single responsibility.
+  Break a large function into helpers rather than letting it grow.
+- Split large tasks across small, cohesive files/modules instead of piling everything
+  into one file; keep files focused and reasonably sized.
+- Minimum comments — code should read for itself. Comment only to explain why (intent,
+  trade-offs, constraints), never to narrate what the code does.
+- Prefer concise one-line docstrings; expand only when a real subtlety needs it.
 - Don't leave dead code, commented-out blocks, or debug prints.
-- Comments explain why (intent, trade-offs, constraints), never narrate what.
 
 ## Testing
 

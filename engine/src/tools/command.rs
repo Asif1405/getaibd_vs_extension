@@ -11,11 +11,11 @@ use crate::tools::Tool;
 
 use super::env_manager::EnvManager;
 
+/// Legacy config helper only. The command tool no longer enforces an allowlist:
+/// the *user* decides what may run via the approval prompt (dangerous programs are
+/// flagged and always re-prompt even when `run_command` is set to "always allow").
+/// Kept so existing `command_allowlist` config keys still deserialize.
 pub fn default_allowlist() -> HashSet<String> {
-    // Note: network/exfiltration tools (curl, wget, …) are intentionally NOT here and
-    // are additionally hard-blocked in `is_blocked_command` so a custom allowlist
-    // can't re-enable them. The command tool is approval-gated, not a sandbox — these
-    // restrictions are defense-in-depth on top of the human approval prompt.
     [
         "cargo", "rustc", "npm", "npx", "bun", "bunx", "node", "python", "python3", "pip", "git",
         "ls", "cat", "grep", "rg", "find", "wc", "head", "tail", "sort", "uniq", "echo", "mkdir",
@@ -25,48 +25,6 @@ pub fn default_allowlist() -> HashSet<String> {
     .into_iter()
     .map(String::from)
     .collect()
-}
-
-/// Commands that are always rejected even if an operator adds them to the allowlist:
-/// network/exfiltration utilities and arbitrary-shell launchers. A model under prompt
-/// injection could otherwise use these to exfiltrate the workspace or bypass the
-/// allowlist entirely (`sh -c '<anything>'`).
-fn is_blocked_command(base: &str) -> bool {
-    matches!(
-        base,
-        "curl"
-            | "wget"
-            | "nc"
-            | "ncat"
-            | "netcat"
-            | "telnet"
-            | "ssh"
-            | "scp"
-            | "sftp"
-            | "ftp"
-            | "rsync"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "dash"
-            | "ksh"
-            | "csh"
-            | "tcsh"
-            | "env"
-            | "xargs"
-            | "eval"
-    )
-}
-
-/// Interpreters that can run arbitrary inline code via an eval flag. For these we
-/// reject inline-code flags (below) so the allowlist isn't trivially bypassed:
-/// `python -c "..."` / `node -e "..."` is equivalent to "run anything".
-fn is_interpreter(base: &str) -> bool {
-    matches!(
-        base,
-        "python" | "python3" | "node" | "bun" | "deno" | "ruby" | "perl" | "php"
-    )
 }
 
 /// Read-only inspection commands that are safe to run without an approval prompt.
@@ -112,14 +70,6 @@ pub fn is_auto_approved(input: &Value) -> bool {
     }
 }
 
-/// Inline-eval flags that turn an interpreter into an arbitrary-code runner.
-fn is_inline_eval_flag(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-c" | "-e" | "--eval" | "-p" | "--print" | "-r" | "--exec"
-    )
-}
-
 /// Read-only shell commands that inspect file contents/paths.
 fn is_read_inspection_command(base: &str) -> bool {
     matches!(
@@ -149,19 +99,69 @@ fn command_targets_vendored_deps(program: &str, args: &[String]) -> bool {
         .any(|t| super::workspace::is_vendored_dependency_path(t))
 }
 
+/// Split a command line into argv-style tokens, honoring single/double quotes so
+/// paths/args containing spaces survive intact.
+///
+/// The `command` field of a tool call is *supposed* to hold just the program,
+/// with the `args` array carrying the rest — but many models (especially the
+/// free-tier default) pack the entire line into `command`
+/// (`"python3 manage.py migrate"`). Without splitting, `Command::new` would try
+/// to exec a binary literally named `"python3 manage.py migrate"` and fail with
+/// ENOENT ("spawn failed"), so the agent appears unable to run *any* command.
+fn split_command_line(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut has_token = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                has_token = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                has_token = true;
+            }
+            '\\' if in_double => {
+                if let Some(&n) = chars.peek() {
+                    if n == '"' || n == '\\' {
+                        cur.push(n);
+                        chars.next();
+                        continue;
+                    }
+                }
+                cur.push('\\');
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(cur);
+    }
+    tokens
+}
+
 pub struct RunCommand {
     root: Arc<PathBuf>,
-    allowlist: HashSet<String>,
     env_mgr: EnvManager,
 }
 
 impl RunCommand {
-    pub fn new(root: Arc<PathBuf>, allowlist: HashSet<String>, env_mgr: EnvManager) -> Self {
-        Self {
-            root,
-            allowlist,
-            env_mgr,
-        }
+    pub fn new(root: Arc<PathBuf>, env_mgr: EnvManager) -> Self {
+        Self { root, env_mgr }
     }
 }
 
@@ -175,11 +175,12 @@ impl Tool for RunCommand {
         "Execute a shell command. Read-only inspection commands (grep, rg, find, ls, cat, \
          head, tail, wc) run WITHOUT an approval prompt — use them freely to locate and read \
          code. Prefer dedicated git_* tools for git operations (git_status, git_add, \
-         git_commit, git_push, git_reset). Only allowlisted commands are permitted. \
-         Commands run in a persistent terminal pool: each result reports the `terminal_id` \
-         it ran in; long-running processes (dev servers/watchers) are left running in their \
-         own terminal and the agent is released to continue. Pass `terminal_id` to target a \
-         specific idle terminal, and use `read_terminal` to read earlier output."
+         git_commit, git_push, git_reset). Any command may be run; the user approves each one \
+         (destructive/network commands always require explicit approval). Commands run in a \
+         persistent terminal pool: each result reports the `terminal_id` it ran in; \
+         long-running processes (dev servers/watchers) are left running in their own terminal \
+         and the agent is released to continue. Pass `terminal_id` to target a specific idle \
+         terminal, and use `read_terminal` to read earlier output."
     }
 
     fn input_schema(&self) -> Value {
@@ -209,48 +210,24 @@ impl Tool for RunCommand {
             .as_str()
             .ok_or_else(|| AppError::InvalidRequest("command is required".into()))?;
 
-        let base = program
-            .split('/')
-            .next_back()
-            .unwrap_or(program)
-            .split_whitespace()
-            .next()
-            .unwrap_or(program);
+        // Parse `command` into argv tokens: it may be just the program or a full
+        // command line (see `split_command_line`). The first token is the binary;
+        // any remaining tokens are leading arguments.
+        let cmd_tokens = split_command_line(program);
+        let binary = cmd_tokens
+            .first()
+            .cloned()
+            .ok_or_else(|| AppError::InvalidRequest("command is empty".into()))?;
 
-        if is_blocked_command(base) {
-            return Err(AppError::InvalidRequest(format!(
-                "Command '{base}' is blocked for security (network/exfiltration or shell \
-                 launcher). Use a dedicated tool, or write a script file and run it with an \
-                 allowed interpreter."
-            )));
+        // No allowlist/blocklist: the user (not a static list) decides what may run via
+        // the approval prompt. Only genuine safety rails remain — the vendored-dependency
+        // read guard here and the `cwd` containment check below.
+        let mut args: Vec<String> = cmd_tokens[1..].to_vec();
+        if let Some(arr) = input["args"].as_array() {
+            args.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
         }
 
-        if !self.allowlist.contains(base) {
-            return Err(AppError::InvalidRequest(format!(
-                "Command not allowed: {base}"
-            )));
-        }
-
-        let args: Vec<String> = input["args"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Defense-in-depth: an allowlisted interpreter must not be used to eval
-        // arbitrary inline code (that would make the allowlist meaningless). The model
-        // can still run interpreters on real script files.
-        if is_interpreter(base) && args.iter().any(|a| is_inline_eval_flag(a)) {
-            return Err(AppError::InvalidRequest(format!(
-                "Inline code execution (e.g. -c/-e/--eval) is disabled for '{base}'. Write the \
-                 code to a file and run that file instead."
-            )));
-        }
-
-        if command_targets_vendored_deps(program, &args) {
+        if command_targets_vendored_deps(&binary, &args) {
             return Err(AppError::InvalidRequest(
                 "Cannot grep/cat/read inside vendored dependency trees (.venv, node_modules, \
                  site-packages). Search project source with search_files/semantic_search, or use \
@@ -276,7 +253,7 @@ impl Tool for RunCommand {
                 .clamp(1, MAX_TIMEOUT_SECS),
         );
 
-        let mut cmd = Command::new(program);
+        let mut cmd = Command::new(&binary);
         cmd.args(&args)
             .current_dir(&work_dir)
             // Detach stdin so a command that reads input (a bare REPL, an interactive
@@ -328,7 +305,7 @@ mod tests {
 
     fn tool() -> RunCommand {
         let root = Arc::new(std::env::temp_dir());
-        RunCommand::new(root.clone(), default_allowlist(), EnvManager::new(root))
+        RunCommand::new(root.clone(), EnvManager::new(root))
     }
 
     // A command that reads stdin (cat with no args) must NOT hang: stdin is detached,
@@ -364,36 +341,16 @@ mod tests {
         assert_eq!(out["exit_code"], -1);
     }
 
-    // C-1: network/exfiltration and shell-launcher commands are blocked even though a
-    // user could try to add them to a custom allowlist.
+    // A full command line packed into `command` (as the free-tier model often does)
+    // is split into program + args instead of failing with ENOENT.
     #[tokio::test]
-    async fn blocks_network_and_shell_commands() {
-        for cmd in ["curl", "wget", "sh", "bash", "nc", "ssh"] {
-            let mut list = default_allowlist();
-            list.insert(cmd.to_string()); // even if explicitly allowed…
-            let root = Arc::new(std::env::temp_dir());
-            let tool = RunCommand::new(root.clone(), list, EnvManager::new(root));
-            let err = tool
-                .execute(json!({ "command": cmd, "args": ["http://evil/"] }))
-                .await
-                .expect_err("network/shell command must be blocked");
-            assert!(format!("{err:?}").contains("blocked"), "{cmd} not blocked");
-        }
-    }
-
-    // C-1: an allowlisted interpreter cannot be used to eval arbitrary inline code.
-    #[tokio::test]
-    async fn blocks_interpreter_inline_eval() {
-        for (cmd, flag) in [("python3", "-c"), ("node", "-e"), ("node", "-p")] {
-            let err = tool()
-                .execute(json!({ "command": cmd, "args": [flag, "print(1)"] }))
-                .await
-                .expect_err("inline eval must be rejected");
-            assert!(
-                format!("{err:?}").contains("Inline code execution"),
-                "{cmd} {flag} not rejected"
-            );
-        }
+    async fn splits_full_command_line() {
+        let out = tool()
+            .execute(json!({ "command": "echo hello world", "timeout_secs": 5 }))
+            .await
+            .expect("echo should run");
+        assert_eq!(out["exit_code"], 0);
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "hello world");
     }
 
     // C-2: a cwd that escapes the project root (absolute path or ../) is rejected

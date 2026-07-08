@@ -1,8 +1,7 @@
-use mcp_universal::tools::command::{default_allowlist, RunCommand};
+use mcp_universal::tools::command::RunCommand;
 use mcp_universal::tools::env_manager::EnvManager;
 use mcp_universal::tools::Tool;
 use serde_json::json;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -10,19 +9,9 @@ fn allowed_tool() -> (RunCommand, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let root = Arc::new(temp_dir.path().to_path_buf());
     let env_mgr = EnvManager::new(root.clone());
-    let tool = RunCommand::new(root, default_allowlist(), env_mgr);
+    let tool = RunCommand::new(root, env_mgr);
     (tool, temp_dir)
 }
-
-fn disallowed_tool() -> (RunCommand, TempDir) {
-    let temp_dir = TempDir::new().unwrap();
-    let root = Arc::new(temp_dir.path().to_path_buf());
-    let allowlist: HashSet<String> = ["ls", "cat"].into_iter().map(String::from).collect();
-    let env_mgr = EnvManager::new(root.clone());
-    let tool = RunCommand::new(root, allowlist, env_mgr);
-    (tool, temp_dir)
-}
-
 
 #[tokio::test]
 async fn allowed_command_executes_successfully() {
@@ -41,18 +30,18 @@ async fn allowed_command_executes_successfully() {
 }
 
 #[tokio::test]
-async fn disallowed_command_returns_error() {
-    let (tool, _temp) = disallowed_tool();
+async fn full_command_line_is_split() {
+    let (tool, _temp) = allowed_tool();
 
+    // The whole line packed into `command` (no `args`) is split, not treated as one
+    // binary name — otherwise the free-tier model can't run anything.
     let result = tool
-        .execute(json!({
-            "command": "echo",
-            "args": ["hello"]
-        }))
-        .await;
+        .execute(json!({ "command": "echo hello there" }))
+        .await
+        .unwrap();
 
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("not allowed"));
+    assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello there");
+    assert_eq!(result["exit_code"], 0);
 }
 
 #[tokio::test]
@@ -74,8 +63,7 @@ async fn command_with_args_works() {
 async fn command_captures_stdout_and_stderr() {
     let (tool, _temp) = allowed_tool();
 
-    // stdout via an allowed command. (Shell launchers like `sh -c` are hard-blocked, so
-    // we drive stdout/stderr with allowlisted binaries instead.)
+    // stdout / stderr driven with simple binaries.
     let out = tool
         .execute(json!({ "command": "echo", "args": ["out"] }))
         .await
