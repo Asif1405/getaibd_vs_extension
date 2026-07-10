@@ -5,15 +5,20 @@ pub mod command;
 pub mod editor_gate;
 pub mod edits;
 pub mod env_manager;
+pub mod explore;
 pub mod git;
 pub mod lsp;
 pub mod mcp_proxy;
 pub mod patch_graph;
 pub mod plan;
+pub mod search_code;
 pub mod semantic;
 pub mod skill;
+pub mod worktree;
 pub mod terminal;
 pub mod terminal_gate;
+pub mod tmpfile;
+pub mod web_fetch;
 pub mod web_search;
 pub mod workspace;
 
@@ -102,9 +107,53 @@ impl ToolRegistry {
                 state.memory_top_k,
             )));
         }
+        // Unified search router — grep always works; the semantic path lights up
+        // only when memory/embeddings are configured.
+        let memory = Self::memory_handles(state);
+        self.register(Arc::new(search_code::SearchCode::new(
+            Arc::new(state.project_root.clone()),
+            memory,
+            state.memory_top_k,
+        )));
         if let (Some(key), Some(base)) = (&state.getaibd_api_key, &state.getaibd_base_url) {
             self.register(Arc::new(web_search::WebSearch::new(base.clone(), key.clone())));
         }
+    }
+
+    /// Owned `(store, embedder)` handles when memory is configured, for tools that
+    /// need their own copies (search router, explore subagent).
+    fn memory_handles(
+        state: &crate::state::AppState,
+    ) -> Option<(
+        crate::memory::MemoryStore,
+        Arc<dyn crate::memory::EmbeddingProvider>,
+    )> {
+        match (&state.memory_store, &state.embedder) {
+            (Some(s), Some(e)) => Some((s.clone(), e.clone())),
+            _ => None,
+        }
+    }
+
+    /// Register the `explore` subagent tool. It runs a bounded, read-only sub-run
+    /// against its own filtered registry (no mutations, no MCP, no `explore` itself,
+    /// so it can never recurse). Requires the request's provider + model.
+    pub fn register_explore_tool(
+        &mut self,
+        state: &crate::state::AppState,
+        provider: Arc<dyn crate::providers::Provider>,
+        model: String,
+    ) {
+        let mut sub = Self::build_default(&state.project_root);
+        sub.register_session_state_tools(state);
+        let sub = sub.filter(|name| explore::EXPLORE_TOOLS.contains(&name));
+        self.register(Arc::new(explore::ExploreCodebase::new(
+            provider,
+            model,
+            state.project_root.clone(),
+            Arc::new(sub),
+            Self::memory_handles(state),
+            14,
+        )));
     }
 
     /// Agent session registry: built-ins + optional MCP servers from `.getaibd/mcp.json`.
@@ -139,6 +188,17 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitStatus::new(root.clone())));
         registry.register(Arc::new(git::GitDiff::new(root.clone(), edits.clone())));
         registry.register(Arc::new(git::GitLog::new(root.clone())));
+        registry.register(Arc::new(git::GitShow::new(root.clone())));
+        registry.register(Arc::new(git::GitBlame::new(root.clone())));
+        registry.register(Arc::new(git::GitBranch::new(root.clone())));
+        registry.register(Arc::new(git::GitAdd::new(root.clone())));
+        registry.register(Arc::new(git::GitCommit::new(root.clone())));
+        registry.register(Arc::new(git::GitReset::new(root.clone())));
+        registry.register(Arc::new(git::GitCheckout::new(root.clone())));
+        registry.register(Arc::new(git::GitPush::new(root.clone())));
+        registry.register(Arc::new(git::GitPrList::new(root.clone())));
+        registry.register(Arc::new(git::GitPrCreate::new(root.clone())));
+        registry.register(Arc::new(git::GitPrCheckout::new(root.clone())));
         registry.register(Arc::new(command::RunCommand::new(
             root.clone(),
             env_mgr.clone(),
@@ -147,12 +207,17 @@ impl ToolRegistry {
         registry.register(Arc::new(ask::AskQuestion::new()));
         registry.register(Arc::new(plan::UpdatePlan::new()));
         registry.register(Arc::new(plan::WritePlan::new()));
+        registry.register(Arc::new(plan::AttemptCompletion::new()));
         registry.register(Arc::new(skill::FetchSkill::new(root.clone())));
         registry.register(Arc::new(terminal::ReadTerminal::new()));
         registry.register(Arc::new(lsp::FindSymbol::new(root.clone())));
         registry.register(Arc::new(lsp::FindReferences::new(root.clone())));
         registry.register(Arc::new(lsp::DocumentSymbols::new(root.clone())));
         registry.register(Arc::new(patch_graph::PatchGraph::new(root.clone())));
+        registry.register(Arc::new(worktree::WorktreeList::new(root.clone())));
+        registry.register(Arc::new(worktree::WorktreeCreate::new(root.clone())));
+        registry.register(Arc::new(worktree::WorktreeRemove::new(root.clone())));
+        registry.register(Arc::new(web_fetch::WebFetch::new(root.clone())));
     }
 }
 

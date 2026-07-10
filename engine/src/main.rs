@@ -80,6 +80,7 @@ async fn main() {
 
     let _watcher = start_file_watcher(&state);
     let index_state = state.clone();
+    let state_for_cleanup = state.clone();
 
     if let Some(ref url) = state.public_url {
         tracing::info!("Public URL set to {url} — SSE clients should connect here");
@@ -127,6 +128,7 @@ async fn main() {
         .route("/tasks/:id/cancel", post(routes::tasks::cancel_task))
         .route("/config", get(routes::config::get_config))
         .route("/config", put(routes::config::put_config))
+        .route("/index/status", get(routes::health::index_status))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routes::auth::require_auth,
@@ -154,6 +156,8 @@ async fn main() {
     tokio::spawn(async move {
         run_startup_indexing(index_state.as_ref()).await;
     });
+
+    spawn_temp_cleanup(state_for_cleanup);
 
     axum::serve(listener, app).await.unwrap();
 }
@@ -189,6 +193,25 @@ fn spawn_parent_watchdog() {
 #[cfg(not(unix))]
 fn spawn_parent_watchdog() {}
 
+/// Periodically sweep away stale agent scratch files so a long-lived session
+/// doesn't slowly fill the disk: `.getaibd/tmp/` spill files (diffs, fetched
+/// pages) and detached background-command logs in the OS temp dir. Runs once at
+/// startup, then hourly. Files older than 24h are removed.
+fn spawn_temp_cleanup(state: Arc<AppState>) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    tokio::spawn(async move {
+        loop {
+            let tmp = mcp_universal::tools::tmpfile::cleanup_stale(&state.project_root, MAX_AGE).await;
+            let logs = mcp_universal::tools::command::cleanup_stale_bg_logs(MAX_AGE).await;
+            if tmp > 0 || logs > 0 {
+                tracing::debug!("Temp cleanup: removed {tmp} spill file(s), {logs} bg log(s)");
+            }
+            tokio::time::sleep(INTERVAL).await;
+        }
+    });
+}
+
 async fn run_startup_indexing(state: &AppState) {
     let Some(ref store) = state.memory_store else {
         return;
@@ -196,6 +219,23 @@ async fn run_startup_indexing(state: &AppState) {
     let Some(ref embedder) = state.embedder else {
         return;
     };
+
+    // Never index onto a nearly-full disk: writing the embeddings DB there can
+    // push the machine into swap-thrash and freeze the editor. The watcher
+    // backfills once space is freed.
+    let disk_probe = state
+        .memory_db_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .unwrap_or(state.project_root.as_path());
+    if mcp_universal::disk::is_low(disk_probe) {
+        tracing::warn!(
+            "Skipping startup indexing: low disk space on the volume holding the memory DB"
+        );
+        return;
+    }
+
+    state.index_status.begin();
 
     match mcp_universal::memory::summarizer::summarize_and_index(
         &state.project_root,
@@ -223,6 +263,7 @@ async fn run_startup_indexing(state: &AppState) {
     // `memory_max_index_files` so the first pass on a large repo can't run away on
     // (billed) embedding cost; the watcher backfills the remainder as files change.
     let Some(ref db_path) = state.memory_db_path else {
+        state.index_status.abort();
         return;
     };
     let merkle_path = db_path.with_extension("merkle.db");
@@ -237,23 +278,57 @@ async fn run_startup_indexing(state: &AppState) {
             )
             .await
             {
-                Ok(r) => tracing::info!(
-                    "Full index: {} embedded, {} unchanged, {} removed (cap {})",
-                    r.indexed,
-                    r.unchanged,
-                    r.removed,
-                    state.memory_max_index_files
-                ),
-                Err(e) => tracing::warn!("Full index failed: {e}"),
+                Ok(r) => {
+                    tracing::info!(
+                        "Full index: {} embedded, {} unchanged, {} removed (cap {})",
+                        r.indexed,
+                        r.unchanged,
+                        r.removed,
+                        state.memory_max_index_files
+                    );
+                    state.index_status.finish(r.indexed, r.unchanged, r.removed);
+                    // Enforce the entry cap right after indexing. Previously prune only
+                    // ran after an agent turn's reflection, so the DB could balloon far
+                    // past `memory_max_entries` on startup / via the watcher.
+                    let keep = state.memory_max_entries;
+                    let store = store.clone();
+                    match tokio::task::spawn_blocking(move || store.prune_oldest(keep)).await {
+                        Ok(Ok(pruned)) if pruned > 0 => {
+                            tracing::info!("Pruned {pruned} memory entries over cap ({keep})");
+                        }
+                        Ok(Err(e)) => tracing::warn!("Memory prune failed: {e}"),
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Full index failed: {e}");
+                    state.index_status.abort();
+                }
             }
         }
-        Err(e) => tracing::warn!("Merkle index open failed: {e}"),
+        Err(e) => {
+            tracing::warn!("Merkle index open failed: {e}");
+            state.index_status.abort();
+        }
     }
 }
 
 fn start_file_watcher(state: &AppState) -> Option<notify::RecommendedWatcher> {
     let store = state.memory_store.clone()?;
     let embedder = state.embedder.clone()?;
+    // Keep the merkle hashes in sync on live edits so restarts don't needlessly
+    // re-embed files the watcher already indexed.
+    let merkle_path = state
+        .memory_db_path
+        .as_ref()
+        .map(|p| p.with_extension("merkle.db"));
 
-    mcp_universal::memory::watcher::spawn_watcher(&state.project_root, store, embedder)
+    mcp_universal::memory::watcher::spawn_watcher(
+        &state.project_root,
+        store,
+        embedder,
+        merkle_path,
+        state.index_status.clone(),
+        state.memory_max_entries,
+    )
 }

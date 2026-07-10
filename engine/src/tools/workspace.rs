@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::AppError;
@@ -19,50 +19,61 @@ fn edit_payload(path: &str, old_content: &str, new_content: &str) -> Value {
     })
 }
 
+/// Resolve a user/agent-supplied path.
+///
+/// This is a local, user-invoked CLI (gated by the folder-trust prompt and the
+/// same shell the user already controls via `run_command`), so paths are *not*
+/// jailed to the project root: absolute paths and `~` are honored as-is, and
+/// relative paths resolve against the project root as a convenient default.
 pub(crate) fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
-    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let candidate = if Path::new(relative).is_absolute() {
-        PathBuf::from(relative)
+    // Tilde expansion so "~/Desktop/foo" works like it does in a shell.
+    let expanded: PathBuf = if relative == "~" {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(relative))
+    } else if let Some(rest) = relative.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => PathBuf::from(relative),
+        }
     } else {
-        root_canonical.join(relative)
+        PathBuf::from(relative)
     };
-    if let Ok(p) = candidate.canonicalize() {
-        if !p.starts_with(&root_canonical) {
-            return Err(AppError::InvalidRequest(format!(
-                "Path escapes project root: {relative}"
-            )));
-        }
-        return Ok(candidate);
+
+    if expanded.is_absolute() {
+        return Ok(expanded);
     }
-    let mut p = root_canonical.clone();
-    for comp in Path::new(relative).components() {
-        match comp {
-            Component::Prefix(_) | Component::RootDir => {
-                return Err(AppError::InvalidRequest(format!(
-                    "Path escapes project root: {relative}"
-                )));
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !p.pop() {
-                    return Err(AppError::InvalidRequest(format!(
-                        "Path escapes project root: {relative}"
-                    )));
-                }
-            }
-            Component::Normal(c) => p.push(c),
-        }
-    }
-    if !p.starts_with(&root_canonical) {
-        return Err(AppError::InvalidRequest(format!(
-            "Path escapes project root: {relative}"
-        )));
-    }
-    Ok(candidate)
+
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    Ok(root_canonical.join(expanded))
 }
 
-/// True when `path` points inside a vendored dependency tree the agent must not read
-/// (`.venv`, `node_modules`, `site-packages`, …). Project source lives outside these.
+/// Working directory for `run_command` — must stay inside the project root even
+/// though file tools allow absolute paths elsewhere on disk.
+pub(crate) fn resolve_command_cwd(root: &Path, cwd: &str) -> Result<PathBuf, AppError> {
+    if cwd.contains("..") {
+        return Err(AppError::InvalidRequest(format!(
+            "cwd '{cwd}' escapes project root"
+        )));
+    }
+    let resolved = if Path::new(cwd).is_absolute() {
+        PathBuf::from(cwd)
+    } else {
+        let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        root_canonical.join(cwd)
+    };
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let resolved_canonical = resolved.canonicalize().unwrap_or(resolved);
+    if !resolved_canonical.starts_with(&root_canonical) {
+        return Err(AppError::InvalidRequest(format!(
+            "cwd '{cwd}' escapes project root"
+        )));
+    }
+    Ok(resolved_canonical)
+}
+
+/// Dependency / build directories the agent must not read or list — use `web_search`
+/// for third-party library docs instead of digging through vendored source.
 pub fn is_vendored_dependency_path(path: &str) -> bool {
     let p = path.replace('\\', "/").to_lowercase();
     const SEGMENTS: &[&str] = &[
@@ -74,6 +85,7 @@ pub fn is_vendored_dependency_path(path: &str) -> bool {
         "/.tox/",
         "/__pycache__/",
         "/dist-packages/",
+        "/target/",
     ];
     if SEGMENTS.iter().any(|s| p.contains(s)) {
         return true;
@@ -81,9 +93,26 @@ pub fn is_vendored_dependency_path(path: &str) -> bool {
     p.starts_with(".venv/")
         || p.starts_with("venv/")
         || p.starts_with("node_modules/")
+        || p.starts_with("target/")
         || p == ".venv"
         || p == "venv"
         || p == "node_modules"
+        || p == "target"
+}
+
+pub(crate) fn is_vendored_path(path: &Path) -> bool {
+    is_vendored_dependency_path(&path.to_string_lossy())
+}
+
+pub(crate) fn reject_vendored_path(path: &Path, rel: &str) -> Result<(), AppError> {
+    if is_vendored_dependency_path(rel) || is_vendored_path(path) {
+        return Err(AppError::InvalidRequest(format!(
+            "{rel} is inside a vendored dependency tree (.venv/node_modules/site-packages). \
+             Read project source instead — use search_files/semantic_search on the repo, or \
+             web_search for third-party library docs."
+        )));
+    }
+    Ok(())
 }
 
 pub struct ReadFile {
@@ -130,6 +159,7 @@ impl Tool for ReadFile {
             )));
         }
         let path = resolve_path(&self.root, rel)?;
+        reject_vendored_path(&path, rel)?;
         match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.is_dir() => {
                 let hint = immediate_entries_hint(&path).await;
@@ -229,6 +259,7 @@ impl Tool for WriteFile {
         };
 
         let path = resolve_path(&self.root, rel)?;
+        reject_vendored_path(&path, rel)?;
 
         if create_dirs {
             if let Some(parent) = path.parent() {
@@ -303,6 +334,7 @@ impl Tool for PatchFile {
             .ok_or_else(|| AppError::InvalidRequest("new_text is required".into()))?;
 
         let path = resolve_path(&self.root, rel)?;
+        reject_vendored_path(&path, rel)?;
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| AppError::InvalidRequest(format!("Cannot read {rel}: {e}")))?;
@@ -360,6 +392,7 @@ impl Tool for ListDirectory {
         let rel = input["path"].as_str().unwrap_or(".");
         let recursive = input["recursive"].as_bool().unwrap_or(false);
         let path = resolve_path(&self.root, rel)?;
+        reject_vendored_path(&path, rel)?;
         match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.is_file() => {
                 return Err(AppError::InvalidRequest(format!(
@@ -465,11 +498,13 @@ impl Tool for SearchFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Secondary code-search fallback: search file contents for a pattern (plain text or \
-         regex), returning matching file paths with line numbers. Prefer `grep`/`rg` via \
-         run_command to locate code; use this only when a shell grep isn't available or \
-         convenient. Search the task's key terms plus close synonyms via regex alternation \
-         (e.g. `login|signin|authenticate`), then read only the files that match."
+        "Fast, instant grep over the workspace — your DEFAULT way to locate code by an exact \
+         string, symbol, or regex. Runs in-process (ripgrep) and returns matching file paths \
+         with line numbers, so it is faster and cleaner than shelling out to `grep`/`rg` via \
+         run_command (don't do that for code search). Supports full regex and word boundaries: \
+         search the task's key terms plus close synonyms via alternation (e.g. \
+         `login|signin|authenticate`, `\\bPaymentService\\b`), then read only the files that \
+         match. For a meaning-based question use semantic_search / search_code instead."
     }
 
     fn input_schema(&self) -> Value {
@@ -493,6 +528,7 @@ impl Tool for SearchFiles {
         let max = usize::try_from(input["max_results"].as_u64().unwrap_or(50)).unwrap_or(50);
 
         let dir = resolve_path(&self.root, search_path)?;
+        reject_vendored_path(&dir, search_path)?;
         let mut results = Vec::new();
         search_recursive(&dir, &dir, pattern, max, &mut results).await?;
 
@@ -545,6 +581,8 @@ impl Tool for MoveFile {
 
         let from = resolve_path(&self.root, from_rel)?;
         let to = resolve_path(&self.root, to_rel)?;
+        reject_vendored_path(&from, from_rel)?;
+        reject_vendored_path(&to, to_rel)?;
 
         if !from.exists() {
             return Err(AppError::InvalidRequest(format!("Source not found: {from_rel}")));
@@ -603,6 +641,7 @@ impl Tool for DeleteFile {
             .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
         let recursive = input["recursive"].as_bool().unwrap_or(false);
         let path = resolve_path(&self.root, rel)?;
+        reject_vendored_path(&path, rel)?;
 
         if !path.exists() {
             return Err(AppError::InvalidRequest(format!("Not found: {rel}")));
@@ -660,6 +699,9 @@ async fn search_recursive(
             {
                 continue;
             }
+            if is_vendored_dependency_path(&path.to_string_lossy()) {
+                continue;
+            }
             Box::pin(search_recursive(base, &path, pattern, max, out)).await?;
         } else if meta.as_ref().is_some_and(std::fs::Metadata::is_file) {
             if let Ok(content) = tokio::fs::read_to_string(&path).await {
@@ -687,4 +729,17 @@ async fn search_recursive(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod vendored_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_venv_and_node_modules() {
+        assert!(is_vendored_dependency_path("project/.venv/lib/python3.12/site.py"));
+        assert!(is_vendored_dependency_path("node_modules/lodash/index.js"));
+        assert!(is_vendored_dependency_path("target/debug/getaibd"));
+        assert!(!is_vendored_dependency_path("src/main.rs"));
+    }
 }

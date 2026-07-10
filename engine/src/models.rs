@@ -56,6 +56,10 @@ pub struct ModelInfo {
     /// and search it by its friendly label without hardcoding its engine id.
     #[serde(default)]
     pub free: bool,
+    /// True when the caller's plan cannot use this model yet (shown locked in the
+    /// picker). Free-tier callers see paid models flagged this way.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

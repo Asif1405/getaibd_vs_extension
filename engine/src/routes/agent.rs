@@ -98,11 +98,16 @@ pub async fn agent_handler(
     let sid = session_id.clone();
 
     let sid_for_task = session_id.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        // Guarantees gates are cleared on any exit path (return, panic, or abort
+        // when the client disconnects), so orphaned session entries can't leak.
+        let _cleanup = crate::routes::util::GateCleanup::new(state.clone(), sid);
         let mut registry = crate::tools::ToolRegistry::build_for_session(&project_root).await;
         // Expose state-backed session tools (semantic codebase search, web search). Each
         // self-gates on the state it needs being configured.
         registry.register_session_state_tools(&state);
+        // The explore subagent reuses this request's provider/model for its sub-run.
+        registry.register_explore_tool(&state, provider.clone(), req.model.clone());
         run_agent_task(
             &state,
             req,
@@ -116,11 +121,10 @@ pub async fn agent_handler(
             tx,
         )
         .await;
-        state.clear_approval_gate(&sid);
-        state.clear_ask_gate(&sid);
     });
 
-    let stream = UnboundedReceiverStream::new(rx);
+    // Abort the run if the client disconnects (drops the SSE stream).
+    let stream = crate::routes::util::GuardedStream::new(UnboundedReceiverStream::new(rx), handle);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -187,6 +191,7 @@ async fn run_agent_task(
         } else {
             Some(0.1)
         },
+        max_llm_calls: None,
     };
 
     let approval_session = session_id_for_events.clone();

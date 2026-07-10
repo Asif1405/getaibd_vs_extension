@@ -14,6 +14,39 @@ pub struct AppConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub context: crate::context::ContextConfig,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+}
+
+/// Multi-agent pipeline (analyzer -> explorer -> planner -> worker -> validator).
+/// Auto-gated: the analyzer routes trivial tasks to the plain single loop.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Max validator -> worker fix cycles before the run finishes and reports.
+    #[serde(default = "default_pipeline_max_fix_cycles")]
+    pub max_fix_cycles: u32,
+    /// Iteration cap for the read-only explorer sub-run.
+    #[serde(default = "default_pipeline_explorer_max_iters")]
+    pub explorer_max_iters: u32,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_fix_cycles: default_pipeline_max_fix_cycles(),
+            explorer_max_iters: default_pipeline_explorer_max_iters(),
+        }
+    }
+}
+
+fn default_pipeline_max_fix_cycles() -> u32 {
+    2
+}
+fn default_pipeline_explorer_max_iters() -> u32 {
+    14
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,7 +91,7 @@ impl Default for MemoryConfig {
 }
 
 fn default_memory_db_path() -> String {
-    ".mcp-memory.db".to_string()
+    "memory.db".to_string()
 }
 fn default_memory_top_k() -> usize {
     5
@@ -228,6 +261,7 @@ impl AppConfig {
             agent: AgentConfig::default(),
             memory: MemoryConfig::default(),
             context: crate::context::ContextConfig::default(),
+            pipeline: PipelineConfig::default(),
         }
     }
 

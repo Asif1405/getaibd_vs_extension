@@ -90,6 +90,8 @@ pub async fn orchestrated_agent_handler(
     // Expose state-backed session tools (semantic codebase search, web search) on the
     // orchestrated path too, so chat-driven agent runs can search the web.
     registry.register_session_state_tools(&state);
+    // The explore subagent reuses this request's provider/model for its sub-run.
+    registry.register_explore_tool(&state, provider.clone(), req.model.clone());
 
     // Unbounded: the event callback below is a *synchronous* closure, so it can
     // only ever `try_send`. On a bounded channel a momentary backlog (TCP
@@ -131,7 +133,10 @@ pub async fn orchestrated_agent_handler(
     };
     let sid = session_id.clone();
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        // Guarantees gates are cleared on any exit path (return, panic, or abort
+        // when the client disconnects), so orphaned session entries can't leak.
+        let _cleanup = crate::routes::util::GateCleanup::new(state.clone(), sid.clone());
         let result = run_orchestrated_task(
             &state,
             req,
@@ -145,10 +150,6 @@ pub async fn orchestrated_agent_handler(
             tx.clone(),
         )
         .await;
-        state.clear_approval_gate(&sid);
-        state.clear_terminal_gate(&sid);
-        state.clear_editor_gate(&sid);
-        state.clear_ask_gate(&sid);
 
         match result {
             Ok(resp) => {
@@ -164,7 +165,9 @@ pub async fn orchestrated_agent_handler(
         }
     });
 
-    Ok(Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+    // Abort the run if the client disconnects (drops the SSE stream).
+    let stream = crate::routes::util::GuardedStream::new(UnboundedReceiverStream::new(rx), handle);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -210,6 +213,11 @@ async fn run_orchestrated_task(
 
     let mut orchestrator = Orchestrator::new(provider, registry)
         .with_auto_mode(req.auto_mode)
+        .with_pipeline(
+            state.pipeline_enabled,
+            state.pipeline_max_fix_cycles,
+            state.pipeline_explorer_max_iters,
+        )
         .with_ask_gate(ask_gate);
 
     if let Some(g) = gate {

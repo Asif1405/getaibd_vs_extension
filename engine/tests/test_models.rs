@@ -95,6 +95,7 @@ fn model_info_serializes() {
         name: "Llama 3".into(),
         capabilities: vec![],
         free: false,
+        locked: false,
     };
     let json = serde_json::to_string(&info).unwrap();
     assert!(json.contains("llama3"));

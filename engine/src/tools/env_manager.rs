@@ -71,23 +71,28 @@ struct EnvStore {
 }
 
 impl EnvStore {
-    fn path_for(root: &Path) -> PathBuf {
-        let dir = root.join(".getaibd");
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(ENVS_FILE)
+    fn store_path() -> PathBuf {
+        crate::paths::global_env_store_path().unwrap_or_else(|| PathBuf::from("envs.json"))
     }
 
     fn load(root: &Path) -> Self {
-        let p = Self::path_for(root);
-        if let Ok(bytes) = std::fs::read(&p) {
-            serde_json::from_slice(&bytes).unwrap_or_default()
-        } else {
-            Self::default()
+        let global = Self::store_path();
+        if let Ok(bytes) = std::fs::read(&global) {
+            return serde_json::from_slice(&bytes).unwrap_or_default();
         }
+        // Legacy: per-repo `.getaibd/envs.json` from older CLI versions.
+        let legacy = crate::paths::project_config_dir(root).join(ENVS_FILE);
+        if let Ok(bytes) = std::fs::read(legacy) {
+            return serde_json::from_slice(&bytes).unwrap_or_default();
+        }
+        Self::default()
     }
 
-    fn save(&self, root: &Path) -> Result<(), AppError> {
-        let p = Self::path_for(root);
+    fn save(&self, _root: &Path) -> Result<(), AppError> {
+        let p = Self::store_path();
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| AppError::InvalidRequest(format!("env store serialise: {e}")))?;
         std::fs::write(&p, bytes)

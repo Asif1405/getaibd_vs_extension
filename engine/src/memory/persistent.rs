@@ -11,33 +11,17 @@ pub struct PersistentMemory {
 
 impl PersistentMemory {
     pub fn new(project_root: &Path) -> Self {
-        let nested = project_root.join(".getaibd").join("MEMORY.md");
-        let legacy = project_root.join("MEMORY.md");
-        // New state goes under `.getaibd/`; an existing legacy root file is still
-        // read/written so we don't strand memory written by older versions.
-        let path = if nested.exists() || !legacy.exists() {
-            nested
-        } else {
-            legacy
-        };
-        Self { path }
+        Self {
+            path: crate::paths::resolve_memory_md_path(project_root),
+        }
     }
 
     pub fn with_path(path: PathBuf) -> Self {
         Self { path }
     }
 
-    /// Create the parent dir before writing, and drop a `.getaibd/.gitignore`
-    /// (ignoring generated state) when writing under `.getaibd/`.
     fn ensure_writable(&self) {
-        let Some(parent) = self.path.parent() else {
-            return;
-        };
-        if parent.file_name().and_then(|n| n.to_str()) == Some(".getaibd") {
-            if let Some(root) = parent.parent() {
-                crate::agent::project_rules::ensure_getaibd_gitignore(root);
-            }
-        } else {
+        if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
     }

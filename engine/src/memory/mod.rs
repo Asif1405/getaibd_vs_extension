@@ -2,6 +2,7 @@ pub mod cache;
 pub mod chunker;
 pub mod context_builder;
 pub mod embeddings;
+pub mod index_status;
 pub mod indexer;
 pub mod merkle;
 pub mod persistent;

@@ -81,6 +81,72 @@ impl Tool for UpdatePlan {
     }
 }
 
+/// Explicit "the task is done" signal. The model calls this ONLY when every part of
+/// the user's request is fully implemented and verified. The runtime treats the call
+/// as a completion claim: it verifies the work against the actual changes and then
+/// ends the run — turning "done" into a positive, unambiguous action instead of the
+/// mere absence of a tool call (which is indistinguishable from a narration pause).
+pub struct AttemptCompletion;
+
+impl AttemptCompletion {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for AttemptCompletion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for AttemptCompletion {
+    fn name(&self) -> &'static str {
+        "attempt_completion"
+    }
+
+    fn description(&self) -> &'static str {
+        "Signal that the user's task is FULLY complete. Call this ONLY when every requirement \
+         has been implemented and verified — never to announce a step you are about to take. \
+         Provide a `summary` of what you changed and accomplished. The runtime verifies the work \
+         against the actual repository changes before ending the run; if anything is still \
+         missing, keep using the other tools instead of calling this."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "A concise summary of everything you changed/accomplished for \
+                                    the task — the final message shown to the user."
+                }
+            },
+            "required": ["summary"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let summary = input
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if summary.is_empty() {
+            return Err(AppError::InvalidRequest(
+                "attempt_completion requires a non-empty 'summary'".into(),
+            ));
+        }
+        Ok(json!({
+            "ok": true,
+            "note": "Completion recorded — the runtime will verify the work against the actual changes."
+        }))
+    }
+}
+
 /// Saves the final plan as a markdown file in a temp directory (outside the repo).
 /// Plan mode is read-only on the project, so the plan is persisted here instead of
 /// writing into the user's codebase.

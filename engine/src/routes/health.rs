@@ -1,6 +1,7 @@
 use axum::extract::{Query, State};
 use axum::Json;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::models::HealthResponse;
@@ -52,4 +53,22 @@ pub async fn health_check(
         },
         providers: provider_checks,
     })
+}
+
+/// Codebase index freshness/status: whether the semantic index is enabled, how
+/// many chunks are stored, and the last index activity (startup pass + watcher).
+pub async fn index_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let enabled = state.memory_store.is_some();
+    let total_chunks = state
+        .memory_store
+        .as_ref()
+        .and_then(|s| s.count().ok())
+        .unwrap_or(0);
+
+    let mut body = state.index_status.snapshot();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("enabled".to_string(), json!(enabled));
+        obj.insert("total_chunks".to_string(), json!(total_chunks));
+    }
+    Json(body)
 }

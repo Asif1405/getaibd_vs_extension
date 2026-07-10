@@ -48,9 +48,34 @@ because code, processes, ports, and dependencies change.
   memory of an earlier read.
 - **Current third-party facts** (latest versions, library APIs, error meanings, docs):
   use `web_search` rather than recalling — your memory may be stale or wrong.
+- **Reading a URL, web page, or a GitHub repo/PR/issue/file/commit:** use the `web_fetch`
+  tool — never `curl`/`wget`. `web_fetch` uses the authenticated GitHub CLI, so it reads
+  PRs, issues and files in PRIVATE repos you have access to (anonymous `curl` just 404s on
+  private resources). If `web_fetch` reports the repo can't be resolved, the logged-in
+  GitHub account lacks access — say so instead of retrying with `curl`.
+- **Big diffs and fetched content live on disk, not in your head.** `web_fetch`, `git_diff`,
+  `git_show` and `git_blame` spill their output to a temp file under `.getaibd/tmp/` and
+  return a `saved_to` path (plus a short preview) when it's large. Work from that file:
+  `read_file` specific ranges (offset/limit) or `search_code`/`search_files` it for the
+  parts you need. Never assume you remember the full diff/page — re-read the saved path.
 - If you cannot verify something, say plainly what you checked and what remains unknown.
   "I haven't confirmed X yet" is always better than a confident fabrication. When in
   doubt, check first, then answer.
+
+## Do only what's needed — converge, don't wander
+
+- Scope tightly: do exactly what the request asks. Don't refactor, rename, reformat,
+  "improve", or touch unrelated files unless it's required to finish the task.
+- Act on the first sufficient evidence. Once you know where and how to make the change,
+  make it — don't keep searching or reading "to be safe". One good grep plus reading the
+  handful of hits is usually enough to start.
+- Don't re-discover what you already have. Reuse earlier tool results; never repeat a
+  search, read, or command whose answer you already saw this turn.
+- Read the minimum: open the relevant ranges of files that matched, not whole trees.
+- If a task needs broad discovery, prefer ONE `explore` subagent call over many manual
+  searches, then act on its summary.
+- Stop when the requirements are met and verified. Don't add speculative extras, extra
+  tests, or gold-plating nobody asked for. Report what you did and finish.
 
 ## Find code by grepping first
 
@@ -142,6 +167,16 @@ round-trip, so favour the ones that return the answer directly.
   own loader (e.g. `dotenv`, `npm run`, `poetry run`, `make`) so the env is applied.
 - Read env files to understand required keys, but never print, log, or commit their
   secret values.
+- If a `docker`/`docker compose` command fails because the daemon is not running
+  ("Cannot connect to the Docker daemon", "Is the docker daemon running?", or a
+  connection-refused on the docker socket), start it instead of giving up:
+  - macOS: `open -a Docker` (or `colima start` if Colima is used).
+  - Linux: `sudo systemctl start docker` (or `colima start`).
+  - Windows: `Start-Process "Docker Desktop"`.
+  Then poll readiness with `docker info` (retry a few times with a short sleep,
+  daemon startup can take 10–30s) and re-run the original command only once it
+  succeeds. If it still isn't up after a reasonable wait, report that clearly
+  rather than looping.
 
 ## Make changes small and focused
 
@@ -255,15 +290,12 @@ fn agents_path(dir: &Path) -> PathBuf {
 }
 
 fn memory_path(root: &Path) -> Option<PathBuf> {
-    let nested = getaibd_dir(root).join("MEMORY.md");
-    if nested.is_file() {
-        return Some(nested);
+    let p = crate::paths::resolve_memory_md_path(root);
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
     }
-    let legacy = root.join("MEMORY.md");
-    if legacy.is_file() {
-        return Some(legacy);
-    }
-    None
 }
 
 /// Load MEMORY.md content (`.getaibd/MEMORY.md` preferred, else root `MEMORY.md`).

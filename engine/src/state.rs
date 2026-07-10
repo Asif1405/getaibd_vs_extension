@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::agent::task_queue::TaskQueue;
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -15,6 +16,12 @@ use crate::providers::Provider;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::tools::approval::ApprovalGate;
 use crate::tools::ToolRegistry;
+
+/// Drop patch snapshots older than this (never-reverted patches would otherwise
+/// retain full pre-edit file bodies for the whole process lifetime).
+const SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60);
+/// Hard cap on retained snapshots; oldest are evicted first past this.
+const MAX_SNAPSHOTS: usize = 32;
 
 pub struct AppState {
     pub providers: HashMap<String, Arc<dyn Provider>>,
@@ -35,11 +42,17 @@ pub struct AppState {
     pub memory_db_path: Option<PathBuf>,
     /// Ceiling for the startup full-repo index pass.
     pub memory_max_index_files: usize,
+    /// Multi-agent pipeline settings (analyzer/explorer/planner/worker/validator).
+    pub pipeline_enabled: bool,
+    pub pipeline_max_fix_cycles: u32,
+    pub pipeline_explorer_max_iters: u32,
     pub rate_limiter: Arc<RateLimiter>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub task_queue: Arc<TaskQueue>,
     /// Shared project analysis cache (call graph, project graph, types, recent tracker)
     pub analysis_cache: Arc<ProjectAnalysisCache>,
+    /// Live snapshot of the codebase index state (startup pass + watcher), for `/index/status`.
+    pub index_status: Arc<crate::memory::index_status::IndexStatus>,
     /// Session-scoped approval gates keyed by session UUID
     approval_gates: Mutex<HashMap<String, ApprovalGate>>,
     /// Session-scoped terminal gates keyed by session UUID
@@ -48,8 +61,9 @@ pub struct AppState {
     ask_gates: Mutex<HashMap<String, crate::tools::ask_gate::AskGate>>,
     /// Session-scoped editor gates (LSP queries / diagnostics) keyed by session UUID
     editor_gates: Mutex<HashMap<String, crate::tools::editor_gate::EditorGate>>,
-    /// Snapshots for patch rollback, keyed by patch ID (UUID)
-    pub patch_snapshots: Mutex<HashMap<String, Snapshot>>,
+    /// Snapshots for patch rollback, keyed by patch ID (UUID). Each entry keeps
+    /// its insertion time so stale snapshots (never reverted) can be swept.
+    pub patch_snapshots: Mutex<HashMap<String, (Instant, Snapshot)>>,
     pub context_config: crate::context::ContextConfig,
 }
 
@@ -72,7 +86,14 @@ impl AppState {
         tracing::info!("Agent project root: {}", project_root.display());
 
         let (memory_store, embedder) = if config.memory.enabled {
-            let db_path = project_root.join(&config.memory.db_path);
+            let db_path = if std::path::Path::new(&config.memory.db_path).is_absolute() {
+                PathBuf::from(&config.memory.db_path)
+            } else {
+                crate::paths::default_memory_db_path(&project_root)
+            };
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             if let Some(e) = Self::build_embedder(config) {
                 let dim = e.dimension();
                 match MemoryStore::open(&db_path, dim) {
@@ -115,10 +136,17 @@ impl AppState {
         let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default()));
         let task_queue = Arc::new(TaskQueue::new());
         let analysis_cache = Arc::new(ProjectAnalysisCache::new());
+        let index_status = Arc::new(crate::memory::index_status::IndexStatus::default());
 
         let memory_db_path = memory_store
             .as_ref()
-            .map(|_| project_root.join(&config.memory.db_path));
+            .map(|_| {
+                if std::path::Path::new(&config.memory.db_path).is_absolute() {
+                    PathBuf::from(&config.memory.db_path)
+                } else {
+                    crate::paths::default_memory_db_path(&project_root)
+                }
+            });
         let memory_max_index_files = config.memory.max_index_files;
 
         let getaibd_cfg = config
@@ -146,10 +174,14 @@ impl AppState {
             memory_max_entries: config.memory.max_entries,
             memory_db_path,
             memory_max_index_files,
+            pipeline_enabled: config.pipeline.enabled,
+            pipeline_max_fix_cycles: config.pipeline.max_fix_cycles,
+            pipeline_explorer_max_iters: config.pipeline.explorer_max_iters,
             rate_limiter,
             circuit_breaker,
             task_queue,
             analysis_cache,
+            index_status,
             approval_gates: Mutex::new(HashMap::new()),
             terminal_gates: Mutex::new(HashMap::new()),
             ask_gates: Mutex::new(HashMap::new()),
@@ -255,15 +287,42 @@ impl AppState {
     }
 
     /// Store a patch snapshot for later rollback.
+    ///
+    /// Snapshots hold full pre-edit file bodies, so a patch that is never
+    /// reverted would otherwise leak its contents for the process lifetime.
+    /// Evict on insert: drop entries older than [`SNAPSHOT_TTL`], then, if still
+    /// over [`MAX_SNAPSHOTS`], drop the oldest first.
     pub fn store_snapshot(&self, patch_id: &str, snapshot: Snapshot) {
-        self.patch_snapshots
-            .lock().expect("state mutex poisoned")
-            .insert(patch_id.to_string(), snapshot);
+        let mut snapshots =
+            self.patch_snapshots.lock().expect("state mutex poisoned");
+        let now = Instant::now();
+        snapshots.insert(patch_id.to_string(), (now, snapshot));
+
+        // TTL sweep.
+        snapshots
+            .retain(|_, (inserted, _)| now.duration_since(*inserted) < SNAPSHOT_TTL);
+
+        // Cap: drop oldest-first until within the limit.
+        while snapshots.len() > MAX_SNAPSHOTS {
+            if let Some(oldest_key) = snapshots
+                .iter()
+                .min_by_key(|(_, (inserted, _))| *inserted)
+                .map(|(k, _)| k.clone())
+            {
+                snapshots.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Take (consume) a snapshot, removing it from the store.
     pub fn take_snapshot(&self, patch_id: &str) -> Option<Snapshot> {
-        self.patch_snapshots.lock().expect("state mutex poisoned").remove(patch_id)
+        self.patch_snapshots
+            .lock()
+            .expect("state mutex poisoned")
+            .remove(patch_id)
+            .map(|(_, snapshot)| snapshot)
     }
 
     fn build_embedder(config: &AppConfig) -> Option<Arc<dyn EmbeddingProvider>> {

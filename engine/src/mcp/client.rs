@@ -105,7 +105,7 @@ fn substitute_env(value: &str) -> String {
 }
 
 fn mcp_config_path(project_root: &Path) -> PathBuf {
-    project_root.join(".getaibd").join("mcp.json")
+    crate::paths::resolve_mcp_config_path(project_root)
 }
 
 /// Connect all MCP servers declared in `.getaibd/mcp.json`. Failures are logged and skipped.

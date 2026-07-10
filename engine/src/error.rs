@@ -1,5 +1,8 @@
+#[cfg(feature = "server")]
 use axum::http::StatusCode;
+#[cfg(feature = "server")]
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "server")]
 use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,11 +38,13 @@ pub enum AppError {
     Conflict(String),
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize)]
 struct ErrorBody {
     error: ErrorDetail,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize)]
 struct ErrorDetail {
     code: String,
@@ -49,6 +54,7 @@ struct ErrorDetail {
 }
 
 impl AppError {
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest(_) => "INVALID_REQUEST",
@@ -64,6 +70,7 @@ impl AppError {
         }
     }
 
+    #[cfg(feature = "server")]
     fn status_code(&self) -> StatusCode {
         match self {
             Self::InvalidRequest(_) | Self::UnknownProvider(_) => StatusCode::BAD_REQUEST,
@@ -76,6 +83,7 @@ impl AppError {
         }
     }
 
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     fn provider_name(&self) -> Option<String> {
         match self {
             Self::ProviderUnavailable(p)
@@ -99,6 +107,7 @@ impl AppError {
     }
 }
 
+#[cfg(feature = "server")]
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();

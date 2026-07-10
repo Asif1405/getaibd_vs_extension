@@ -46,6 +46,16 @@ impl TaskRecord {
 
 pub type TaskStore = Arc<RwLock<HashMap<String, TaskRecord>>>;
 
+/// Hard cap on retained task records. Beyond this, the oldest *finished*
+/// (completed/failed/cancelled) records are evicted so a long-lived server does
+/// not accumulate task history for its whole lifetime. Active (queued/running)
+/// tasks are never evicted.
+const MAX_RETAINED_TASKS: usize = 200;
+
+/// Cap on the per-task progress log. A single long-running task could otherwise
+/// push unbounded progress lines into memory. We keep the most recent lines.
+const MAX_PROGRESS_LINES: usize = 500;
+
 pub struct TaskQueue {
     store: TaskStore,
     tx: mpsc::Sender<QueuedTask>,
@@ -67,6 +77,11 @@ impl TaskHandle {
         let mut store = self.store.write().await;
         if let Some(record) = store.get_mut(&self.id) {
             record.progress.push(msg.into());
+            // Keep only the most recent lines so a chatty task can't grow without bound.
+            let len = record.progress.len();
+            if len > MAX_PROGRESS_LINES {
+                record.progress.drain(0..len - MAX_PROGRESS_LINES);
+            }
         }
     }
 
@@ -137,7 +152,11 @@ impl TaskQueue {
         let record = TaskRecord::new(description);
         let id = record.id.clone();
 
-        self.store.write().await.insert(id.clone(), record);
+        {
+            let mut store = self.store.write().await;
+            store.insert(id.clone(), record);
+            evict_finished(&mut store, MAX_RETAINED_TASKS);
+        }
 
         let _ = self
             .tx
@@ -177,6 +196,36 @@ impl TaskQueue {
 impl Default for TaskQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Evict oldest *finished* task records once the store exceeds `max`. Queued and
+/// running tasks are always kept; only terminal records (completed/failed/
+/// cancelled) are candidates for removal, oldest-first by creation time.
+fn evict_finished(store: &mut HashMap<String, TaskRecord>, max: usize) {
+    if store.len() <= max {
+        return;
+    }
+    let mut finished: Vec<(String, u64)> = store
+        .values()
+        .filter(|r| {
+            matches!(
+                r.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            )
+        })
+        .map(|r| (r.id.clone(), r.created_at))
+        .collect();
+    // Oldest first.
+    finished.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let mut to_remove = store.len().saturating_sub(max);
+    for (id, _) in finished {
+        if to_remove == 0 {
+            break;
+        }
+        store.remove(&id);
+        to_remove -= 1;
     }
 }
 

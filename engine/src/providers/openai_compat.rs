@@ -19,7 +19,20 @@ fn compat_http_error(provider_id: &str, status: reqwest::StatusCode, body: &str)
         let trimmed: String = body.chars().take(400).collect();
         format!("HTTP {status}: {trimmed}")
     };
-    AppError::ProviderError(format!("{provider_id}: {detail}"))
+    let msg = format!("{provider_id}: {detail}");
+    // A transient upstream failure — a gateway/proxy error (502/503/504), a generic
+    // 5xx, a request-timeout (408/425), or an overload (429) — should be retried with
+    // backoff instead of aborting the whole agent run over a momentary blip. Everything
+    // else (400/401/403/404/422 …) is a genuine client error that will never succeed on
+    // retry, so surface it immediately as a hard ProviderError.
+    let code = status.as_u16();
+    if code == 408 || code == 425 {
+        AppError::ProviderTimeout(msg)
+    } else if code == 429 || code >= 500 {
+        AppError::ProviderUnavailable(msg)
+    } else {
+        AppError::ProviderError(msg)
+    }
 }
 
 async fn read_http_error(provider_id: &str, resp: reqwest::Response) -> AppError {
@@ -462,6 +475,9 @@ impl Provider for OpenAiCompatProvider {
             /// True for the platform's free / "Auto" model.
             #[serde(default)]
             free: bool,
+            /// True when the caller's plan cannot use this model (locked in UI).
+            #[serde(default)]
+            locked: bool,
             #[serde(default)]
             capabilities: Vec<String>,
             /// Real context window (tokens) from the catalog; 0/absent when unknown.
@@ -492,6 +508,7 @@ impl Provider for OpenAiCompatProvider {
                     name,
                     capabilities: m.capabilities,
                     free: m.free,
+                    locked: m.locked,
                 }
             })
             .collect();
@@ -949,6 +966,46 @@ mod compat_tests {
         let msg = ToolMessage::user("hello");
         let v = serde_json::to_value(CompatMessage::from(&msg)).unwrap();
         assert_eq!(v["content"], serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn transient_upstream_statuses_are_retryable() {
+        use reqwest::StatusCode;
+        // A gateway blip must NOT kill the whole run — it maps to a retryable variant so
+        // retry.rs / the streaming loop retry with backoff instead of aborting mid-task.
+        for code in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::REQUEST_TIMEOUT,
+        ] {
+            let err = compat_http_error("getaibd", code, "<html>502 Bad Gateway</html>");
+            assert!(
+                err.is_retryable(),
+                "HTTP {code} should be retryable, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_client_errors_are_not_retryable() {
+        use reqwest::StatusCode;
+        // Real client errors will never succeed on retry, so they must surface at once.
+        for code in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            let err = compat_http_error("getaibd", code, "bad");
+            assert!(
+                !err.is_retryable(),
+                "HTTP {code} should NOT be retryable, got {err:?}"
+            );
+        }
     }
 
     #[test]

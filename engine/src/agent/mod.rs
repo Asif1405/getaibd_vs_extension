@@ -1,6 +1,7 @@
 pub mod conduct;
 pub mod modes;
 pub mod orchestrator;
+pub mod pipeline;
 pub mod planner;
 pub mod project_rules;
 pub mod runtime;

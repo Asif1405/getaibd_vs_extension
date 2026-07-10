@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 
 use crate::error::AppError;
-use crate::tools::Tool;
+use crate::tools::{tmpfile, Tool};
 
 async fn run_git(root: &PathBuf, args: &[&str]) -> Result<String, AppError> {
     let output = Command::new("git")
@@ -181,7 +181,8 @@ impl Tool for GitDiff {
     }
 
     fn description(&self) -> &'static str {
-        "Show file changes. Set staged=true for staged changes."
+        "Show file changes. Set staged=true for staged changes. Pass `ref` to diff the working \
+         tree against a commit/branch/tag, or `base`+`head` to diff two refs (base..head)."
     }
 
     fn input_schema(&self) -> Value {
@@ -189,7 +190,10 @@ impl Tool for GitDiff {
             "type": "object",
             "properties": {
                 "staged": { "type": "boolean", "description": "Show staged changes" },
-                "path": { "type": "string", "description": "Specific file to diff" }
+                "path": { "type": "string", "description": "Specific file to diff" },
+                "ref": { "type": "string", "description": "Diff working tree against this commit/branch/tag" },
+                "base": { "type": "string", "description": "Left side of a two-ref diff (base..head)" },
+                "head": { "type": "string", "description": "Right side of a two-ref diff (base..head); defaults to HEAD" }
             }
         })
     }
@@ -199,18 +203,23 @@ impl Tool for GitDiff {
             return Ok(self.diff_from_tracked_edits(input["path"].as_str()).await);
         }
         let staged = input["staged"].as_bool().unwrap_or(false);
-        let mut args = vec!["diff"];
+        let mut args: Vec<String> = vec!["diff".into()];
         if staged {
-            args.push("--cached");
+            args.push("--cached".into());
         }
-        let path_str;
+        if let Some(base) = input["base"].as_str() {
+            let head = input["head"].as_str().unwrap_or("HEAD");
+            args.push(format!("{base}..{head}"));
+        } else if let Some(r) = input["ref"].as_str() {
+            args.push(r.to_string());
+        }
         if let Some(p) = input["path"].as_str() {
-            args.push("--");
-            path_str = p.to_string();
-            args.push(&path_str);
+            args.push("--".into());
+            args.push(p.to_string());
         }
-        let output = run_git(&self.root, &args).await?;
-        Ok(json!({ "diff": output }))
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_git(&self.root, &arg_refs).await?;
+        Ok(tmpfile::stash(&self.root, "git-diff", "diff", &output).await)
     }
 }
 
@@ -231,7 +240,7 @@ impl Tool for GitLog {
     }
 
     fn description(&self) -> &'static str {
-        "Show commit history."
+        "Show commit history. Filter by `path` (commits touching a file/dir) or `author`."
     }
 
     fn input_schema(&self) -> Value {
@@ -239,7 +248,9 @@ impl Tool for GitLog {
             "type": "object",
             "properties": {
                 "count": { "type": "integer", "description": "Number of commits (default: 10)" },
-                "oneline": { "type": "boolean", "description": "One-line format" }
+                "oneline": { "type": "boolean", "description": "One-line format" },
+                "path": { "type": "string", "description": "Only commits that touched this file or directory" },
+                "author": { "type": "string", "description": "Only commits by this author (substring match)" }
             }
         })
     }
@@ -250,12 +261,19 @@ impl Tool for GitLog {
         }
         let count = input["count"].as_u64().unwrap_or(10);
         let oneline = input["oneline"].as_bool().unwrap_or(true);
-        let count_str = format!("-{count}");
-        let mut args = vec!["log", &count_str];
+        let mut args: Vec<String> = vec!["log".into(), format!("-{count}")];
         if oneline {
-            args.push("--oneline");
+            args.push("--oneline".into());
         }
-        let output = run_git(&self.root, &args).await?;
+        if let Some(author) = input["author"].as_str() {
+            args.push(format!("--author={author}"));
+        }
+        if let Some(path) = input["path"].as_str() {
+            args.push("--".into());
+            args.push(path.to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_git(&self.root, &arg_refs).await?;
         Ok(json!({ "log": output.trim() }))
     }
 }
@@ -476,6 +494,425 @@ impl Tool for GitPush {
             args.push(branch);
         }
         let output = run_git(&self.root, &args).await?;
+        Ok(json!({ "output": output.trim() }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only enrichments: show / blame / branch
+// ---------------------------------------------------------------------------
+
+pub struct GitShow {
+    root: Arc<PathBuf>,
+}
+
+impl GitShow {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitShow {
+    fn name(&self) -> &'static str {
+        "git_show"
+    }
+
+    fn description(&self) -> &'static str {
+        "Inspect git history. With `ref` only: show a commit — message, author, date, full diff \
+         (set stat=true for a changed-files summary); use for 'what changed in <sha>'. With \
+         `path` set: fetch that file's FULL contents as of `ref` (a past or deleted version, \
+         i.e. `git show <ref>:<path>`). Either way the payload is saved to a temp file you then \
+         read with read_file / search_code — this is the correct way to view a historical file; \
+         never run `git show <ref>:<file>` in a terminal and scrape the printed output."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": { "type": "string", "description": "Commit SHA, branch, tag, or ref (default: HEAD)" },
+                "path": { "type": "string", "description": "Fetch this file's contents as of `ref` (git show <ref>:<path>), saved to a temp file to read — for historical or deleted files" },
+                "stat": { "type": "boolean", "description": "Show a changed-files summary instead of the full diff (commit mode only)" }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
+        let gref = input["ref"].as_str().unwrap_or("HEAD");
+        // `path` set → show that file's *contents* as of the ref. Spill to a temp file the
+        // agent reads with read_file, preserving the source extension for syntax/search —
+        // never `git show <ref>:<path> | head` in a terminal and scrape the output.
+        if let Some(path) = input["path"].as_str() {
+            let spec = format!("{gref}:{path}");
+            let output = run_git(&self.root, &["show", &spec]).await?;
+            let ext = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("txt");
+            return Ok(tmpfile::stash(&self.root, "git-show-file", ext, &output).await);
+        }
+        let mut args: Vec<String> = vec!["show".into()];
+        if input["stat"].as_bool().unwrap_or(false) {
+            args.push("--stat".into());
+        }
+        args.push(gref.to_string());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_git(&self.root, &arg_refs).await?;
+        Ok(tmpfile::stash(&self.root, "git-show", "diff", &output).await)
+    }
+}
+
+pub struct GitBlame {
+    root: Arc<PathBuf>,
+}
+
+impl GitBlame {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitBlame {
+    fn name(&self) -> &'static str {
+        "git_blame"
+    }
+
+    fn description(&self) -> &'static str {
+        "Show line-by-line authorship for a file (which commit last changed each line). \
+         Pass start/end to limit to a line range for large files."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to blame" },
+                "start": { "type": "integer", "description": "First line (1-based) of the range" },
+                "end": { "type": "integer", "description": "Last line of the range" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
+        let path = input["path"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("path is required".into()))?;
+        let mut args: Vec<String> = vec!["blame".into(), "--date=short".into()];
+        if let (Some(s), Some(e)) = (input["start"].as_u64(), input["end"].as_u64()) {
+            args.push("-L".into());
+            args.push(format!("{s},{e}"));
+        }
+        args.push("--".into());
+        args.push(path.to_string());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_git(&self.root, &arg_refs).await?;
+        Ok(tmpfile::stash(&self.root, "git-blame", "txt", &output).await)
+    }
+}
+
+pub struct GitBranch {
+    root: Arc<PathBuf>,
+}
+
+impl GitBranch {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitBranch {
+    fn name(&self) -> &'static str {
+        "git_branch"
+    }
+
+    fn description(&self) -> &'static str {
+        "List branches with the current one marked and their upstream tracking. Set all=true \
+         to include remote-tracking branches."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "all": { "type": "boolean", "description": "Include remote-tracking branches" }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
+        let mut args = vec!["branch", "-vv"];
+        if input["all"].as_bool().unwrap_or(false) {
+            args.push("--all");
+        }
+        let output = run_git(&self.root, &args).await?;
+        let current = run_git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        Ok(json!({ "branches": output.trim(), "current": current }))
+    }
+}
+
+pub struct GitCheckout {
+    root: Arc<PathBuf>,
+}
+
+impl GitCheckout {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitCheckout {
+    fn name(&self) -> &'static str {
+        "git_checkout"
+    }
+
+    fn description(&self) -> &'static str {
+        "Switch to an existing branch, or create a new one (create=true, optionally from a \
+         base ref). Only when the user asked to change branches."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "branch": { "type": "string", "description": "Branch name to switch to or create" },
+                "create": { "type": "boolean", "description": "Create the branch (git checkout -b)" },
+                "from": { "type": "string", "description": "Base ref for a newly created branch" }
+            },
+            "required": ["branch"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        if !is_git_repo(&self.root).await {
+            return Err(AppError::InvalidRequest(NOT_A_REPO.into()));
+        }
+        let branch = input["branch"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("branch is required".into()))?;
+        let mut args: Vec<String> = vec!["checkout".into()];
+        if input["create"].as_bool().unwrap_or(false) {
+            args.push("-b".into());
+        }
+        args.push(branch.to_string());
+        if let Some(from) = input["from"].as_str() {
+            args.push(from.to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_git(&self.root, &arg_refs).await?;
+        Ok(json!({ "output": output.trim(), "branch": branch }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GitHub pull-request ops via the authenticated `gh` CLI (works on private repos)
+// ---------------------------------------------------------------------------
+
+/// Resolve the `gh` binary, falling back to common install paths.
+fn gh_bin() -> &'static str {
+    for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"] {
+        if std::path::Path::new(p).exists() {
+            return p;
+        }
+    }
+    "gh"
+}
+
+async fn run_gh(root: &PathBuf, args: &[&str]) -> Result<String, AppError> {
+    let output = Command::new(gh_bin())
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await
+        .map_err(|e| AppError::InvalidRequest(format!("failed to run gh (is it installed?): {e}")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(AppError::InvalidRequest(format!("gh error: {}", stderr.trim())))
+    }
+}
+
+pub struct GitPrList {
+    root: Arc<PathBuf>,
+}
+
+impl GitPrList {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitPrList {
+    fn name(&self) -> &'static str {
+        "github_pr_list"
+    }
+
+    fn description(&self) -> &'static str {
+        "List GitHub pull requests via the authenticated gh CLI (works on private repos). \
+         Defaults to the current repo; pass `repo` (owner/name) for another. To read a single \
+         PR's body and diff, use web_fetch with the PR URL instead."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "description": "owner/name (default: current repo)" },
+                "state": { "type": "string", "description": "open | closed | merged | all (default: open)" },
+                "limit": { "type": "integer", "description": "Max PRs to list (default: 20)" }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let state = input["state"].as_str().unwrap_or("open");
+        let limit = input["limit"].as_u64().unwrap_or(20).to_string();
+        let mut args = vec![
+            "pr", "list", "--state", state, "--limit", &limit, "--json",
+            "number,title,state,author,headRefName,baseRefName,url,isDraft",
+        ];
+        if let Some(repo) = input["repo"].as_str() {
+            args.push("--repo");
+            args.push(repo);
+        }
+        let output = run_gh(&self.root, &args).await?;
+        Ok(json!({ "pull_requests": output.trim() }))
+    }
+}
+
+pub struct GitPrCreate {
+    root: Arc<PathBuf>,
+}
+
+impl GitPrCreate {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitPrCreate {
+    fn name(&self) -> &'static str {
+        "github_pr_create"
+    }
+
+    fn description(&self) -> &'static str {
+        "Open a GitHub pull request for the current branch via the authenticated gh CLI. \
+         Only when the user asked to open a PR. Push the branch first if it has no upstream."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "PR title" },
+                "body": { "type": "string", "description": "PR description (markdown)" },
+                "base": { "type": "string", "description": "Base branch to merge into (default: repo default)" },
+                "draft": { "type": "boolean", "description": "Open as a draft PR" }
+            },
+            "required": ["title", "body"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let title = input["title"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("title is required".into()))?;
+        let body = input["body"]
+            .as_str()
+            .ok_or_else(|| AppError::InvalidRequest("body is required".into()))?;
+        let mut args: Vec<String> = vec![
+            "pr".into(), "create".into(),
+            "--title".into(), title.to_string(),
+            "--body".into(), body.to_string(),
+        ];
+        if let Some(base) = input["base"].as_str() {
+            args.push("--base".into());
+            args.push(base.to_string());
+        }
+        if input["draft"].as_bool().unwrap_or(false) {
+            args.push("--draft".into());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_gh(&self.root, &arg_refs).await?;
+        Ok(json!({ "output": output.trim() }))
+    }
+}
+
+pub struct GitPrCheckout {
+    root: Arc<PathBuf>,
+}
+
+impl GitPrCheckout {
+    pub fn new(root: Arc<PathBuf>) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GitPrCheckout {
+    fn name(&self) -> &'static str {
+        "github_pr_checkout"
+    }
+
+    fn description(&self) -> &'static str {
+        "Check out a GitHub pull request locally by number via the authenticated gh CLI, so you \
+         can review or run it. Only when the user asked."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "number": { "type": "integer", "description": "PR number to check out" },
+                "repo": { "type": "string", "description": "owner/name (default: current repo)" }
+            },
+            "required": ["number"]
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, AppError> {
+        let number = input["number"]
+            .as_u64()
+            .ok_or_else(|| AppError::InvalidRequest("number is required".into()))?
+            .to_string();
+        let mut args = vec!["pr", "checkout", &number];
+        if let Some(repo) = input["repo"].as_str() {
+            args.push("--repo");
+            args.push(repo);
+        }
+        let output = run_gh(&self.root, &args).await?;
         Ok(json!({ "output": output.trim() }))
     }
 }
