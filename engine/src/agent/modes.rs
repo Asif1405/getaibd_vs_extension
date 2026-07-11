@@ -667,7 +667,8 @@ mod tests {
         }
         // No issue -> skip entirely.
         assert!(prompt.contains("gap analysis is skipped entirely"));
-        assert!(prompt.contains("read THAT with `read_file` and use it as your primary map"));
+        assert!(prompt
+            .contains("read it FIRST with `read_file` and drive the whole review from it"));
     }
 
     /// Every mode prompt follows the shared template: the section headers must be
