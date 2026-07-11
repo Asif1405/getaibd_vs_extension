@@ -22,6 +22,17 @@ Reflect on the tool results above. Inside <reflection>...</reflection> tags:
   change approach rather than repeating it.
 If the task is fully complete, provide your final answer without any tags.";
 
+/// Forced convergence check, injected after every few tool calls regardless of
+/// whether the richer `<reflection>` scaffolding is enabled. Its job is to stop a
+/// model from calling tools indefinitely: it must decide, on the evidence it now
+/// has, whether the task is satisfied or a specific concrete gap remains.
+pub const CHECKPOINT_PROMPT: &str = "\
+Checkpoint — you have run several tools in a row. Before calling any more, stop and evaluate on the results you already have:
+- What do those results give you, and what (if anything) does the task still concretely require?
+- If you now have EVERYTHING needed to answer or complete the task, produce the final answer now (or call attempt_completion) — do not gather more.
+- If something specific is still missing, name that ONE missing piece and take exactly the single next step that obtains it.
+Only call another tool when a concrete, named gap requires it; never re-read or re-search what you already have.";
+
 /// Whether a model should run the explicit plan/reflect "thinking" scaffolding.
 ///
 /// Reasoning models benefit from the `<plan>`/`<reflection>` protocol. Smaller,

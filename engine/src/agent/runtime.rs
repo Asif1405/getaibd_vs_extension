@@ -675,6 +675,9 @@ async fn agent_loop(
     // Loop/repeat guard thresholds (see `last_iter_sig` below).
     const REPEAT_STOP_TOOLS: u32 = 2; // stop on the 3rd identical tool turn in a row
     const REPEAT_STOP_TEXT: u32 = 2; // stop on the 3rd identical no-tool answer
+    // Force a convergence self-check after at most this many tool calls, so the model
+    // pauses to decide "do I have everything?" instead of calling tools endlessly.
+    const CHECKPOINT_TOOL_CALLS: u32 = 3;
     let task_ctx = resolve_task_context(session, task);
     let auto_complete = options.is_some_and(|o| o.auto_complete) && !tool_defs.is_empty();
     // Loop/repeat guard. Catches the model emitting a byte-identical action on
@@ -733,6 +736,10 @@ async fn agent_loop(
     let llm_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let tool_call_budget = options.and_then(|o| o.max_tool_calls);
     let mut tool_calls_made = 0u32;
+    // Tool calls run since the last forced convergence check. After every
+    // CHECKPOINT_TOOL_CALLS tools we make the model evaluate whether the task is
+    // satisfied or a concrete gap remains, so it can't call tools indefinitely.
+    let mut tool_calls_since_checkpoint = 0u32;
     let llm: Arc<dyn Provider> = Arc::new(CountingProvider {
         inner: provider.clone(),
         calls: llm_calls.clone(),
@@ -1217,6 +1224,8 @@ async fn agent_loop(
             execute_tool_calls(&response.tool_calls, registry, options, session, on_event).await;
             tool_calls_made =
                 tool_calls_made.saturating_add(response.tool_calls.len() as u32);
+            tool_calls_since_checkpoint =
+                tool_calls_since_checkpoint.saturating_add(response.tool_calls.len() as u32);
             // The model acted this turn — it isn't stalled on prose. Reset the
             // no-tool stagnation counter.
             no_tool_turns = 0;
@@ -1238,7 +1247,17 @@ async fn agent_loop(
             // A normal tool turn keeps going. An explicit attempt_completion falls
             // through to the completion evaluation below (its batched tools already ran).
             if !explicit_completion {
-                if enable_thinking {
+                // Force a convergence check after every few tool calls (always, even
+                // for non-reasoning models that skip the richer reflection): the model
+                // must decide whether it now has everything or a concrete gap remains,
+                // instead of chaining tool calls indefinitely. Between checkpoints,
+                // reasoning models still get the lighter per-turn reflection.
+                if tool_calls_since_checkpoint >= CHECKPOINT_TOOL_CALLS {
+                    session.push_message(ToolMessage::system(
+                        thinking::CHECKPOINT_PROMPT.to_string(),
+                    ));
+                    tool_calls_since_checkpoint = 0;
+                } else if enable_thinking {
                     session
                         .push_message(ToolMessage::system(thinking::REFLECTION_PROMPT.to_string()));
                 }
