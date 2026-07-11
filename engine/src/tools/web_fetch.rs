@@ -57,8 +57,10 @@ impl Tool for WebFetch {
          Otherwise it falls back to the authenticated GitHub CLI (which also honours \
          GH_TOKEN/GITHUB_TOKEN). For any other URL it performs an HTTP GET and returns \
          readable text. For a PR/commit it also saves a structural diff-graph \
-         (files -> changed symbols -> references) as `graph_file` — read that first to \
-         plan a review. Fetching the same URL twice returns the saved copy (no re-fetch)."
+         (files -> changed symbols -> references) as `graph_file` — that is the PRIMARY \
+         evidence for any PR/commit work (review, plan, fix, explain); read it first and \
+         reason from it, treating the raw diff as a fallback for confirming exact lines. \
+         Fetching the same URL twice returns the saved copy (no re-fetch)."
     }
 
     fn input_schema(&self) -> Value {
@@ -141,13 +143,14 @@ impl Tool for WebFetch {
                         payload["graph_file"] = json!(path);
                         payload["graph_summary"] = graph["summary"].clone();
                         payload["graph_hint"] = json!(format!(
-                            "REVIEW FROM THE GRAPH. A structural diff-graph (files -> changed \
-                             symbols -> references/blast-radius) is saved at {path} (graph_file). \
-                             Read it FIRST with read_file — it lists every file and symbol the diff \
-                             touches. The raw unified diff is at diff_file: open ONLY specific line \
-                             ranges from it (read_file offset/limit) when a hunk in the graph needs \
-                             its exact changed lines. Do NOT read the whole diff, and do not review \
-                             from the diff instead of the graph."
+                            "WORK FROM THE GRAPH (primary evidence). A structural diff-graph (files \
+                             -> changed symbols -> references/blast-radius) is saved at {path} \
+                             (graph_file). Read it FIRST with read_file and reason from it — it lists \
+                             every file and symbol the change touches. The raw unified diff at \
+                             diff_file is only a FALLBACK: open ONLY specific line ranges from it \
+                             (read_file offset/limit) when a hunk named in the graph needs its exact \
+                             changed lines. Do NOT read the whole diff, and never work from the diff \
+                             instead of the graph. This holds for any mode (review, plan, fix, explain)."
                         ));
                     }
                 }
