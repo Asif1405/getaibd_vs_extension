@@ -1,22 +1,25 @@
 /// System prompts and response parsing for plan/think/reflect agent loop.
 pub const PLANNING_PROMPT: &str = "\
-You are an advanced agent that plans before acting. Follow this protocol:
+Work like a developer who thinks before acting and checks progress after each move.
 
-1. PLAN: Before taking any action, output your plan inside <plan>...</plan> tags.
-   Break down the task into clear steps.
-2. THINK: When reasoning about a problem, wrap your thoughts in <thinking>...</thinking> tags.
-3. ACT: Execute your plan using the available tools.
-4. REFLECT: After tool results come back, reflect on the outcome inside <reflection>...</reflection> tags.
-   - If the plan succeeded, state what was accomplished.
-   - If something failed or needs adjustment, output a new <plan> to re-approach.
+1. PLAN: Before acting, briefly break the task into ordered steps inside <plan>...</plan> tags —
+   how you would actually approach it, not ceremony.
+2. THINK: When reasoning through a problem, wrap your thoughts in <thinking>...</thinking> tags.
+3. ACT: Execute the next step with the available tools. Pick the cheapest tool that does the job
+   and don't repeat a call that already gave its answer.
+4. REFLECT: After tool results come back, inside <reflection>...</reflection> tags ask 'did this
+   move me toward done?' — if yes, continue; if it failed or the result was unexpected, adapt and
+   output a revised <plan> instead of retrying the same thing.
 
-Always plan first, then act, then reflect. Adjust your approach based on results.";
+Done when the task's goal is met and verified. Stop then — do not keep planning or exploring past
+that point.";
 
 pub const REFLECTION_PROMPT: &str = "\
 Reflect on the tool results above. Inside <reflection>...</reflection> tags:
-- Did the action succeed or fail?
-- Is the original task complete, or do more steps remain?
-- If more work is needed, output a new <plan> with updated steps.
+- Did the action move you toward the goal, or fail / return something unexpected?
+- Is the original task complete and verified, or do concrete steps remain?
+- If more work is needed, output a new <plan> with updated steps; if the last action failed,
+  change approach rather than repeating it.
 If the task is fully complete, provide your final answer without any tags.";
 
 /// Whether a model should run the explicit plan/reflect "thinking" scaffolding.

@@ -192,6 +192,7 @@ async fn run_agent_task(
             Some(0.1)
         },
         max_llm_calls: None,
+        max_tool_calls: None,
     };
 
     let approval_session = session_id_for_events.clone();

@@ -170,7 +170,7 @@ impl Tool for PatchGraph {
 }
 
 /// Pick the innermost (smallest-span) symbol whose range overlaps `[start, end]`.
-fn innermost(ranges: &[SymbolRange], start: usize, end: usize) -> Option<&SymbolRange> {
+pub(crate) fn innermost(ranges: &[SymbolRange], start: usize, end: usize) -> Option<&SymbolRange> {
     ranges
         .iter()
         .filter(|r| r.overlaps(start, end))
@@ -179,7 +179,12 @@ fn innermost(ranges: &[SymbolRange], start: usize, end: usize) -> Option<&Symbol
 
 /// References to `name` across the repo (word-boundary), minus the definition line
 /// itself. Returns `{ count, truncated, sample: [{path, line, text}] }`.
-async fn references_for(root: &Path, name: &str, def_path: &str, def_line: usize) -> Value {
+pub(crate) async fn references_for(
+    root: &Path,
+    name: &str,
+    def_path: &str,
+    def_line: usize,
+) -> Value {
     let pattern = format!(r"\b{}\b", regex_escape(name));
     let matches = ripgrep(root, &pattern).await;
     let usages: Vec<_> = matches

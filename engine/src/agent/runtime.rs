@@ -361,6 +361,9 @@ pub struct AgentOptions {
     /// `GETAIBD_MAX_LLM_CALLS` env / [`DEFAULT_MAX_LLM_CALLS`] default. `None` uses that
     /// default. Lets a caller (or a test) pin an explicit, deterministic cost bound.
     pub max_llm_calls: Option<u32>,
+    /// Hard ceiling on tool calls executed during this run. Once reached, the
+    /// runtime removes tools and asks for the final answer. `None` is unlimited.
+    pub max_tool_calls: Option<u32>,
 }
 
 impl Default for AgentOptions {
@@ -377,6 +380,7 @@ impl Default for AgentOptions {
             auto_complete: false,
             temperature: None,
             max_llm_calls: None,
+            max_tool_calls: None,
         }
     }
 }
@@ -727,6 +731,8 @@ async fn agent_loop(
         None => max_llm_calls(),
     };
     let llm_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let tool_call_budget = options.and_then(|o| o.max_tool_calls);
+    let mut tool_calls_made = 0u32;
     let llm: Arc<dyn Provider> = Arc::new(CountingProvider {
         inner: provider.clone(),
         calls: llm_calls.clone(),
@@ -777,6 +783,63 @@ async fn agent_loop(
     }
 
     loop {
+        if tool_call_budget.is_some_and(|budget| tool_calls_made >= budget) {
+            on_event(AgentEvent {
+                kind: AgentEventKind::Reflecting,
+                content: Some(
+                    "Evidence budget reached — stopping investigation and writing the report."
+                        .into(),
+                ),
+            });
+            session.push_message(ToolMessage::system(
+                "The evidence/tool budget is exhausted. Do not request more tools. Produce the \
+                 final answer now using only the evidence already collected. Be concrete and \
+                 concise; clearly state when no material issue was found."
+                    .to_string(),
+            ));
+            let final_request = ToolChatRequest {
+                model: session.model.clone(),
+                messages: session.messages.clone(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: session.reasoning_effort.clone(),
+                tool_choice: None,
+                compress: session.compress,
+                cache_session_id: session.cache_session_id.clone(),
+            };
+            let final_text = chat_with_tools_retry_cb(llm, &final_request, None)
+                .await
+                .ok()
+                .and_then(|response| response.content)
+                .filter(|text| !text.trim().is_empty())
+                .or_else(|| (!last_text.trim().is_empty()).then(|| last_text.clone()))
+                .unwrap_or_else(|| {
+                    "The review stopped at its evidence budget before producing a report."
+                        .to_string()
+                });
+            // This final call is non-streaming, so its text never reached the UI as
+            // tokens. Emit it as a Response so the report is actually shown (the
+            // Complete event's content is dropped by the client). Skip if it merely
+            // echoes text already streamed this run.
+            if final_text.trim() != last_text.trim() {
+                on_event(AgentEvent {
+                    kind: AgentEventKind::Response,
+                    content: Some(final_text.clone()),
+                });
+            }
+            return finish_agent(
+                session,
+                Some(final_text),
+                memory,
+                provider,
+                iterations,
+                EndReason::NaturalStop,
+                on_event,
+            )
+            .await;
+        }
+
         // Absolute backstop on TOTAL provider calls (turns + reviewer + summaries). The
         // turn/nudge/stall/repeat guards below stop a healthy run far sooner; this only
         // ever fires if those paths pathologically interact, and it guarantees the run can
@@ -976,7 +1039,7 @@ async fn agent_loop(
             cumulative_prompt_tokens += turn_tokens;
         }
 
-        let response = if use_streaming {
+        let mut response = if use_streaming {
             // Transient stream failures are worth retrying with backoff instead of
             // aborting the whole task: a stalled stream (idle watchdog tripped), a
             // gateway/proxy blip (502/503/504), or an upstream overload (429). Each
@@ -1019,6 +1082,12 @@ async fn agent_loop(
             let cb = options.and_then(|o| o.circuit_breaker.as_deref());
             chat_with_tools_retry_cb(llm, &request, cb).await?
         };
+        if let Some(budget) = tool_call_budget {
+            let remaining = budget.saturating_sub(tool_calls_made) as usize;
+            if response.tool_calls.len() > remaining {
+                response.tool_calls.truncate(remaining);
+            }
+        }
         iterations += 1;
 
         if let Some(text) = &response.content {
@@ -1146,6 +1215,8 @@ async fn agent_loop(
                 response.tool_calls.clone(),
             ));
             execute_tool_calls(&response.tool_calls, registry, options, session, on_event).await;
+            tool_calls_made =
+                tool_calls_made.saturating_add(response.tool_calls.len() as u32);
             // The model acted this turn — it isn't stalled on prose. Reset the
             // no-tool stagnation counter.
             no_tool_turns = 0;
@@ -1217,6 +1288,46 @@ async fn agent_loop(
         // bounded only by the hard safety caps (iteration wall, repeat-loop guard,
         // and token/LLM-call budgets), which can never fabricate a false "done".
         if explicit_completion {
+            if informational_task && !did_mutate {
+                // Small models sometimes use `attempt_completion.summary` as a
+                // status receipt ("Explained X; changes: none") without ever
+                // providing the explanation itself. For an informational task,
+                // completion means producing the actual user-facing answer.
+                session.push_message(ToolMessage::system(
+                    "The user requested an explanation/analysis, but your completion summary is \
+                     only a status receipt. Now provide the ACTUAL answer in full using the \
+                     evidence already gathered. Do not call tools. Do not output Outcome/Changes/\
+                     Notes metadata and do not say merely that you explained it."
+                        .to_string(),
+                ));
+                let answer_request = ToolChatRequest {
+                    model: session.model.clone(),
+                    messages: session.messages.clone(),
+                    tools: Vec::new(),
+                    temperature: None,
+                    max_tokens: None,
+                    reasoning_effort: session.reasoning_effort.clone(),
+                    tool_choice: None,
+                    compress: session.compress,
+                    cache_session_id: session.cache_session_id.clone(),
+                };
+                let actual_answer = chat_with_tools_retry_cb(llm, &answer_request, None)
+                    .await
+                    .ok()
+                    .and_then(|answer| answer.content)
+                    .filter(|answer| !answer.trim().is_empty())
+                    .or(final_content);
+                return finish_agent(
+                    session,
+                    actual_answer,
+                    memory,
+                    provider,
+                    iterations,
+                    EndReason::CompletionToolVerified,
+                    on_event,
+                )
+                .await;
+            }
             tracing::debug!(iterations, "attempt_completion signaled — finishing run");
             return finish_agent(
                 session,
@@ -4462,6 +4573,26 @@ mod completion_loop_tests {
     }
 
     #[tokio::test]
+    async fn informational_completion_produces_answer_not_status_receipt() {
+        let (result, mock) = run(
+            "mock",
+            "Explain the attached agentic_fix.py file.",
+            vec![complete_turn(
+                "Outcome: Explained agentic_fix.py. Changes: none. Notes: none.",
+            )],
+            vec![Verdict::Done],
+        )
+        .await;
+        assert_eq!(result.end_reason, EndReason::CompletionToolVerified);
+        assert_eq!(result.iterations, 1);
+        assert_eq!(mock.review_calls.load(Ordering::SeqCst), 1);
+        assert_ne!(
+            result.final_response,
+            "Outcome: Explained agentic_fix.py. Changes: none. Notes: none."
+        );
+    }
+
+    #[tokio::test]
     async fn prose_question_does_not_end_run() {
         // A prose question is not the completion signal, so the run does NOT yield on
         // it (the old behavior). It nudges — steering the model toward ask_question or
@@ -4575,6 +4706,7 @@ mod completion_loop_tests {
     async fn run_runaway(
         max_iterations: u32,
         max_llm_calls: Option<u32>,
+        max_tool_calls: Option<u32>,
         auto_complete: bool,
     ) -> (AgentResult, Arc<RunawayProvider>) {
         let root = temp_root();
@@ -4587,6 +4719,7 @@ mod completion_loop_tests {
             auto_complete,
             enable_thinking: false,
             max_llm_calls,
+            max_tool_calls,
             ..Default::default()
         };
         let mut on_event = |_ev: AgentEvent| {};
@@ -4609,7 +4742,7 @@ mod completion_loop_tests {
         // A model that never converges, with a tiny explicit LLM-call budget. The run must
         // stop the instant the ceiling is reached — total calls are hard-bounded by it, and
         // the loop cannot fan out into unbounded spend.
-        let (result, mock) = run_runaway(10_000, Some(6), true).await;
+        let (result, mock) = run_runaway(10_000, Some(6), None, true).await;
         assert_eq!(result.end_reason, EndReason::CallBudgetExhausted);
         assert_eq!(result.iterations, 6, "must stop exactly at the call ceiling");
         // Not one paid call past the budget: the ceiling is checked BEFORE each request.
@@ -4623,10 +4756,23 @@ mod completion_loop_tests {
         // predictable envelope (turns + a single wrap-up summary), never unbounded.
         // Read-only Ask/Plan-style run (no auto-complete reviewer) so the iteration ceiling
         // is the sole, deterministic stop. 8 worker turns + exactly one wrap-up summary call.
-        let (result, mock) = run_runaway(8, Some(u32::MAX), false).await;
+        let (result, mock) = run_runaway(8, Some(u32::MAX), None, false).await;
         assert_eq!(result.end_reason, EndReason::StepCeiling);
         assert_eq!(result.iterations, 8);
         assert_eq!(mock.calls.load(Ordering::SeqCst), 9);
+    }
+
+    #[tokio::test]
+    async fn evidence_budget_forces_a_final_answer_without_more_tools() {
+        let (result, mock) =
+            run_runaway(100, Some(20), Some(3), false).await;
+        assert_eq!(result.end_reason, EndReason::NaturalStop);
+        assert_eq!(result.iterations, 3);
+        assert_eq!(
+            mock.calls.load(Ordering::SeqCst),
+            4,
+            "three tool turns plus one tool-free final report"
+        );
     }
 
     #[tokio::test]
@@ -4634,7 +4780,7 @@ mod completion_loop_tests {
         // No explicit budget: the DEFAULT ceiling (or an earlier guard) must still stop a
         // non-converging model. The run terminates and its total spend is bounded well
         // under any pathological blow-up.
-        let (result, mock) = run_runaway(10_000, None, true).await;
+        let (result, mock) = run_runaway(10_000, None, None, true).await;
         assert!(
             matches!(
                 result.end_reason,

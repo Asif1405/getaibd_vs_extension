@@ -122,11 +122,13 @@ impl Orchestrator {
             content: Some(detected_mode.as_str().to_string()),
         });
 
-        let original_prompt = session.system_prompt.clone();
-        session.system_prompt = Some(detected_mode.system_prompt().to_string());
-
         let original_max_iterations = session.max_iterations;
         session.max_iterations = detected_mode.max_iterations();
+
+        // Render the prompt: some prompts embed `{max_iterations}` and must have it
+        // substituted before reaching the model, or the literal token leaks through.
+        let original_prompt = session.system_prompt.clone();
+        session.system_prompt = Some(detected_mode.rendered_system_prompt(session.max_iterations));
 
         let result = match detected_mode {
             AgentMode::Ask => self.execute_ask(session, input, on_event).await,
@@ -176,6 +178,7 @@ impl Orchestrator {
             auto_complete: false,
             temperature: None,
             max_llm_calls: None,
+            max_tool_calls: None,
         };
         // attempt_completion is an action-mode completion signal; Ask has no
         // auto-complete loop, so filter it out to keep the toolset clean.
@@ -216,6 +219,7 @@ impl Orchestrator {
             auto_complete: false,
             temperature: None,
             max_llm_calls: None,
+            max_tool_calls: None,
         };
         // Plan is read-only: hand it a filtered registry with just the read/search
         // tools plus `write_plan` (temp file), so it can never mutate the repo.
@@ -252,16 +256,22 @@ impl Orchestrator {
             tool_timeout_secs: 300,
             circuit_breaker: None,
             context_config: Some(crate::context::ContextConfig::default()),
-            enable_thinking: super::thinking::model_uses_reasoning(&session.model),
+            // API reasoning effort still flows through the session. Disable only
+            // the generic plan/reflect scaffolding, which otherwise tells thinking
+            // models to re-plan after every read and causes review roaming.
+            enable_thinking: false,
             // Reviewer fetches, inspects, and reports, then yields — it is not an
             // auto-complete action loop.
             auto_complete: false,
             temperature: None,
-            // A review converges in a handful of calls (fetch PR + issue, read the touched
-            // files, report). Cap total model calls tightly — comfortably above a thorough
-            // review, far below the global default — so a review that fails to converge is
-            // stopped early and cheaply instead of quietly racking up cost.
-            max_llm_calls: Some(120),
+            // A small review converges in a handful of calls, but a LARGE PR needs
+            // several reads to page through the diff and the surrounding base code it
+            // touches. Set the ceiling high enough for a big PR while staying well below
+            // the global default — the web_fetch per-URL cache prevents the re-fetch
+            // loop that used to burn this budget, so convergence is driven by the prompt
+            // ("stop once every hunk is reviewed"), not by a tight cap.
+            max_llm_calls: Some(50),
+            max_tool_calls: Some(50),
         };
         // Read-only: hand it the reviewer allowlist (read/search/fetch tools only), so
         // it can never mutate the repo or open a shell. attempt_completion is not in the
@@ -315,6 +325,7 @@ impl Orchestrator {
                 Some(0.1)
             },
             max_llm_calls: None,
+            max_tool_calls: None,
         };
 
         run_agent_with_memory(
@@ -367,6 +378,7 @@ impl Orchestrator {
                 Some(0.1)
             },
             max_llm_calls: None,
+            max_tool_calls: None,
         };
 
         run_agent_with_memory(

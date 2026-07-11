@@ -174,7 +174,9 @@ impl Tool for WritePlan {
     fn description(&self) -> &'static str {
         "Save the finished plan as a markdown file in a temporary directory OUTSIDE the \
          repository (Plan mode never modifies project files). Provide a short `title` \
-         and the full markdown `plan`; returns the temp file path to share with the user."
+         and the full markdown `plan`; returns the temp file path to share with the user. \
+         To REVISE a plan you already saved this session, pass its `path` (the value \
+         returned earlier) and the file is updated in place instead of creating a new one."
     }
 
     fn input_schema(&self) -> Value {
@@ -188,6 +190,12 @@ impl Tool for WritePlan {
                 "plan": {
                     "type": "string",
                     "description": "The full plan as markdown (context, gap analysis, todos, risks, approach)."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional: an existing plan file path returned by a previous \
+                                    write_plan call. When given, that file is overwritten in place \
+                                    (so revisions edit the same plan instead of piling up new files)."
                 }
             },
             "required": ["plan"]
@@ -202,19 +210,38 @@ impl Tool for WritePlan {
             ));
         }
         let title = input.get("title").and_then(Value::as_str).unwrap_or("plan");
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let dir = std::env::temp_dir().join("getaibd-plans");
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| AppError::InvalidRequest(format!("Cannot create plan dir: {e}")))?;
-        let path = dir.join(format!("{stamp}-{}.md", slugify(title)));
+
+        // Reuse the caller-supplied path when it points at an existing plan under our
+        // temp dir (revision-in-place); otherwise mint a fresh timestamped file. The
+        // containment check keeps Plan mode from writing anywhere but the plans dir.
+        let reuse = input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.starts_with(&dir) && p.extension().is_some_and(|e| e == "md"));
+        let (path, updated) = match reuse {
+            Some(p) => (p, true),
+            None => {
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                (dir.join(format!("{stamp}-{}.md", slugify(title))), false)
+            }
+        };
         tokio::fs::write(&path, plan)
             .await
             .map_err(|e| AppError::InvalidRequest(format!("Cannot write plan: {e}")))?;
         Ok(json!({
             "ok": true,
             "path": path.to_string_lossy(),
-            "note": "Plan saved to a temp file — the repository was not modified."
+            "updated": updated,
+            "note": if updated {
+                "Existing plan updated in place — the repository was not modified."
+            } else {
+                "Plan saved to a temp file — the repository was not modified."
+            }
         }))
     }
 }

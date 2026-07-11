@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 use crate::error::AppError;
 use crate::tools::{tmpfile, Tool};
@@ -18,6 +20,13 @@ use crate::tools::{tmpfile, Tool};
 pub struct WebFetch {
     root: Arc<PathBuf>,
     client: reqwest::Client,
+    /// Per-session cache: URL -> the payload from the first fetch. A second fetch
+    /// of the same URL returns the ALREADY-SAVED temp file instead of hitting the
+    /// network again and writing a new temp file. This enforces the reviewer's
+    /// "never fetch the same URL twice" rule deterministically: without it a
+    /// thinking model re-fetches the same PR diff every loop, never converging and
+    /// littering `.getaibd/tmp/` with identical copies.
+    cache: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl WebFetch {
@@ -28,6 +37,7 @@ impl WebFetch {
                 .user_agent("getaibd-agent")
                 .build()
                 .unwrap_or_default(),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -46,7 +56,9 @@ impl Tool for WebFetch {
          git/SSH credentials — so PRIVATE repos work just like they do in your IDE. \
          Otherwise it falls back to the authenticated GitHub CLI (which also honours \
          GH_TOKEN/GITHUB_TOKEN). For any other URL it performs an HTTP GET and returns \
-         readable text."
+         readable text. For a PR/commit it also saves a structural diff-graph \
+         (files -> changed symbols -> references) as `graph_file` — read that first to \
+         plan a review. Fetching the same URL twice returns the saved copy (no re-fetch)."
     }
 
     fn input_schema(&self) -> Value {
@@ -65,6 +77,25 @@ impl Tool for WebFetch {
             return Err(AppError::InvalidRequest("url is required".into()));
         }
 
+        // Already fetched this URL in this session? Return the saved file instead of
+        // re-fetching. Re-reading a link never yields new information mid-run, so a
+        // repeat is always a loop, not progress.
+        if let Some(cached) = self.cache.lock().await.get(&url).cloned() {
+            let mut payload = cached;
+            let saved = payload
+                .get("saved_to")
+                .and_then(Value::as_str)
+                .unwrap_or("the saved file")
+                .to_string();
+            payload["cached"] = json!(true);
+            payload["note"] = json!(format!(
+                "Already fetched this URL earlier in this session; reusing the saved copy at \
+                 {saved}. Do NOT fetch it again — read that file with read_file (or search it) \
+                 to get the parts you need."
+            ));
+            return Ok(payload);
+        }
+
         let (host, path) = split_host_path(&url);
 
         let (source, content) = if is_github_host(&host) {
@@ -74,14 +105,56 @@ impl Tool for WebFetch {
         };
 
         // Spill to a temp file so large PRs/diffs/pages stay out of context.
-        let ext = if source.ends_with("pr") || source.ends_with("commit") {
-            "diff"
-        } else {
-            "txt"
-        };
+        let is_diff = source.ends_with("pr") || source.ends_with("commit");
+        let ext = if is_diff { "diff" } else { "txt" };
         let mut payload = tmpfile::stash(&self.root, source, ext, &content).await;
         payload["url"] = json!(url);
         payload["source"] = json!(source);
+
+        // For a code diff (PR/commit), also build a structural diff-graph and save it
+        // alongside, so the model reviews a "files -> changed symbols -> references"
+        // map instead of paging the raw diff. Best-effort: skip silently on any issue.
+        if is_diff {
+            let graph = super::diff_graph::build_from_diff(&self.root, &content).await;
+            if graph["files"].as_array().map(|f| !f.is_empty()).unwrap_or(false) {
+                if let Ok(graph_str) = serde_json::to_string_pretty(&graph) {
+                    let g = tmpfile::stash(&self.root, "diff-graph", "json", &graph_str).await;
+                    if let Some(path) = g.get("saved_to").and_then(Value::as_str) {
+                        // The raw diff was stashed above; keep its PATH so the model
+                        // can open specific ranges, but strip the inline diff
+                        // content/preview/note so it can't just read the whole diff
+                        // instead of the graph. Without this the diff sits inline in
+                        // the tool result and the model reviews it, ignoring the graph.
+                        let diff_file = payload
+                            .get("saved_to")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.remove("content");
+                            obj.remove("preview");
+                            obj.remove("note");
+                            obj.remove("saved_to");
+                        }
+                        if let Some(diff_file) = diff_file {
+                            payload["diff_file"] = json!(diff_file);
+                        }
+                        payload["graph_file"] = json!(path);
+                        payload["graph_summary"] = graph["summary"].clone();
+                        payload["graph_hint"] = json!(format!(
+                            "REVIEW FROM THE GRAPH. A structural diff-graph (files -> changed \
+                             symbols -> references/blast-radius) is saved at {path} (graph_file). \
+                             Read it FIRST with read_file — it lists every file and symbol the diff \
+                             touches. The raw unified diff is at diff_file: open ONLY specific line \
+                             ranges from it (read_file offset/limit) when a hunk in the graph needs \
+                             its exact changed lines. Do NOT read the whole diff, and do not review \
+                             from the diff instead of the graph."
+                        ));
+                    }
+                }
+            }
+        }
+
+        self.cache.lock().await.insert(url, payload.clone());
         Ok(payload)
     }
 }
@@ -454,4 +527,28 @@ fn html_to_text(html: &str) -> String {
         }
     }
     collapsed.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A URL already in the session cache is served from the saved file — no network,
+    // and flagged so the model stops re-fetching (the reviewer non-convergence fix).
+    #[tokio::test]
+    async fn repeated_url_is_served_from_cache() {
+        let tool = WebFetch::new(Arc::new(std::env::temp_dir()));
+        let url = "https://example.com/pr/1";
+        tool.cache.lock().await.insert(
+            url.to_string(),
+            json!({ "saved_to": ".getaibd/tmp/github-pr-123.diff", "url": url, "source": "github-pr" }),
+        );
+        let out = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("cached fetch should succeed without network");
+        assert_eq!(out["cached"], true);
+        assert!(out["note"].as_str().unwrap().contains("Already fetched"));
+        assert_eq!(out["saved_to"], ".getaibd/tmp/github-pr-123.diff");
+    }
 }

@@ -2,6 +2,7 @@ pub mod approval;
 pub mod ask;
 pub mod ask_gate;
 pub mod command;
+pub mod diff_graph;
 pub mod editor_gate;
 pub mod edits;
 pub mod env_manager;

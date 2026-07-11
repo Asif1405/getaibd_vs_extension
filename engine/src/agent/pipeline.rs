@@ -55,35 +55,55 @@ pub struct PipelineDeps<'a> {
     pub explorer_max_iters: u32,
 }
 
-const ANALYZER_PROMPT: &str = "You are the TRIAGE stage of a coding agent. Read the user's \
-request and return ONLY a JSON object (no prose, no code fences) with keys: \
+const ANALYZER_PROMPT: &str = "You are the TRIAGE stage of a coding agent. \
+Input: the user's request. \
+Decision: how much scaffolding this task needs and which tools will do the job most cheaply. \
+Return ONLY a JSON object (no prose, no code fences) with keys: \
 \"complexity\" (\"simple\" or \"complex\"), \"summary\" (one sentence restating the goal), \
 \"requirements\" (array of concrete, verifiable requirements), \"symbols\" (array of the \
 concrete identifiers/function/type/file names worth searching for to locate the code — be \
-specific, these drive an automated code search), \"needs_exploration\" (bool: true only if \
-finding the code requires following references across several files, false if a couple of \
-searches suffice), \"needs_validation\" (bool: true if the change should be built/tested or \
-spans multiple files, false for a trivial edit or a plain question). Mark \"simple\" for small, \
-low-risk, mostly single-file work or a question; \"complex\" otherwise. Be decisive and terse.";
+specific, these drive an automated code search; empty for greenfield build-from-scratch work), \
+\"needs_exploration\" (bool: true only if finding the code requires following references across \
+several files, false if a couple of searches suffice), \"needs_validation\" (bool: true if the \
+change should be built/tested or spans multiple files, false for a trivial edit or a plain \
+question), and \"tool_plan\" (object picking the cheapest tools: \
+\"retrieval\" one of \"grep\"|\"semantic\"|\"explore\"|\"none\" (none = greenfield, nothing to \
+locate), \"verify\" one of \"none\"|\"diff\"|\"lint_test\"|\"run_services\" (run_services = the \
+change must be exercised by bringing up a server/service/docker/DB at runtime), \"edit\" one of \
+\"patch\"|\"write\" (patch = small localized edits, write = new/rewritten files)). \
+Mark \"simple\" for small, low-risk, mostly single-file work or a question; \"complex\" \
+otherwise. Be decisive and terse.";
 
 const EXPLORER_PROMPT: &str = "You are the EXPLORER: a fast, strictly read-only investigator. \
-Given the task and a starting set of code hits, trace exactly what must change. Use \
-search_code / semantic_search / find_symbol / find_references to follow references, then read \
-only the relevant ranges — never dump whole files, never crawl exhaustively. You cannot write, \
-edit, delete, or run commands. Finish with a tight report: the files/symbols to change (with \
-`path:line`), existing patterns to follow, and constraints/gotchas. Say clearly if not found.";
+Input: the task plus a starting set of code hits. \
+Decision: exactly what must change and where. \
+Use search_code / semantic_search / find_symbol / find_references to follow references, then \
+read only the relevant ranges — never dump whole files, never crawl exhaustively. You cannot \
+write, edit, delete, or run commands. Done when the change surface is mapped or clearly not \
+found. \
+Output: a tight report — the files/symbols to change (with `path:line`), existing patterns to \
+follow, and constraints/gotchas. Say clearly if not found.";
 
-const PLANNER_PROMPT: &str = "You are the PLANNER. Given the task, its requirements, and the \
-gathered code context, produce a concise ordered implementation checklist. Return ONLY \
-markdown: a first line '## Plan' then '- [ ] <step>' lines. Each step concrete and actionable \
-(which file, what change). No prose. 3-8 steps.";
+const PLANNER_PROMPT: &str = "You are the PLANNER. \
+Input: the task, its requirements, and the gathered code context. \
+Decision: the shortest ordered path to done, and which tool each step uses. \
+Produce a concise ordered implementation checklist covering both editing existing code and \
+greenfield build-from-scratch work (scaffold -> implement -> install deps -> run), and \
+interleave a lint/test step after implementation steps. \
+Output: ONLY markdown — a first line '## Plan' then '- [ ] <step> (tool: <tool>)' lines. Each \
+step concrete and actionable (which file, what change) and naming its suggested tool \
+(e.g. patch_file, write_file, run_command, search_files). No prose. 3-8 steps.";
 
-const VALIDATOR_PROMPT: &str = "You are the VALIDATOR. Verify the task is fully and correctly \
-implemented in the current working tree. Inspect changes with git_diff, read edited files, and \
-run the build/tests with run_command when the project has them. Check every requirement. Do NOT \
-make changes yourself. End your reply with ONLY a single-line JSON object: \
+const VALIDATOR_PROMPT: &str = "You are the VALIDATOR. \
+Input: the original task, its requirements, and the current working tree. \
+Decision: does the working tree fully and correctly implement the task. \
+Inspect changes with git_diff, read edited files, and run the project's linter AND tests (and, \
+when the change needs a running service, start it in the background and read its log) with \
+run_command. Check every requirement. Do NOT make changes yourself. \
+Output: end your reply with ONLY a single-line JSON object: \
 {\"pass\": true|false, \"issues\": [\"...\"]}. pass=false with concrete, actionable issues if \
-anything is missing, broken, or unverified; otherwise pass=true with an empty list.";
+anything is missing, broken, unverified, or failing lint/tests; otherwise pass=true with an \
+empty list.";
 
 #[derive(Deserialize, Default)]
 struct AnalyzeJson {
@@ -99,6 +119,71 @@ struct AnalyzeJson {
     needs_exploration: Option<bool>,
     #[serde(default)]
     needs_validation: Option<bool>,
+    #[serde(default)]
+    tool_plan: ToolPlan,
+}
+
+/// Advisory tool routing from the analyzer. The worker keeps its full tool
+/// registry; this only nudges it toward the cheapest tools for the task. All
+/// fields default to empty so an older/partial analyzer response degrades cleanly.
+#[derive(Deserialize, Default)]
+struct ToolPlan {
+    #[serde(default)]
+    retrieval: String,
+    #[serde(default)]
+    verify: String,
+    #[serde(default)]
+    edit: String,
+}
+
+impl ToolPlan {
+    fn is_empty(&self) -> bool {
+        self.retrieval.trim().is_empty()
+            && self.verify.trim().is_empty()
+            && self.edit.trim().is_empty()
+    }
+
+    /// Render an advisory `## Suggested tools` block for the worker seed, or empty
+    /// when the analyzer offered no plan.
+    fn suggested_block(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let line = |label: &str, v: &str| -> String {
+            let v = v.trim();
+            if v.is_empty() {
+                String::new()
+            } else {
+                format!("- {label}: {v}\n")
+            }
+        };
+        let retrieval = match self.retrieval.trim() {
+            "grep" => "grep (search_files/search_code) to locate code",
+            "semantic" => "semantic_search to locate code by concept",
+            "explore" => "explore subagent for multi-hop discovery",
+            "none" => "none needed (greenfield / build from scratch)",
+            other => other,
+        };
+        let verify = match self.verify.trim() {
+            "none" => "none",
+            "diff" => "git_diff only",
+            "lint_test" => "run the project's lint + tests after each step",
+            "run_services" => "bring up the server/service/docker/DB and exercise it at runtime",
+            other => other,
+        };
+        let edit = match self.edit.trim() {
+            "patch" => "patch_file for small localized edits",
+            "write" => "write_file for new/rewritten files",
+            other => other,
+        };
+        let mut out = String::from(
+            "## Suggested tools (advisory — prefer these unless the task proves otherwise)\n",
+        );
+        out.push_str(&line("Retrieval", retrieval));
+        out.push_str(&line("Verify", verify));
+        out.push_str(&line("Edit", edit));
+        out
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -192,6 +277,7 @@ fn action_options(deps: &PipelineDeps, model: &str, auto_complete: bool) -> Agen
         auto_complete,
         temperature: if reasoning { None } else { Some(0.1) },
         max_llm_calls: None,
+        max_tool_calls: None,
     }
 }
 
@@ -516,12 +602,14 @@ pub async fn run_pipeline(
     }
 
     // Stage 5 — Worker (user's model) on the shared session.
+    let suggested = analysis.tool_plan.suggested_block();
     let seeded = format!(
-        "{input}\n\n## Requirements\n- {}\n\n{}\n{}\n\nImplement the task end to end, following \
+        "{input}\n\n## Requirements\n- {}\n\n{}\n{}\n{}\nImplement the task end to end, following \
          the plan checklist. Make only the changes needed, then stop.",
         analysis.requirements.join("\n- "),
         pack,
-        findings
+        findings,
+        suggested
     );
     let mut result = run_worker(deps, session, &seeded, on_event).await?;
 
@@ -567,4 +655,53 @@ pub async fn run_pipeline(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The analyzer's tool_plan deserializes when present and drives the advisory block.
+    #[test]
+    fn analyze_json_parses_tool_plan() {
+        let raw = r#"{
+            "complexity": "complex",
+            "summary": "add a feature",
+            "requirements": ["do the thing"],
+            "symbols": ["Foo"],
+            "needs_exploration": true,
+            "needs_validation": true,
+            "tool_plan": {"retrieval": "grep", "verify": "lint_test", "edit": "patch"}
+        }"#;
+        let a: AnalyzeJson = serde_json::from_str(raw).expect("parses with tool_plan");
+        assert_eq!(a.tool_plan.retrieval, "grep");
+        assert_eq!(a.tool_plan.verify, "lint_test");
+        assert_eq!(a.tool_plan.edit, "patch");
+        let block = a.tool_plan.suggested_block();
+        assert!(block.contains("## Suggested tools"));
+        assert!(block.contains("lint + tests"));
+    }
+
+    // A response with no tool_plan still parses (older analyzer) and yields no block.
+    #[test]
+    fn analyze_json_defaults_without_tool_plan() {
+        let raw = r#"{"complexity":"simple","summary":"x","requirements":[],"symbols":[]}"#;
+        let a: AnalyzeJson = serde_json::from_str(raw).expect("parses without tool_plan");
+        assert!(a.tool_plan.is_empty());
+        assert!(a.tool_plan.suggested_block().is_empty());
+    }
+
+    // Greenfield/run-services routing renders human-readable guidance.
+    #[test]
+    fn tool_plan_renders_greenfield_and_services() {
+        let plan = ToolPlan {
+            retrieval: "none".into(),
+            verify: "run_services".into(),
+            edit: "write".into(),
+        };
+        let block = plan.suggested_block();
+        assert!(block.contains("greenfield"));
+        assert!(block.contains("runtime"));
+        assert!(block.contains("write_file"));
+    }
 }
