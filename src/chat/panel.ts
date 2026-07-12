@@ -83,7 +83,6 @@ const PROVIDER_KEY = "getaibd.lastProvider";
 const MODEL_KEY = "getaibd.lastModel";
 const MODE_KEY = "getaibd.lastMode";
 const COMPRESS_KEY = "getaibd.compress";
-const MEMORY_KEY = "getaibd.useMemory";
 const REASONING_KEY = "getaibd.reasoningEffort";
 const ALWAYS_ALLOW_KEY = "getaibd.alwaysAllowTools";
 const MAX_RECONNECT = 3;
@@ -552,9 +551,6 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         await this.globalState.update(REASONING_KEY, effort);
         break;
       }
-      case "useMemoryChanged":
-        await this.globalState.update(MEMORY_KEY, msgBool(msg, "useMemory"));
-        break;
       case "openDiff": {
         const p = msgString(msg, "path");
         if (p) {await this.openDiff(p);}
@@ -926,9 +922,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const reasoning =
       this.globalState.get<string>(REASONING_KEY) ??
       config.get<string>("chat.reasoningDefault", "medium");
-    const useMemory =
-      this.globalState.get<boolean>(MEMORY_KEY) ??
-      config.get<boolean>("agent.useMemory", false);
+    // RAG memory is always on — no user-facing off switch.
+    const useMemory = true;
 
     this.post({
       type: "restoreSelections",
@@ -1523,9 +1518,8 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this.post({ type: "agentStart" });
 
     const apiKey = await this.store.getApiKey(provider);
-    const agentUseMemory =
-      this.globalState.get<boolean>(MEMORY_KEY) ??
-      vscode.workspace.getConfiguration("getaibd").get<boolean>("agent.useMemory", false);
+    // RAG memory is always on — no user-facing off switch.
+    const agentUseMemory = true;
     // `launch` is re-invokable so a dropped engine can be restarted and retried once
     // (see retryAfterEngineDrop) without re-pushing the user message / history.
     const launch = () => {
@@ -3860,10 +3854,6 @@ body {
   <span class="header-spacer"></span>
   <button class="upgrade-btn" id="upgradeBtn" title="Add your API key to unlock all models" style="display:none">&#x1F511; Add API Key</button>
   <div class="header-toggles" id="headerToggles">
-    <div class="cost-mode-switch" id="ragModeSwitch" title="Local codebase memory (RAG). On adds relevant project snippets to agent runs — uses more tokens.">
-      <button type="button" class="cost-mode-option" id="ragOffBtn">RAG Off</button>
-      <button type="button" class="cost-mode-option" id="ragOnBtn" title="Enable local RAG memory for agent runs">RAG On</button>
-    </div>
     <div class="cost-mode-switch" id="costModeSwitch" style="display:none" title="Reduced cost compresses tool context to save credits. This might degrade response.">
       <button type="button" class="cost-mode-option active" id="costNormalBtn">Normal</button>
       <button type="button" class="cost-mode-option" id="costReducedBtn" title="Reduced cost — compress tool context to save credits">Reduced</button>
@@ -4058,11 +4048,7 @@ function ingestImageFiles(files) {
 const costModeSwitch = document.getElementById("costModeSwitch");
 const costNormalBtn = document.getElementById("costNormalBtn");
 const costReducedBtn = document.getElementById("costReducedBtn");
-const ragModeSwitch = document.getElementById("ragModeSwitch");
-const ragOffBtn = document.getElementById("ragOffBtn");
-const ragOnBtn = document.getElementById("ragOnBtn");
 let compressEnabled = true;
-let ragEnabled = false;
 if (upgradeBtn) {
   upgradeBtn.addEventListener("click", () => vscode.postMessage({ type: "needApiKey" }));
 }
@@ -4072,8 +4058,6 @@ function updateHeaderTogglesUi() {
   if (costModeSwitch) { costModeSwitch.style.display = showCost ? "inline-flex" : "none"; }
   if (costNormalBtn) { costNormalBtn.classList.toggle("active", !compressEnabled); }
   if (costReducedBtn) { costReducedBtn.classList.toggle("active", compressEnabled); }
-  if (ragOffBtn) { ragOffBtn.classList.toggle("active", !ragEnabled); }
-  if (ragOnBtn) { ragOnBtn.classList.toggle("active", ragEnabled); }
 }
 
 function updateCostModeUi() {
@@ -4087,17 +4071,8 @@ function setCompress(enabled) {
   vscode.postMessage({ type: "compressChanged", compress: compressEnabled });
 }
 
-function setRag(enabled) {
-  if (ragEnabled === enabled) { return; }
-  ragEnabled = enabled;
-  updateHeaderTogglesUi();
-  vscode.postMessage({ type: "useMemoryChanged", useMemory: ragEnabled });
-}
-
 if (costNormalBtn) { costNormalBtn.addEventListener("click", () => setCompress(false)); }
 if (costReducedBtn) { costReducedBtn.addEventListener("click", () => setCompress(true)); }
-if (ragOffBtn) { ragOffBtn.addEventListener("click", () => setRag(false)); }
-if (ragOnBtn) { ragOnBtn.addEventListener("click", () => setRag(true)); }
 
 if (settingsPanel) {
   settingsPanel.addEventListener("click", (e) => {
@@ -5868,9 +5843,6 @@ window.addEventListener("message", (event) => {
       }
       if (msg.compress !== undefined) {
         compressEnabled = !!msg.compress;
-      }
-      if (msg.useMemory !== undefined) {
-        ragEnabled = !!msg.useMemory;
       }
       if (msg.reasoningEffort) {
         currentReasoning = msg.reasoningEffort;
